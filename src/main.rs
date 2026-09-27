@@ -18,7 +18,7 @@ use std::time::Duration;
     about = "Tamper-evident audit chains: verify, append, stream and browse them",
     long_about = "Tamper-evident audit chains: verify, append, stream and browse them.\n\n\
         Reads nostoi-v1 (JSONL or SQLite), WeftMark's ledger.jsonl (weftmark-ledger-v1) \
-        and Ephor's audit database (kagp-audit-v1); writes nostoi-v1.\n\n\
+        and Ephor's audit database (ephor-audit-v1); writes nostoi-v1.\n\n\
         Exit status: 0 intact, 1 broken, 2 error."
 )]
 struct Cli {
@@ -32,7 +32,7 @@ enum Command {
     Verify {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
-        /// Format (default: detected): nostoi-v1, weftmark-ledger-v1, kagp-audit-v1
+        /// Format (default: detected): nostoi-v1, weftmark-ledger-v1, ephor-audit-v1
         #[arg(long)]
         format: Option<Format>,
         /// One JSON report per line

@@ -12,7 +12,7 @@
 //!
 //! - `nostoi-v1`, its own, as JSON Lines or an append-only SQLite store;
 //! - `weftmark-ledger-v1`, WeftMark's `ledger.jsonl`;
-//! - `kagp-audit-v1`, Ephor's `governance_events`.
+//! - `ephor-audit-v1`, Ephor's `governance_events`.
 //!
 //! and writes `nostoi-v1`, whose digest any language can compute: SHA-256 of
 //! the record's canonical JSON without its `digest`, where canonical JSON is

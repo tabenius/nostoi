@@ -4,7 +4,7 @@
 //! | --- | --- | --- | --- |
 //! | `nostoi-v1` | Nostoi's own logs (Sylvae, Frog, …) | one JSON object per line, or a row of the SQLite store | SHA-256 of the canonical JSON of the record without `digest` |
 //! | `weftmark-ledger-v1` | WeftMark's `ledger.jsonl` | one JSON object per line | SHA-256 of the canonical JSON of the record without `digest` |
-//! | `kagp-audit-v1` | Ephor (governance-http, agent-proxy, PostgreSQL/SQLite stores) | a `governance_events` row | SHA-256 of the length-prefixed fields |
+//! | `ephor-audit-v1` | Ephor (governance-http, agent-proxy, PostgreSQL/SQLite stores) | a `governance_events` row | SHA-256 of the length-prefixed fields |
 //!
 //! "Canonical JSON" is Python's `json.dumps(sort_keys=True, separators=(",", ":"))`
 //! (see [`crate::canonical`]).
@@ -22,17 +22,17 @@ pub const NOSTOI_V1: &str = "nostoi-v1";
 pub enum Format {
     Nostoi,
     WeftmarkLedger,
-    KagpAudit,
+    EphorAudit,
 }
 
 impl Format {
-    pub const ALL: [Format; 3] = [Format::Nostoi, Format::WeftmarkLedger, Format::KagpAudit];
+    pub const ALL: [Format; 3] = [Format::Nostoi, Format::WeftmarkLedger, Format::EphorAudit];
 
     pub fn name(self) -> &'static str {
         match self {
             Format::Nostoi => NOSTOI_V1,
             Format::WeftmarkLedger => "weftmark-ledger-v1",
-            Format::KagpAudit => "kagp-audit-v1",
+            Format::EphorAudit => "ephor-audit-v1",
         }
     }
 
@@ -40,7 +40,7 @@ impl Format {
         match self {
             Format::Nostoi => "Nostoi's own chain: JSONL or the Nostoi SQLite store",
             Format::WeftmarkLedger => "WeftMark's ledger.jsonl",
-            Format::KagpAudit => "Ephor's audit chain (governance_events in SQLite)",
+            Format::EphorAudit => "Ephor's audit chain (governance_events in SQLite)",
         }
     }
 }
@@ -56,9 +56,14 @@ impl FromStr for Format {
     fn from_str(text: &str) -> Result<Self, String> {
         Format::ALL
             .into_iter()
-            .find(|format| format.name() == text || format.name().trim_end_matches("-v1") == text)
+            .find(|format| {
+                format.name() == text
+                    || format.name().trim_end_matches("-v1") == text
+                    // Ephor's audit format was named after KAGP, its former name.
+                    || (*format == Format::EphorAudit && matches!(text, "kagp-audit-v1" | "kagp-audit"))
+            })
             .ok_or_else(|| {
-                format!("unknown format {text:?} (nostoi-v1, weftmark-ledger-v1, kagp-audit-v1)")
+                format!("unknown format {text:?} (nostoi-v1, weftmark-ledger-v1, ephor-audit-v1)")
             })
     }
 }
@@ -185,11 +190,11 @@ pub fn weftmark_entry(record: Value) -> Result<Entry, String> {
     })
 }
 
-// ── kagp-audit-v1 ───────────────────────────────────────────────────
+// ── ephor-audit-v1 ───────────────────────────────────────────────────
 
 /// One Ephor audit event, as a `governance_events` row stores it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KagpEvent {
+pub struct EphorEvent {
     pub chain_sequence: u64,
     pub id: String,
     pub node_id: String,
@@ -204,11 +209,11 @@ pub struct KagpEvent {
     pub signature: String,
 }
 
-/// The `kagp-audit-v1` hash (Ephor's governance-node, governance-http and
-/// PostgreSQL `kagp_event_hash`): SHA-256 over `kagp-audit-v1|` and each field
+/// The `ephor-audit-v1` hash (Ephor's governance-node, governance-http and
+/// PostgreSQL `kagp_event_hash`): SHA-256 over `kagp-audit-v1|` (the tag keeps Ephor's former name) and each field
 /// as `<byte length>:<bytes>`, lists as their length then their items.
 #[allow(clippy::too_many_arguments)]
-pub fn kagp_hash(
+pub fn ephor_hash(
     node_id: &str,
     id: &str,
     aggregate_id: &str,
@@ -232,6 +237,8 @@ pub fn kagp_hash(
         }
     }
     let mut hasher = Sha256::new();
+    // The domain tag keeps Ephor's former name: it is hashed into every
+    // event, so changing it would break every existing chain.
     hasher.update(b"kagp-audit-v1|");
     field(&mut hasher, node_id);
     field(&mut hasher, id);
@@ -246,9 +253,9 @@ pub fn kagp_hash(
     hex::encode(hasher.finalize())
 }
 
-impl KagpEvent {
+impl EphorEvent {
     pub fn hash(&self) -> String {
-        kagp_hash(
+        ephor_hash(
             &self.node_id,
             &self.id,
             &self.aggregate_id,
@@ -296,8 +303,8 @@ mod tests {
     use crate::chain::GENESIS;
 
     #[test]
-    fn kagp_matches_ephors_postgres_test_vector() {
-        let hash = kagp_hash(
+    fn ephor_matches_its_postgres_test_vector() {
+        let hash = ephor_hash(
             "node-a",
             "6a80fb52-2979-42cb-97bb-666552245920",
             "session-1",
@@ -313,6 +320,13 @@ mod tests {
             hash,
             "2a7501b1a8d0b1e390d4bfd5f407cceaeac8e09da34c783cb4c6027f127f0d55"
         );
+    }
+
+    #[test]
+    fn ephors_former_format_name_still_works() {
+        assert_eq!("ephor-audit-v1".parse::<Format>(), Ok(Format::EphorAudit));
+        assert_eq!("kagp-audit-v1".parse::<Format>(), Ok(Format::EphorAudit));
+        assert_eq!(Format::EphorAudit.name(), "ephor-audit-v1");
     }
 
     #[test]

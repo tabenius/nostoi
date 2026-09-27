@@ -86,9 +86,9 @@ pub fn read(reader: impl Read, format: Option<Format>) -> Result<Loaded> {
         let parsed = match this {
             Format::Nostoi => format::nostoi_entry(record),
             Format::WeftmarkLedger => format::weftmark_entry(record),
-            Format::KagpAudit => {
+            Format::EphorAudit => {
                 return Err(Error::Invalid(
-                    "kagp-audit-v1 chains live in SQLite, not JSONL".into(),
+                    "ephor-audit-v1 chains live in SQLite, not JSONL".into(),
                 ))
             }
         };

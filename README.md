@@ -17,7 +17,7 @@ common format:
 | --- | --- | --- |
 | `nostoi-v1` | Nostoi's own; for Sylvae, Frog and anything new | JSON Lines, or the append-only SQLite store |
 | `weftmark-ledger-v1` | WeftMark's `ledger.jsonl` | JSON Lines |
-| `kagp-audit-v1` | Ephor's audit chain (`governance_events`) | SQLite (Ephor's store) |
+| `ephor-audit-v1` | Ephor's audit chain (`governance_events`) | SQLite (Ephor's store) |
 
 *Nostoi* (Νόστοι, "the homecomings") are the lost epic poems of the Greek
 heroes' journeys home: records that should have survived and did not. The
@@ -33,7 +33,7 @@ $ nostoi append audit.jsonl --kind tool.call --actor agent:claude --subject cs-4
 $ nostoi verify audit.jsonl ~/.weftmark/ledger.jsonl /var/lib/rebekah/ephor/audit.sqlite
 ✓ audit.jsonl (nostoi-v1): 1 records intact, head 1 67b6c5…
 ✓ ledger.jsonl (weftmark-ledger-v1): 812 records intact, head 812 9c01e2…
-✗ audit.sqlite (kagp-audit-v1): record 204 was altered: its content does not match its digest; records 1–203 are intact
+✗ audit.sqlite (ephor-audit-v1): record 204 was altered: its content does not match its digest; records 1–203 are intact
 
 $ nostoi log audit.jsonl --follow            # verified records as JSON lines, live
 $ nostoi head audit.jsonl                    # position and digest: anchor it elsewhere
@@ -101,7 +101,7 @@ against each other in both directions.
 
 WeftMark's `weftmark-ledger-v1` is hashed the same way (its record: `sequence`,
 `previous_digest`, `kind`, `entity_id`, `payload`, `recorded_at`, `digest`).
-Ephor's `kagp-audit-v1` hashes length-prefixed fields; see `src/format.rs`.
+Ephor's `ephor-audit-v1` hashes length-prefixed fields; see `src/format.rs`.
 
 ## The SQLite store
 

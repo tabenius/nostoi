@@ -10,7 +10,7 @@
 
 use crate::chain::{Entry, Problem, GENESIS};
 use crate::error::{Error, Result};
-use crate::format::{self, Format, KagpEvent};
+use crate::format::{self, EphorEvent, Format};
 use crate::jsonl::{Draft, Loaded};
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -100,7 +100,7 @@ pub fn load(path: &Path, format: Option<Format>) -> Result<Loaded> {
     let format = match format {
         Some(format) => format,
         None if has_table(&conn, "nostoi_records")? => Format::Nostoi,
-        None if has_table(&conn, "governance_events")? => Format::KagpAudit,
+        None if has_table(&conn, "governance_events")? => Format::EphorAudit,
         None => {
             return Err(Error::Invalid(
                 "no chain here (neither nostoi_records nor governance_events)".into(),
@@ -109,7 +109,7 @@ pub fn load(path: &Path, format: Option<Format>) -> Result<Loaded> {
     };
     match format {
         Format::Nostoi => load_nostoi(&conn),
-        Format::KagpAudit => load_kagp(&conn),
+        Format::EphorAudit => load_ephor(&conn),
         Format::WeftmarkLedger => Err(Error::Invalid(
             "weftmark-ledger-v1 chains are JSONL files".into(),
         )),
@@ -150,7 +150,7 @@ fn strings(text: &str) -> std::result::Result<Vec<String>, String> {
     serde_json::from_str(text).map_err(|e| format!("not a JSON array of strings: {e}"))
 }
 
-fn load_kagp(conn: &Connection) -> Result<Loaded> {
+fn load_ephor(conn: &Connection) -> Result<Loaded> {
     let mut stmt = conn.prepare(
         "SELECT chain_sequence, id, node_id, aggregate_id, agent_class, action, arguments,
                 outcome, occurred_at_ms, caller_stack, previous_hash, signature
@@ -161,9 +161,9 @@ fn load_kagp(conn: &Connection) -> Result<Loaded> {
     let mut unreadable = None;
     while let Some(row) = rows.next()? {
         let seq: i64 = row.get(0)?;
-        let event = (|| -> std::result::Result<KagpEvent, String> {
+        let event = (|| -> std::result::Result<EphorEvent, String> {
             let get = |i: usize| row.get::<_, String>(i).map_err(|e| e.to_string());
-            Ok(KagpEvent {
+            Ok(EphorEvent {
                 chain_sequence: seq as u64,
                 id: get(1)?,
                 node_id: get(2)?,
@@ -190,7 +190,7 @@ fn load_kagp(conn: &Connection) -> Result<Loaded> {
         }
     }
     Ok(Loaded {
-        format: Format::KagpAudit,
+        format: Format::EphorAudit,
         entries,
         unreadable,
     })
@@ -358,7 +358,7 @@ mod tests {
                caller_stack TEXT, previous_hash TEXT, signature TEXT, node_id TEXT);",
         )
         .unwrap();
-        let mut event = KagpEvent {
+        let mut event = EphorEvent {
             chain_sequence: 1,
             id: "6a80fb52-2979-42cb-97bb-666552245920".into(),
             node_id: "node-a".into(),
@@ -392,7 +392,7 @@ mod tests {
         )
         .unwrap();
         let loaded = load(&path, None).unwrap();
-        assert_eq!(loaded.format, Format::KagpAudit);
+        assert_eq!(loaded.format, Format::EphorAudit);
         let report = loaded.verify();
         assert!(report.ok, "{:?}", report.problem);
         assert_eq!(

@@ -1,5 +1,8 @@
 # Native, Python and WebAssembly
 
+For suite-wide rules on recording bounded action intents before side effects,
+see [audit-first operations](AUDIT-FIRST.md).
+
 All bindings call the same Rust verifier. The WIT contract is
 [`bindings/component/wit/world.wit`](../bindings/component/wit/world.wit).
 The component exports canonical-json, verify-jsonl and append-jsonl. JSON text

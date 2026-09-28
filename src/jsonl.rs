@@ -161,6 +161,16 @@ fn append_locked(path: &Path, file: &mut File, draft: Draft<'_>) -> Result<Entry
     )
     .map_err(Error::Invalid)?;
     let mut line = crate::canonical::to_string(&record);
+    // A complete last record need not have a newline. Preserve the record
+    // boundary before appending, rather than joining two JSON objects.
+    if file.metadata().map_err(io(path))?.len() > 0 {
+        file.seek(SeekFrom::End(-1)).map_err(io(path))?;
+        let mut last = [0];
+        file.read_exact(&mut last).map_err(io(path))?;
+        if last[0] != b'\n' {
+            line.insert(0, '\n');
+        }
+    }
     line.push('\n');
     file.write_all(line.as_bytes()).map_err(io(path))?;
     file.sync_all().map_err(io(path))?;
@@ -180,6 +190,19 @@ mod tests {
             body: json!({"n": 1}),
             at: None,
         }
+    }
+
+    #[test]
+    fn append_preserves_a_complete_record_without_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        append(&path, draft("one")).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.trim_end()).unwrap();
+        append(&path, draft("two")).unwrap();
+        let report = load(&path, None).unwrap().verify();
+        assert!(report.ok);
+        assert_eq!(report.verified, 2);
     }
 
     #[test]

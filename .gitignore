@@ -1,2 +1,6 @@
 target/
 __pycache__/
+bindings/javascript/dist/
+node_modules/
+.venv/
+*.egg-info/

@@ -43,6 +43,7 @@ pub mod chain;
 mod error;
 pub mod format;
 pub mod jsonl;
+pub mod portable;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod time;

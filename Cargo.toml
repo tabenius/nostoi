@@ -9,6 +9,12 @@ repository = "https://github.com/tabenius/nostoi"
 keywords = ["audit", "hash-chain", "tamper-evident", "ledger", "sqlite"]
 categories = ["cryptography", "command-line-utilities", "database"]
 readme = "README.md"
+include = ["/src/**", "/tests/**", "/docs/**", "/contrib/python/nostoi.py", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE-*", "/assets/logo.svg"]
+
+[workspace]
+members = ["bindings/python", "bindings/component"]
+default-members = ["."]
+resolver = "2"
 
 [lib]
 name = "nostoi"

@@ -357,6 +357,23 @@ quietly covering an old head is the failure people miss:
 
 ## Threats this does and does not address
 
+### What is deliberately not defended
+
+Stated plainly, because the list above is more comforting than the code is:
+
+- **A symlink planted between the check and the write.** Sidecar writes refuse to
+  follow a symlink, which catches one planted in advance and the accidental case.
+  Closing the race properly would need `openat` with `O_NOFOLLOW` on every path
+  component, which is more machinery than this warrants.
+- **An attacker who can win a race on the document.** If someone can rewrite the
+  sidecar and the signature together between two verifications, both are
+  consistent again. That is why the fingerprint pin and an external timestamp
+  exist: they are the parts that do not live on this host.
+- **A key you were compelled to use.** No mechanism here can tell.
+- **An unlimited document.** Documents over 64 KiB and signatures over 1 MiB are
+  refused rather than read, because this code is meant to survive a machine an
+  attacker has partly controlled.
+
 | Threat | Attestation |
 | --- | --- |
 | Chain rewritten wholesale, digests recomputed | **Detected** — the attested digest no longer appears at that sequence |
@@ -388,6 +405,8 @@ and that they could not have said it about any other head.
   passphrase-less key committed on purpose, so the suite can pin a fingerprint as
   a literal. It signs nothing but test documents, and it must never be trusted.
 - **Verification is read-only.** It opens no lock, writes nothing, and needs only
-  the chain and the two sidecars plus an allowed-signers file.
+  the chain and the two sidecars plus an allowed-signers file. `--canonicalize` is
+  the one exception and it only rewrites formatting, after checking that the file
+  has not changed since it was verified.
 - **A missing attestation is never treated as a pass.** `verify-attestation`
   exits non-zero; the read-only commands print the gap rather than staying quiet.

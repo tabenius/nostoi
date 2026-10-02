@@ -275,10 +275,13 @@ pub fn publish(
     outbox_dir: Option<&Path>,
 ) -> Result<Vec<TargetPublish>> {
     config.validate()?;
+    // The chain is proven before any destination is contacted, so a broken chain
+    // fails the whole batch without touching the network.
     let report = nostoi_core::verify(chain_path, None)?;
     if let Some(problem) = &report.problem {
         return Err(Error::Broken(problem.clone()));
     }
+    check_outbox_dir(outbox_dir)?;
     // One instant for the whole batch: destinations must differ about the chain,
     // never about when they were asked.
     let anchored_at = OffsetDateTime::now_utc();
@@ -328,16 +331,44 @@ pub fn publish(
     Ok(results)
 }
 
+/// Each destination's outbox path, or `None` for every one of them.
+///
+/// A destination either has its own durable outbox or none of them do: mixing the
+/// two would mean some destinations could be retried with their exact bytes after
+/// a crash while others could not, and the report says `durable` per destination
+/// so the operator has to read it. `nostoi-anchor --outbox-dir` therefore applies
+/// to all of them.
 #[cfg(feature = "sqlite")]
 fn outboxes(config: &Fanout, outbox_dir: Option<&Path>) -> Vec<Option<PathBuf>> {
     match outbox_dir {
-        Some(_) => config
-            .outbox_paths(outbox_dir.unwrap_or_else(|| Path::new(".")))
+        Some(dir) => config
+            .outbox_paths(dir)
             .into_iter()
             .map(|(_, path)| Some(path))
             .collect(),
         None => vec![None; config.targets.len()],
     }
+}
+
+/// Why the outbox directory cannot be used, if it cannot.
+///
+/// Checked once per batch rather than letting each destination fail on its own:
+/// `rusqlite`'s "unable to open database file" does not distinguish a missing
+/// directory from a permissions problem, and the fix is different.
+#[cfg(feature = "sqlite")]
+pub fn check_outbox_dir(outbox_dir: Option<&Path>) -> Result<()> {
+    let Some(dir) = outbox_dir else {
+        return Ok(());
+    };
+    if dir.is_dir() {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "outbox directory {} does not exist, so no destination would have durable recovery. \
+         Create it, or point --outbox-dir at an existing one (a systemd unit's \
+         StateDirectory= creates its own).",
+        dir.display()
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]

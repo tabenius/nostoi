@@ -133,6 +133,14 @@ impl Fixture {
         verifier
     }
 
+    /// Sign and write, so a test can assert on the write itself.
+    fn sign_and_write(&self) -> std::result::Result<Sidecars, nostoi::Error> {
+        let mut signer = signer(&self.key);
+        signer.program = ssh_keygen().expect("ssh-keygen");
+        let signed = attest::sign(&self.chain, "production/kernel", None, &signer, None)?;
+        attest::write(&self.chain, &signed)
+    }
+
     /// The attestation currently on disk, without checking its signature.
     fn read_attestation(&self) -> Attestation {
         attest::read(&self.chain).unwrap().unwrap().attestation
@@ -342,22 +350,23 @@ fn formatting_cannot_break_an_attestation_but_editing_it_still_can() {
     .unwrap();
 
     let checked = attest::verify(&fixture.chain, &fixture.pinned()).unwrap();
-    assert_eq!(checked.canonicality, Canonicality::Reformatted);
+    assert_eq!(checked.document.canonicality, Canonicality::Reformatted);
     assert!(checked.coverage.is_current());
     assert_eq!(checked.attestation.canonical_bytes().unwrap(), canonical);
 
     // Repairing touches formatting only, and the signature still applies.
-    assert!(attest::canonicalize(&fixture.chain).unwrap(), "repaired");
-    assert_eq!(std::fs::read(&sidecars.document).unwrap(), canonical);
     assert!(
-        !attest::canonicalize(&fixture.chain).unwrap(),
-        "already canonical"
+        attest::canonicalize(&fixture.chain, &checked.document).unwrap(),
+        "repaired"
     );
+    assert_eq!(std::fs::read(&sidecars.document).unwrap(), canonical);
     assert_eq!(
         attest::verify(&fixture.chain, &fixture.pinned())
             .unwrap()
+            .document
             .canonicality,
-        Canonicality::Canonical
+        Canonicality::Canonical,
+        "an already canonical document needs no repair"
     );
 
     // CRLF is formatting too.
@@ -365,14 +374,32 @@ fn formatting_cannot_break_an_attestation_but_editing_it_still_can() {
         .unwrap()
         .replace('\n', "\r\n");
     std::fs::write(&sidecars.document, crlf.as_bytes()).unwrap();
+    let crlf_checked = attest::verify(&fixture.chain, &fixture.pinned()).unwrap();
     assert_eq!(
-        attest::verify(&fixture.chain, &fixture.pinned())
-            .unwrap()
-            .canonicality,
+        crlf_checked.document.canonicality,
         Canonicality::Reformatted
     );
-    attest::canonicalize(&fixture.chain).unwrap();
+    attest::canonicalize(&fixture.chain, &crlf_checked.document).unwrap();
 
+    // A repair refuses to write over a file that changed since it was verified,
+    // rather than discarding whatever replaced it. The verified document has to
+    // be one that needs repairing, or there is nothing to overwrite.
+    std::fs::write(
+        &sidecars.document,
+        serde_json::to_vec_pretty(&parsed).unwrap(),
+    )
+    .unwrap();
+    let stale = attest::verify(&fixture.chain, &fixture.pinned()).unwrap();
+    assert_eq!(stale.document.canonicality, Canonicality::Reformatted);
+    let tampered = String::from_utf8(canonical.clone())
+        .unwrap()
+        .replace("\"nostoi-v1\"", "\"nostoi-v1 \"");
+    std::fs::write(&sidecars.document, tampered.as_bytes()).unwrap();
+    let error = attest::canonicalize(&fixture.chain, &stale.document).unwrap_err();
+    assert!(error.to_string().contains("changed since"), "{error}");
+    std::fs::write(&sidecars.document, &canonical).unwrap();
+
+    // A changed *value* in a reformatted file is still refused.
     // A changed *value* in a reformatted file is still refused. That is the
     // property that matters, and the reason content is compared canonically.
     let mut altered = parsed;
@@ -754,6 +781,92 @@ fn display_output_is_never_read_back_or_compared() {
 
 fn checked_head(chain: &Path) -> u64 {
     nostoi::verify(chain, None).unwrap().head.unwrap().seq
+}
+
+#[test]
+fn an_oversized_sidecar_is_refused_rather_than_read_into_memory() {
+    let Some(_) = ssh_keygen() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain(dir.path(), 1);
+    let sidecars = Sidecars::for_chain(&chain);
+    std::fs::write(&sidecars.document, vec![b'x'; 4 * 1024 * 1024]).unwrap();
+    std::fs::write(&sidecars.signature, vec![b'x'; 4 * 1024 * 1024]).unwrap();
+
+    // The document limit is 64 KiB, so this is refused on size rather than parsed.
+    let error = nostoi::attest::read(&chain).unwrap_err();
+    let said = error.to_string();
+    assert!(
+        said.contains("byte limit") || said.contains("not valid JSON"),
+        "{said}"
+    );
+
+    // And the signature limit is independent of it.
+    std::fs::write(
+        &sidecars.document,
+        br#"{"v":"nostoi-attestation-v1","chain":"k","format":"nostoi-v1","seq":1,"digest":"0000000000000000000000000000000000000000000000000000000000000000","anchored_at":"2026-01-01T00:00:00Z","principal":"p","fingerprint":"SHA256:x"}"#,
+    )
+    .unwrap();
+    std::fs::write(&sidecars.signature, vec![b'x'; 4 * 1024 * 1024]).unwrap();
+    let mut verifier = Verifier::new(dir.path().join("allowed"), "p");
+    verifier.program = ssh_keygen().unwrap();
+    let error = nostoi::attest::verify(&chain, &verifier).unwrap_err();
+    assert!(error.to_string().contains("byte limit"), "{error}");
+}
+
+#[test]
+fn a_sidecar_that_is_a_symlink_is_not_written_through() {
+    let Some(program) = ssh_keygen() else { return };
+    let fixture = fixture!();
+    let sidecars = Sidecars::for_chain(&fixture.chain);
+
+    // A planted symlink where the sidecar goes would otherwise be followed by
+    // fs::write, turning a create into an overwrite of something else entirely.
+    let elsewhere = fixture._dir.path().join("not-a-sidecar");
+    std::fs::write(&elsewhere, b"original").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&elsewhere, &sidecars.document).unwrap();
+    #[cfg(not(unix))]
+    return;
+
+    let error = fixture.sign_and_write().unwrap_err();
+    assert!(error.to_string().contains("symlink"), "{error}");
+    assert_eq!(
+        std::fs::read(&elsewhere).unwrap(),
+        b"original",
+        "the file the symlink pointed at must be untouched"
+    );
+
+    // Replacing it with a real file works, so this is a refusal and not a
+    // restriction on the directory.
+    std::fs::remove_file(&sidecars.document).unwrap();
+    let _ = program;
+    fixture.sign_and_write().unwrap();
+    assert!(attest::verify(&fixture.chain, &fixture.pinned()).is_ok());
+}
+
+#[test]
+fn a_tilde_path_is_expanded_and_other_accounts_are_not() {
+    // A shell expands `~/` before argv ever sees it; nothing here does.
+    let home = std::env::var("HOME").expect("HOME");
+    assert_eq!(
+        attest::expand_home(Path::new("~/.ssh/id_ed25519")).unwrap(),
+        Path::new(&home).join(".ssh/id_ed25519"),
+        "a leading ~/ is the one form that expands"
+    );
+    assert_eq!(
+        attest::expand_home(Path::new("relative/key")).unwrap(),
+        Path::new("relative/key"),
+        "anything else is left alone"
+    );
+    assert_eq!(
+        attest::expand_home(Path::new("/absolute/key")).unwrap(),
+        Path::new("/absolute/key")
+    );
+
+    // ~user would mean signing with someone else's key by accident.
+    let error = attest::expand_home(Path::new("~root/.ssh/id_ed25519")).unwrap_err();
+    assert!(error.to_string().contains("only ~/"), "{error}");
+    assert!(attest::expand_home(Path::new("~")).is_err());
 }
 
 #[test]

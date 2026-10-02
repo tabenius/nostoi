@@ -151,6 +151,30 @@ fn a_rewritten_chain_is_caught_even_when_its_own_hashes_agree() {
 }
 
 #[test]
+fn an_empty_chain_is_not_reported_as_a_rewritten_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    std::fs::write(&path, "").unwrap();
+
+    // A chain with no records cannot carry an attestation, and saying "record 3's
+    // digest does not match" about a file with no records sends someone hunting
+    // for a corruption that is not there.
+    let head = Head {
+        seq: 3,
+        digest: "a".repeat(64),
+    };
+    let attestation = attest(&head, "kernel");
+    let error = attestation::check(&path, &attestation, None).unwrap_err();
+    let said = error.to_string();
+    assert!(said.contains("no records"), "{said}");
+    assert!(!said.contains("digest"), "{said}");
+
+    // And the outcome is its own, not `Rewritten`.
+    let verification = nostoi_core::verify_streaming(&path, None, Some(3)).unwrap();
+    assert_eq!(attestation.coverage(&verification), Coverage::Empty);
+}
+
+#[test]
 fn a_malformed_document_never_reaches_the_chain() {
     let dir = tempfile::tempdir().unwrap();
     let (path, head) = chain(dir.path(), 2);

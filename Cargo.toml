@@ -9,7 +9,14 @@ repository = "https://github.com/tabenius/nostoi"
 keywords = ["audit", "hash-chain", "tamper-evident", "ledger", "sqlite"]
 categories = ["cryptography", "command-line-utilities", "database"]
 readme = "README.md"
-include = ["/src/**", "/tests/**", "/docs/**", "/examples/**", "/contrib/python/nostoi.py", "/contrib/systemd/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE-*", "/assets/logo.svg"]
+include = ["/src/**", "/tests/*.rs", "/docs/**", "/examples/**", "/contrib/python/nostoi.py", "/contrib/systemd/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE-*", "/assets/logo.svg"]
+# `/tests/*.rs` rather than `/tests/**`, because the attestation suite keeps a
+# committed key pair so its fingerprint can be a known answer. Cargo ignores
+# `exclude` entirely when `include` is present, so the narrowing has to happen
+# here. A passphrase-less private key has no business in a published artifact: it
+# trains everyone to ignore secret-scanner alerts, and it would sign something
+# that looks legitimate. It stays in the repository, and CI checks it is never
+# packaged.
 
 [workspace]
 members = ["bindings/python", "bindings/component", "crates/nostoi-core", "crates/nostoi-anchor", "crates/nostoi-kmsg"]

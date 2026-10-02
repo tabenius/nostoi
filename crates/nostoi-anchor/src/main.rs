@@ -48,12 +48,13 @@ struct Args {
     #[cfg(feature = "sqlite")]
     #[arg(long, conflicts_with = "verify")]
     outbox: Option<PathBuf>,
-    /// S3 endpoint, e.g. https://s3.us-west-2.amazonaws.com or https://<account>.r2.cloudflarestorage.com
+    /// S3 endpoint, e.g. https://s3.us-west-2.amazonaws.com or https://<account>.r2.cloudflarestorage.com.
+    /// Required for a single destination and refused with --targets.
     #[arg(long)]
-    endpoint: String,
-    /// Bucket name
+    endpoint: Option<String>,
+    /// Bucket name. Required for a single destination and refused with --targets.
     #[arg(long)]
-    bucket: String,
+    bucket: Option<String>,
     /// AWS region (use 'auto' for R2)
     #[arg(long, default_value = "auto")]
     region: String,
@@ -128,11 +129,17 @@ fn fail(error: Error) -> Failure {
 
 /// One destination, addressed directly.
 fn run_single(args: &Args) -> Result<ExitCode, Failure> {
+    // `--endpoint` and `--bucket` are optional in the parser because a target
+    // file replaces them, and clap's `required` cannot say "required unless".
+    // Checking here is also what lets --targets refuse them instead of silently
+    // ignoring a half-configured single destination.
+    let endpoint = require(args.endpoint.as_deref(), "--endpoint")?;
+    let bucket = require(args.bucket.as_deref(), "--bucket")?;
     let credentials = load_credentials(args.credentials_dir.as_deref()).map_err(fail)?;
-    let provider = Provider::detect(&args.endpoint);
+    let provider = Provider::detect(endpoint);
     let client = Client::new(
-        &args.endpoint,
-        &args.bucket,
+        endpoint,
+        bucket,
         &args.region,
         args.path_style || provider == Provider::R2,
         credentials,
@@ -190,6 +197,15 @@ fn run_single(args: &Args) -> Result<ExitCode, Failure> {
 
 /// Several destinations from one target file.
 fn run_fanout(args: &Args, path: &Path) -> Result<ExitCode, Failure> {
+    // A half-migrated unit that still passes --endpoint would otherwise publish
+    // to one place while reporting several.
+    if args.endpoint.is_some() || args.bucket.is_some() {
+        return Err(fail(Error::Invalid(
+            "--endpoint and --bucket address one destination; with --targets each destination \
+             carries its own endpoint and bucket in the target file"
+                .into(),
+        )));
+    }
     let mut config = Fanout::load(path).map_err(fail)?;
     // An explicit flag wins over the file, so an operator can point a stored
     // configuration at a different chain without editing it.
@@ -381,6 +397,17 @@ fn provider_name(provider: Provider) -> String {
     match provider {
         Provider::S3 => "s3".to_string(),
         Provider::R2 => "r2".to_string(),
+    }
+}
+
+/// A value the caller has to supply for a single destination.
+fn require<'a>(value: Option<&'a str>, flag: &str) -> Result<&'a str, Failure> {
+    match value {
+        Some(value) if !value.is_empty() => Ok(value),
+        _ => Err(fail(Error::Invalid(format!(
+            "{flag} is required when addressing a single destination; with --targets each \
+             destination carries its own"
+        )))),
     }
 }
 

@@ -21,6 +21,183 @@ fn repo_root() -> std::path::PathBuf {
 }
 
 #[test]
+fn the_runners_fan_out_argv_is_accepted_by_the_real_binary() {
+    // The runner's own tests record argv against a fake executable, so they cannot
+    // see whether the real parser accepts it. They did not: --endpoint and --bucket
+    // were `required`, so every fan-out run through the runner died on argument
+    // parsing, before a single destination was contacted. This runs the real
+    // binary with exactly the arguments the runner builds.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("audit.jsonl");
+    nostoi_core::append(
+        &source,
+        nostoi_core::Draft {
+            actor: None,
+            kind: "test",
+            subject: None,
+            body: serde_json::json!({"event": 1}),
+            at: None,
+        },
+    )
+    .unwrap();
+
+    let targets = dir.path().join("anchors.json");
+    std::fs::write(
+        &targets,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "targets": [
+                {
+                    "name": "one",
+                    "endpoint": "https://s3.us-west-2.amazonaws.com",
+                    "bucket": "b",
+                    "region": "us-west-2",
+                    "lock": "compliance",
+                    "retain_days": 365,
+                    "credentials": "one",
+                },
+                {
+                    "name": "two",
+                    "endpoint": "https://s3.us-west-004.backblazeb2.com",
+                    "bucket": "b",
+                    "region": "us-west-004",
+                    "path_style": true,
+                    "lock": "compliance",
+                    "retain_days": 365,
+                    "credentials": "two",
+                },
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let credentials = dir.path().join("credentials");
+    for name in ["one", "two"] {
+        let sub = credentials.join(name);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("aws-access-key-id"),
+            format!(
+                "{name}-key
+"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            sub.join("aws-secret-access-key"),
+            format!(
+                "{name}-secret
+"
+            ),
+        )
+        .unwrap();
+    }
+    let outbox_dir = dir.path().join("outbox");
+    std::fs::create_dir_all(&outbox_dir).unwrap();
+
+    // Exactly what nostoi-anchor-runner execs in fan-out mode.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_nostoi-anchor"))
+        .arg(&source)
+        .arg("--targets")
+        .arg(&targets)
+        .arg("--chain-id")
+        .arg("scheduled-chain")
+        .arg("--credentials-dir")
+        .arg(&credentials)
+        .arg("--outbox-dir")
+        .arg(&outbox_dir)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("required"),
+        "the runner's argv must parse: {stderr}"
+    );
+    // Exit 2 is the uncertain-upload code and 3 the unconfirmed one; anything else
+    // is argument parsing or a usage error, which is what this is about.
+    assert!(
+        matches!(output.status.code(), Some(2) | Some(3)),
+        "expected a per-destination failure, not a usage error: status {:?}\n{stderr}",
+        output.status.code()
+    );
+
+    // And the two modes cannot be mixed: a half-migrated unit must fail loudly
+    // rather than quietly publish to one destination while reporting several.
+    let mixed = std::process::Command::new(env!("CARGO_BIN_EXE_nostoi-anchor"))
+        .arg(&source)
+        .arg("--targets")
+        .arg(&targets)
+        .arg("--endpoint")
+        .arg("https://s3.us-west-2.amazonaws.com")
+        .arg("--bucket")
+        .arg("b")
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&mixed.stderr).contains("one destination"),
+        "{:?}",
+        String::from_utf8_lossy(&mixed.stderr)
+    );
+    assert_ne!(mixed.status.code(), Some(0));
+
+    // A single destination still names what it is missing.
+    let single = std::process::Command::new(env!("CARGO_BIN_EXE_nostoi-anchor"))
+        .arg(&source)
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&single.stderr);
+    assert!(said.contains("--endpoint is required"), "{said}");
+}
+
+#[test]
+fn a_missing_outbox_directory_is_named_rather_than_left_to_the_database_driver() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("audit.jsonl");
+    nostoi_core::append(
+        &source,
+        nostoi_core::Draft {
+            actor: None,
+            kind: "test",
+            subject: None,
+            body: serde_json::json!({"event": 1}),
+            at: None,
+        },
+    )
+    .unwrap();
+    let targets = dir.path().join("anchors.json");
+    std::fs::write(
+        &targets,
+        serde_json::json!({
+            "targets": [{
+                "name": "one",
+                "endpoint": "https://s3.us-west-2.amazonaws.com",
+                "bucket": "b",
+                "region": "us-west-2",
+                "credentials": "one",
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let credentials = dir.path().join("credentials");
+    std::fs::create_dir_all(credentials.join("one")).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_nostoi-anchor"))
+        .arg(&source)
+        .arg("--targets")
+        .arg(&targets)
+        .arg("--credentials-dir")
+        .arg(&credentials)
+        .arg("--outbox-dir")
+        .arg(dir.path().join("absent"))
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("does not exist"), "{said}");
+    // Not the driver's phrasing, which does not say what to do about it.
+    assert!(!said.contains("unable to open database file"), "{said}");
+}
+
+#[test]
 fn scheduled_publish_uses_durable_outbox_and_verifier_uses_separate_credentials() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("audit.jsonl");

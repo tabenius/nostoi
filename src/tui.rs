@@ -26,6 +26,8 @@ pub struct App {
     detail: bool,
     /// One line about the chain's attestation, shown under the status.
     attestation: String,
+    /// The document, read on reload so drawing never reads a file.
+    attestation_document: Option<crate::attest::ReadDocument>,
     /// Whether the detail pane is showing a record or the attestation.
     pane: Pane,
     quit: bool,
@@ -53,6 +55,7 @@ impl App {
             follow: false,
             detail: true,
             attestation: String::new(),
+            attestation_document: None,
             pane: Pane::Record,
             quit: false,
         };
@@ -66,16 +69,15 @@ impl App {
         match open(&self.path, self.format) {
             Ok(loaded) => {
                 let report = loaded.verify();
-                self.attestation = crate::attest::summary(
-                    &self.path,
-                    report.head.as_ref().map_or(0, |head| head.seq),
-                );
+                // Read the attestation once per reload rather than once per frame:
+                // drawing happens many times a second, and this parses a file.
+                self.read_attestation(report.head.as_ref().map_or(0, |head| head.seq));
                 self.report = Some(report);
                 self.entries = loaded.entries;
                 self.error = None;
             }
             Err(error) => {
-                self.attestation = crate::attest::summary(&self.path, 0);
+                self.read_attestation(0);
                 self.error = Some(error.to_string());
             }
         }
@@ -164,6 +166,16 @@ impl App {
             .position(|&i| self.entries[i].seq >= seq);
         self.table
             .select(pos.or(Some(self.visible.len().saturating_sub(1))));
+    }
+
+    /// Refresh the cached attestation state. Everything the browser shows about
+    /// an attestation comes from here, so no draw path touches the filesystem.
+    fn read_attestation(&mut self, head_seq: u64) {
+        self.attestation_document = crate::attest::present(&self.path);
+        self.attestation = match &self.attestation_document {
+            Some(read) => crate::attest::describe(&read.attestation, head_seq, &self.path),
+            None => crate::attest::summary(&self.path, head_seq),
+        };
     }
 
     pub fn key(&mut self, key: KeyEvent) {
@@ -367,12 +379,14 @@ impl App {
 
     fn draw_detail(&self, frame: &mut Frame, area: Rect) {
         if self.pane == Pane::Attestation {
-            let (title, body) = match crate::attest::present(&self.path) {
+            let (title, body) = match &self.attestation_document {
                 Some(read) => (
                     format!(
                         " attestation seq={} · signature NOT checked here ",
                         read.attestation.seq
                     ),
+                    // Rendered from the parsed document. Nothing a human sees here
+                    // is ever read back or compared.
                     serde_json::to_string_pretty(&read.attestation).unwrap_or_default(),
                 ),
                 None => (
@@ -381,7 +395,7 @@ impl App {
                         "{}\n\nsign one with:\n  nostoi attest {} --principal you@host\n\n\
                          check an existing one with:\n  nostoi verify-attestation {} \
                          --allowed-signers FILE --principal you@host --fingerprint SHA256:…",
-                        crate::attest::summary(&self.path, 0),
+                        self.attestation,
                         self.path.display(),
                         self.path.display()
                     ),

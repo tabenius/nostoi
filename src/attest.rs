@@ -28,9 +28,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use nostoi_core::attestation::{
-    self, Attestation, Attested, ReadDocument, Sidecars, DEFAULT_NAMESPACE,
-};
+use nostoi_core::attestation::{self, Attestation, Attested, Sidecars, DEFAULT_NAMESPACE};
+
+pub use nostoi_core::attestation::{Canonicality, ReadDocument};
 use nostoi_core::time::now as now_rfc3339;
 use nostoi_core::Format;
 
@@ -107,6 +107,32 @@ impl Verifier {
     pub fn pin(mut self, fingerprint: impl Into<String>) -> Self {
         self.fingerprint = Some(fingerprint.into());
         self
+    }
+}
+
+/// Expand a leading `~/`, which a shell would normally do and an argv will not.
+///
+/// `~user` is deliberately refused rather than resolved: looking up another
+/// account's home means reading the password database, and silently signing with
+/// someone else's key is worse than an error. `HOME` unset is also an error, since
+/// the literal path would otherwise reach `ssh-keygen` and produce a complaint
+/// about a file that cannot exist.
+pub fn expand_home(path: &Path) -> Result<PathBuf> {
+    let text = path.to_string_lossy();
+    if text.starts_with('~') && !text.starts_with("~/") {
+        return Err(Error::Invalid(format!(
+            "{text} cannot be expanded: only ~/ is understood here. Pass the path to the \
+             key directly if you meant another account."
+        )));
+    }
+    match text.strip_prefix("~/") {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(home) if !home.is_empty() => Ok(Path::new(&home).join(rest)),
+            _ => Err(Error::Invalid(format!(
+                "cannot expand {text}: HOME is not set, so pass an absolute path to the key"
+            ))),
+        },
+        None => Ok(path.to_path_buf()),
     }
 }
 
@@ -229,7 +255,7 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
 /// The signing key's fingerprint, as `ssh-keygen` reports it.
 pub fn fingerprint(program: &Path, key: &Path) -> Result<String> {
     let output = run(program, &["-lf", &key.to_string_lossy()])?;
-    parse_fingerprint(&output.stdout)
+    parse_fingerprint(&output)
         .ok_or_else(|| Error::Invalid(format!("could not read a fingerprint from {key:?}")))
 }
 
@@ -250,7 +276,7 @@ fn public_key(program: &Path, key: &Path) -> Result<String> {
     let sidecar = std::path::PathBuf::from(sidecar);
     let text = match std::fs::read_to_string(&sidecar) {
         Ok(text) => text,
-        Err(_) => run(program, &["-y", "-f", &key.to_string_lossy()])?.stdout,
+        Err(_) => run(program, &["-y", "-f", &key.to_string_lossy()])?,
     };
     let public = text.trim();
     if !(public.starts_with("ssh-")
@@ -312,11 +338,36 @@ pub fn sign(
 /// Write a signed attestation beside its chain.
 pub fn write(chain: &Path, signed: &Signed) -> Result<Sidecars> {
     let sidecars = Sidecars::for_chain(chain);
-    std::fs::write(&sidecars.document, &signed.document)
-        .map_err(crate::error::io(&sidecars.document))?;
-    std::fs::write(&sidecars.signature, &signed.signature)
-        .map_err(crate::error::io(&sidecars.signature))?;
+    write_sidecar(&sidecars.document, &signed.document)?;
+    write_sidecar(&sidecars.signature, &signed.signature)?;
     Ok(sidecars)
+}
+
+/// Write one sidecar, refusing to write through a symlink.
+///
+/// `fs::write` follows symlinks, so a planted `audit.jsonl.attestation.sig`
+/// pointing somewhere else would be overwritten by us rather than created. That
+/// is worth refusing: these files sit next to an audit chain, which is exactly
+/// where something might try to redirect a write.
+///
+/// This is best effort and says so. A symlink created between the check and the
+/// write still wins, and protecting the directory components too would need
+/// `openat` with `O_NOFOLLOW` on each one. Catching the planted-in-advance case
+/// and the accidental one is what this buys.
+fn write_sidecar(path: &Path, bytes: &[u8]) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(Error::Invalid(format!(
+                "{} is a symlink, so it was not written; move it aside if that is \
+                 intended, and check what it points at",
+                path.display()
+            )))
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(crate::error::io(path)(error)),
+    }
+    std::fs::write(path, bytes).map_err(crate::error::io(path))
 }
 
 /// The chain's head and the format name the verifier detected.
@@ -356,17 +407,28 @@ pub fn read(chain: &Path) -> Result<Option<ReadDocument>> {
 /// whether it still covers the head, but not that it is genuine. See
 /// [`verify`] for that.
 pub fn summary(chain: &Path, head_seq: u64) -> String {
-    let Some(read) = present(chain) else {
-        let sidecars = Sidecars::for_chain(chain);
-        return match sidecars.missing_description() {
-            Some(missing) => format!(
-                "no attestation ({missing}); sign one with: nostoi attest {} --principal you@host",
-                chain.display()
-            ),
-            None => format!("no readable attestation beside {}", chain.display()),
-        };
-    };
-    let attestation = read.attestation;
+    match present(chain) {
+        Some(read) => describe(&read.attestation, head_seq, chain),
+        None => {
+            let sidecars = Sidecars::for_chain(chain);
+            match sidecars.missing_description() {
+                Some(missing) => format!(
+                    "no attestation ({missing}); sign one with: \
+                     nostoi attest {} --principal you@host",
+                    chain.display()
+                ),
+                None => format!("no readable attestation beside {}", chain.display()),
+            }
+        }
+    }
+}
+
+/// One line about an attestation that has already been read.
+///
+/// Split from [`summary`] so a caller that has the document in hand does not read
+/// it again, which is what the browser does on every reload and must not do on
+/// every frame.
+pub fn describe(attestation: &Attestation, head_seq: u64, chain: &Path) -> String {
     let short = attestation
         .fingerprint
         .split_once(':')
@@ -428,10 +490,9 @@ pub fn verify(chain: &Path, verifier: &Verifier) -> Result<Attested> {
     let sidecars = Sidecars::for_chain(chain);
     let read = read(chain)?.expect("read checked for the sidecars");
     let attestation = read.attestation;
-    let canonicality = read.document.canonicality;
-    let canonical = read.document.canonical;
+    let canonical = read.document.canonical.clone();
     let signature =
-        std::fs::read(&sidecars.signature).map_err(crate::error::io(&sidecars.signature))?;
+        read_bounded(&sidecars.signature, MAX_SIGNATURE_BYTES).map_err(Error::Invalid)?;
     if signature.is_empty() {
         return Err(Error::Invalid(format!(
             "{} is empty: an attestation with no signature proves nothing",
@@ -462,30 +523,41 @@ pub fn verify(chain: &Path, verifier: &Verifier) -> Result<Attested> {
         }
     }
     let mut checked = attestation::check(chain, &attestation, None).map_err(Error::from)?;
-    checked.canonicality = canonicality;
+    checked.document = read.document;
     Ok(checked)
 }
 
-/// Rewrite the document in canonical form.
+/// Rewrite the document in canonical form, if it is not already.
 ///
-/// Only ever called after the signature has been checked against the canonical
-/// bytes, which is what makes this lossless: the bytes being replaced are the
-/// bytes the signature already covers.
-pub fn canonicalize(chain: &Path) -> Result<bool> {
+/// Takes the document that was verified rather than reading its own, which does
+/// two things. It makes the coupling explicit instead of conventional: the bytes
+/// being replaced are provably the bytes the signature already covers. And it
+/// closes a lost-update window — between verifying and repairing, the file could
+/// have changed, and writing the older canonical form would silently discard
+/// whatever replaced it. So the file is re-read and compared first, and a change
+/// is an error rather than an overwrite.
+pub fn canonicalize(chain: &Path, verified: &nostoi_core::attestation::Document) -> Result<bool> {
     let sidecars = Sidecars::for_chain(chain);
-    let read = read(chain)?.expect("read checked for the sidecars");
-    if read.document.canonicality.is_canonical() {
+    if verified.canonicality.is_canonical() {
         return Ok(false);
     }
-    std::fs::write(&sidecars.document, &read.document.canonical)
-        .map_err(crate::error::io(&sidecars.document))?;
+    let current =
+        std::fs::read(&sidecars.document).map_err(crate::error::io(&sidecars.document))?;
+    if current != verified.on_disk {
+        return Err(Error::Invalid(format!(
+            "{} changed since it was verified, so it was not rewritten; run \
+             verify-attestation again",
+            sidecars.document.display()
+        )));
+    }
+    write_sidecar(&sidecars.document, verified.canonical.as_bytes())?;
     Ok(true)
 }
 
 /// Sign bytes with `ssh-keygen -Y sign`.
 fn sign_bytes(program: &Path, key: &Path, namespace: &str, document: &[u8]) -> Result<Vec<u8>> {
-    // ssh-keygen signs a file and writes `<file>.sig`, so the bytes go to a
-    // private temporary directory that is removed afterwards.
+    // ssh-keygen signs a file and writes `<file>.sig` beside it, so the bytes go
+    // to a private temporary directory that removes itself.
     let dir = temp_dir("nostoi-attest")?;
     let path = dir.join("attestation.json");
     std::fs::write(&path, document).map_err(crate::error::io(&path))?;
@@ -503,12 +575,11 @@ fn sign_bytes(program: &Path, key: &Path, namespace: &str, document: &[u8]) -> R
     )
     .map_err(|error| explain_signing_failure(error, key))?;
     let signature_path = dir.join("attestation.json.sig");
-    let signature = std::fs::read(&signature_path).map_err(|error| {
+    let signature = read_bounded(&signature_path, MAX_SIGNATURE_BYTES).map_err(|error| {
         Error::Invalid(format!(
-            "ssh-keygen reported success but wrote no signature ({error})"
+            "ssh-keygen reported success but wrote no readable signature ({error})"
         ))
     })?;
-    let _ = std::fs::remove_dir_all(&dir);
     Ok(signature)
 }
 
@@ -551,7 +622,6 @@ fn verify_bytes(
     let output = child.wait_with_output().map_err(|error| {
         Error::Invalid(format!("{} did not finish: {error}", program.display()))
     })?;
-    let _ = std::fs::remove_dir_all(&dir);
     if !output.status.success() {
         return Err(Error::Invalid(verification_failure(
             &allowed_signers.to_string_lossy(),
@@ -622,36 +692,73 @@ fn explain_signing_failure(error: Error, key: &Path) -> Error {
     ))
 }
 
-/// Run a program and capture its output.
-fn run(program: &Path, args: &[&str]) -> Result<Output> {
+/// The largest signature we will read. An armored SSHSIG block is around a
+/// kilobyte.
+///
+/// The document limit lives next to the document reader, in `nostoi-core`, since
+/// that is where the read happens and every caller benefits.
+const MAX_SIGNATURE_BYTES: u64 = 1024 * 1024;
+
+/// Read a file, refusing one larger than `limit`.
+fn read_bounded(path: &Path, limit: u64) -> std::result::Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot open {} ({error})", path.display()))?;
+    let size = file
+        .metadata()
+        .map_err(|error| format!("cannot stat {} ({error})", path.display()))?
+        .len();
+    if size > limit {
+        return Err(format!(
+            "{} is {size} bytes, over the {limit} byte limit for this kind of file",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {} ({error})", path.display()))?;
+    if bytes.len() as u64 > limit {
+        // The file grew between the stat and the read.
+        return Err(format!(
+            "{} is larger than the {limit} byte limit",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Run a program and return its standard output.
+///
+/// Both streams are read because some of ssh-keygen's refusals are split across
+/// them, but only standard output is returned: the interesting part of a failure is
+/// folded into the error here, and a captured stderr that nothing reads is worse
+/// than no field at all.
+fn run(program: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| Error::Invalid(format!("cannot run {}: {error}", program.display())))?;
     if !output.status.success() {
-        let said = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
         return Err(Error::Invalid(format!(
             "{} {} failed: {}",
             program.display(),
             args.first().copied().unwrap_or_default(),
-            first_line(&said)
+            first_line(&both(&output.stdout, &output.stderr))
         )));
     }
-    Ok(Output {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-struct Output {
-    stdout: String,
-    #[allow(dead_code)]
-    stderr: String,
+/// Two captured streams as one string, since some tools split a message across
+/// them and reporting half of it sends people looking in the wrong place.
+fn both(a: &[u8], b: &[u8]) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(a),
+        String::from_utf8_lossy(b)
+    )
 }
 
 /// The `SHA256:...` token from an `ssh-keygen` line.
@@ -681,19 +788,119 @@ fn first_line(text: &str) -> String {
     }
 }
 
-/// A private directory for the bytes handed to `ssh-keygen`.
-fn temp_dir(prefix: &str) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
-        // Time is not available in nostoi-core without its own clock import, and
-        // the pid plus an existing-file check is enough to avoid collisions
-        // between concurrent runs on one host.
-        std::time::SystemTime::now()
+/// A private directory for the bytes handed to `ssh-keygen`, removed on drop.
+///
+/// Three properties, each of which `create_dir_all` alone does not give:
+///
+/// * **Private.** The mode is forced to 0700. A umask-derived directory is
+///   typically 0775, which is group-writable: another account in the same group
+///   could read the document or, worse, write into it.
+/// * **Exclusive.** `mkdir` fails if the name exists, and the name is derived
+///   from the pid and a clock, so it is guessable. Adopting a directory somebody
+///   else created is how an attacker gets a path they control into our own
+///   process. A collision retries under a new name instead.
+/// * **Temporary.** The guard removes the directory on every path out, including
+///   the error paths. Removing it by hand at the end of the happy path leaks a
+///   directory per failed attempt otherwise.
+///
+/// The remaining risk is a symlink planted inside the directory after it is
+/// created: `ssh-keygen` writes `<file>.sig` beside the file it is given, and
+/// would follow a symlink there. The window is small and the directory is 0700,
+/// so this is hardening rather than a guarantee.
+fn temp_dir(prefix: &str) -> Result<TempDir> {
+    for attempt in 0..ATTEMPTS {
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos())
-            .unwrap_or_default()
-    ));
-    std::fs::create_dir_all(&dir).map_err(crate::error::io(&dir))?;
-    Ok(dir)
+            .unwrap_or_default();
+        let dir =
+            std::env::temp_dir().join(format!("{prefix}-{}-{nanos}-{attempt}", std::process::id()));
+        match create_private(&dir) {
+            Ok(()) => return Ok(TempDir { path: dir }),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists && attempt + 1 < ATTEMPTS => {}
+            Err(error) => return Err(crate::error::io(&dir)(error)),
+        }
+    }
+    Err(Error::Invalid(format!(
+        "could not create a private directory under {}",
+        std::env::temp_dir().display()
+    )))
+}
+
+/// How many names to try before giving up on a collision.
+const ATTEMPTS: usize = 8;
+
+/// Create one directory, privately, and fail if it already exists.
+///
+/// `create_dir_all` is the wrong call twice over: it derives the mode from the
+/// umask, and it succeeds on a directory that is already there. The second is
+/// the dangerous one, because the name is derived from the pid and a clock.
+fn create_private(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// A directory that deletes itself when it goes out of scope.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn join(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // A failure here would mask the error that caused the drop, so it is
+        // deliberately ignored. Nothing of value is left behind either way: the
+        // only files are the document being signed and the signature.
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_directory_is_private_and_unique_and_self_removing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let first = temp_dir("nostoi-test").unwrap();
+        let second = temp_dir("nostoi-test").unwrap();
+        assert_ne!(first.path, second.path, "each call gets its own directory");
+        assert_eq!(
+            std::fs::metadata(&first.path).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the mode must be forced, not inherited from the umask"
+        );
+
+        let path = first.path.clone();
+        drop(first);
+        assert!(
+            !path.exists(),
+            "dropping the guard must remove the directory"
+        );
+        drop(second);
+    }
+
+    #[test]
+    fn an_existing_directory_is_refused_rather_than_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("taken");
+        create_private(&existing).unwrap();
+        // Adopting somebody else's directory is how a path they control ends up in
+        // our own process, so a second attempt has to fail.
+        let error = create_private(&existing).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    }
 }

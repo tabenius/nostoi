@@ -383,8 +383,18 @@ fn run(command: Command) -> Result<ExitCode, String> {
             dry_run,
             json,
         } => attest(
-            &path, &key, &principal, &chain_id, format, &namespace, anchor_key, &program, dry_run,
-            json,
+            &path,
+            AttestOptions {
+                key: &key,
+                principal: &principal,
+                chain_id: &chain_id,
+                format,
+                namespace: &namespace,
+                anchor_key,
+                program: &program,
+                dry_run,
+                json,
+            },
         ),
         Command::VerifyAttestation {
             path,
@@ -543,21 +553,37 @@ fn attestation_summary(path: &Path, report: &Report) -> String {
     nostoi::attest::summary(path, report.head.as_ref().map_or(0, |head| head.seq))
 }
 
-/// `nostoi attest`: sign the current head and report what to install.
-#[allow(clippy::too_many_arguments)]
-fn attest(
-    path: &Path,
-    key: &Path,
-    principal: &str,
-    chain_id: &str,
+/// The options `attest` takes, gathered for the same reason as
+/// [`VerifyOptions`].
+struct AttestOptions<'a> {
+    key: &'a Path,
+    principal: &'a str,
+    chain_id: &'a str,
     format: Option<Format>,
-    namespace: &str,
+    namespace: &'a str,
     anchor_key: Option<String>,
-    program: &Path,
+    program: &'a Path,
     dry_run: bool,
     json: bool,
-) -> Result<ExitCode, String> {
-    let mut signer = nostoi::attest::Signer::new(expand(key), principal);
+}
+
+/// `nostoi attest`: sign the current head and report what to install.
+fn attest(path: &Path, options: AttestOptions<'_>) -> Result<ExitCode, String> {
+    let AttestOptions {
+        key,
+        principal,
+        chain_id,
+        format,
+        namespace,
+        anchor_key,
+        program,
+        dry_run,
+        json,
+    } = options;
+    let mut signer = nostoi::attest::Signer::new(
+        nostoi::attest::expand_home(key).map_err(|e| e.to_string())?,
+        principal,
+    );
     signer.namespace = namespace.to_string();
     signer.program = program.to_path_buf();
     let signed = nostoi::attest::sign(path, chain_id, format, &signer, anchor_key)
@@ -628,8 +654,7 @@ fn attest(
     Ok(ExitCode::SUCCESS)
 }
 
-/// The options `verify-attestation` takes, gathered so the call site reads as
-/// named arguments rather than eight positional ones.
+/// The options `verify-attestation` takes, gathered for the same reason.
 struct VerifyOptions<'a> {
     allowed_signers: &'a Path,
     principal: &'a str,
@@ -660,8 +685,11 @@ fn verify_attestation(path: &Path, options: VerifyOptions) -> Result<ExitCode, S
         Ok(checked) => {
             // Repair once, before printing, so a write never hides inside a
             // serialization and the report describes what it just did.
-            let repaired = match canonicalize && !checked.canonicality.is_canonical() {
-                true => Some(nostoi::attest::canonicalize(path).map_err(|e| e.to_string())?),
+            let repaired = match canonicalize && !checked.document.canonicality.is_canonical() {
+                true => Some(
+                    nostoi::attest::canonicalize(path, &checked.document)
+                        .map_err(|e| e.to_string())?,
+                ),
                 false => None,
             };
             let signed_bytes = checked
@@ -690,7 +718,7 @@ fn verify_attestation(path: &Path, options: VerifyOptions) -> Result<ExitCode, S
                         "digest": checked.attestation.digest,
                         "head": checked.head,
                         "anchor_key": checked.attestation.anchor_key,
-                        "canonical_form": checked.canonicality.is_canonical(),
+                        "canonical_form": checked.document.canonicality.is_canonical(),
                         "canonicalized": repaired,
                         "signed_bytes": signed_bytes,
                     })
@@ -721,7 +749,7 @@ fn verify_attestation(path: &Path, options: VerifyOptions) -> Result<ExitCode, S
                 }
                 // Formatting is never a security failure, so it is a note rather
                 // than an error, and repairable.
-                if !checked.canonicality.is_canonical() {
+                if !checked.document.canonicality.is_canonical() {
                     println!(
                         "  note: the document is formatted, not canonical; the signature \
                          covers the same content either way"
@@ -765,18 +793,6 @@ fn verify_attestation(path: &Path, options: VerifyOptions) -> Result<ExitCode, S
             }
             Ok(ExitCode::from(1))
         }
-    }
-}
-
-/// Expand a leading `~`, which a shell would normally do and an argv will not.
-fn expand(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    match text.strip_prefix("~/") {
-        Some(rest) => match std::env::var("HOME") {
-            Ok(home) => Path::new(&home).join(rest),
-            Err(_) => path.to_path_buf(),
-        },
-        None => path.to_path_buf(),
     }
 }
 

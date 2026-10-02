@@ -1,13 +1,14 @@
 //! Chains stored as JSON Lines: one record per line, appended, never edited.
 //!
 //! Reading detects the format from the first record (`"v": "nostoi-v1"`, or
-//! WeftMark's `sequence`/`previous_digest`). Appending (nostoi-v1 only) takes an
+//! WeftMark's `sequence`/`previous_digest`, or Ephor's
+//! `chain_sequence`/`previous_hash`). Appending (nostoi-v1 only) takes an
 //! exclusive lock on the file, re-verifies the chain, refuses to extend a broken
 //! one, writes one line and syncs it to disk before returning.
 
 use crate::chain::{self, Entry, Problem, GENESIS};
 use crate::error::{io, Error, Result};
-use crate::format::{self, Format};
+use crate::format::{self, EphorEvent, Format};
 use serde_json::Value;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -34,6 +35,8 @@ pub fn detect(record: &Value) -> Option<Format> {
         Some(Format::Nostoi)
     } else if map.contains_key("previous_digest") && map.contains_key("sequence") {
         Some(Format::WeftmarkLedger)
+    } else if map.contains_key("chain_sequence") && map.contains_key("previous_hash") {
+        Some(Format::EphorAudit)
     } else {
         None
     }
@@ -41,8 +44,33 @@ pub fn detect(record: &Value) -> Option<Format> {
 
 /// Read a JSONL chain from any reader.
 pub fn read(reader: impl Read, format: Option<Format>) -> Result<Loaded> {
-    let mut format = format;
     let mut entries = Vec::new();
+    let (format, unreadable) = scan(reader, format, |entry| entries.push(entry))?;
+    Ok(Loaded {
+        format,
+        entries,
+        unreadable,
+    })
+}
+
+/// Verify JSON Lines from a reader, retaining at most the current record.
+/// Reads through chain failures to preserve counts and read-error precedence.
+pub fn verify_reader(
+    reader: impl Read,
+    format: Option<Format>,
+    checkpoint_seq: Option<u64>,
+) -> Result<chain::StreamingVerification> {
+    let mut verifier = chain::Verifier::new(checkpoint_seq);
+    let (format, unreadable) = scan(reader, format, |entry| verifier.push(&entry))?;
+    Ok(verifier.finish(format.name(), unreadable))
+}
+
+fn scan(
+    reader: impl Read,
+    format: Option<Format>,
+    mut visit: impl FnMut(Entry),
+) -> Result<(Format, Option<Problem>)> {
+    let mut format = format;
     let mut unreadable = None;
     for (index, line) in BufReader::new(reader).lines().enumerate() {
         let at = index as u64 + 1;
@@ -76,35 +104,61 @@ pub fn read(reader: impl Read, format: Option<Format>) -> Result<Loaded> {
                     format = Some(found);
                     found
                 }
-                None => {
-                    return Err(Error::Invalid(
-                        "not a chain Nostoi knows (nostoi-v1 or weftmark-ledger-v1)".into(),
-                    ))
-                }
+                None => return Err(Error::Invalid(
+                    "not a chain Nostoi knows (nostoi-v1, weftmark-ledger-v1 or ephor-audit-v1)"
+                        .into(),
+                )),
             },
         };
         let parsed = match this {
             Format::Nostoi => format::nostoi_entry(record),
             Format::WeftmarkLedger => format::weftmark_entry(record),
-            Format::EphorAudit => {
-                return Err(Error::Invalid(
-                    "ephor-audit-v1 chains live in SQLite, not JSONL".into(),
-                ))
-            }
+            Format::EphorAudit => ephor_entry(record),
         };
         match parsed {
-            Ok(entry) => entries.push(entry),
+            Ok(entry) => visit(entry),
             Err(detail) => {
                 unreadable = Some(Problem::Unreadable { at, detail });
                 break;
             }
         }
     }
-    Ok(Loaded {
-        format: format.unwrap_or(Format::Nostoi),
-        entries,
-        unreadable,
-    })
+    Ok((format.unwrap_or(Format::Nostoi), unreadable))
+}
+
+// Decode Ephor's exported record shape; hashing and Entry conversion stay in
+// EphorEvent, shared with the SQLite reader.
+fn ephor_entry(record: Value) -> std::result::Result<Entry, String> {
+    let text = |key: &str| {
+        record[key]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{key} is not a string"))
+    };
+    let number = |key: &str| {
+        record[key]
+            .as_u64()
+            .ok_or_else(|| format!("{key} is not a positive integer"))
+    };
+    let list = |key: &str| {
+        serde_json::from_value::<Vec<String>>(record[key].clone())
+            .map_err(|e| format!("{key} is not an array of strings: {e}"))
+    };
+    Ok(EphorEvent {
+        chain_sequence: number("chain_sequence")?,
+        id: text("id")?,
+        node_id: text("node_id")?,
+        aggregate_id: text("aggregate_id")?,
+        agent_class: text("agent_class")?,
+        action: text("action")?,
+        arguments: list("arguments")?,
+        outcome: text("outcome")?,
+        occurred_at_ms: number("occurred_at_ms")?,
+        caller_stack: list("caller_stack")?,
+        previous_hash: text("previous_hash")?,
+        signature: text("signature")?,
+    }
+    .entry())
 }
 
 /// Read a JSONL chain file.
@@ -140,8 +194,7 @@ pub fn append(path: &Path, draft: Draft<'_>) -> Result<Entry> {
 
 fn append_locked(path: &Path, file: &mut File, draft: Draft<'_>) -> Result<Entry> {
     file.seek(SeekFrom::Start(0)).map_err(io(path))?;
-    let loaded = read(&mut *file, Some(Format::Nostoi))?;
-    let report = loaded.verify();
+    let report = verify_reader(&mut *file, Some(Format::Nostoi), None)?.report;
     if let Some(problem) = report.problem {
         return Err(Error::Broken(problem));
     }

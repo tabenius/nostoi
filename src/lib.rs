@@ -59,7 +59,7 @@ pub mod time;
 #[cfg(feature = "tui")]
 pub mod tui;
 
-pub use chain::{Entry, Head, Problem, Report, GENESIS};
+pub use chain::{Entry, Head, Problem, Report, StreamingVerification, GENESIS};
 pub use error::{Error, Result};
 pub use format::Format;
 pub use jsonl::{Draft, Loaded};
@@ -76,9 +76,32 @@ pub fn open(path: &Path, format: Option<Format>) -> Result<Loaded> {
     jsonl::load(path, format)
 }
 
-/// Verify the chain at `path`.
+/// Verify the entire chain at `path` with record memory bounded by its largest
+/// record. See [`verify_streaming`] to also collect a checkpoint position.
 pub fn verify(path: &Path, format: Option<Format>) -> Result<Report> {
-    Ok(open(path, format)?.verify())
+    Ok(verify_streaming(path, format, None)?.report)
+}
+
+/// Verify the entire chain from genesis, optionally collecting the digest at
+/// `checkpoint_seq`. No local watermark is trusted and the suffix is checked.
+/// Memory for records is bounded by the largest record, not chain length.
+/// SQLite reads use one coherent snapshot; JSONL reads use buffered lines.
+/// A returned checkpoint can describe an intact prefix of a broken chain:
+/// always check `report.ok` before accepting the full history.
+pub fn verify_streaming(
+    path: &Path,
+    format: Option<Format>,
+    checkpoint_seq: Option<u64>,
+) -> Result<StreamingVerification> {
+    #[cfg(feature = "sqlite")]
+    if sqlite::is_sqlite(path) {
+        return sqlite::verify_streaming(path, format, checkpoint_seq);
+    }
+    jsonl::verify_reader(
+        std::fs::File::open(path).map_err(error::io(path))?,
+        format,
+        checkpoint_seq,
+    )
 }
 
 /// Append a `nostoi-v1` record to the chain at `path`, creating it if needed:

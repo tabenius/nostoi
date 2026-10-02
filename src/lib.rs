@@ -54,6 +54,8 @@ pub mod portable;
 #[cfg(feature = "s3")]
 pub mod s3;
 #[cfg(feature = "sqlite")]
+pub mod schema;
+#[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod time;
 #[cfg(feature = "tui")]

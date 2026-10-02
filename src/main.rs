@@ -28,6 +28,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect audit/outbox database schema metadata without migrating it
+    #[cfg(feature = "sqlite")]
+    Schema {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Verify chains; name the first record that does not fit
     Verify {
         #[arg(required = true)]
@@ -116,6 +123,32 @@ fn main() -> ExitCode {
 
 fn run(command: Command) -> Result<ExitCode, String> {
     match command {
+        #[cfg(feature = "sqlite")]
+        Command::Schema { path, json } => {
+            let info = nostoi::schema::inspect(&path).map_err(|e| e.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&info).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!(
+                    "{}: {} schema {} (supported {}), application_id {:#x}, format {}{}",
+                    path.display(),
+                    info.component,
+                    info.schema_revision,
+                    info.supported_revision,
+                    info.application_id,
+                    info.record_format,
+                    if info.legacy_unversioned {
+                        " [legacy, unversioned]"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Verify {
             paths,
             format,

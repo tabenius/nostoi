@@ -152,6 +152,11 @@ retaining the entire history. See [streaming verification](docs/STREAMING-VERIFI
 [compartment architecture](docs/COMPARTMENT-ARCHITECTURE.md) describes process
 privileges and a staged crate split while preserving the current API.
 
+Owned databases now declare independent schema revisions and component identities;
+prepared requests and kernel payloads also carry explicit format tags. Use
+`nostoi schema PATH --json` to inspect database metadata without migration. See
+[schema versioning and legacy adoption](docs/SCHEMA-VERSIONING.md).
+
 ## Status
 
 `0.1`: the formats, both stores, the CLI and the TUI, with tests (canonical

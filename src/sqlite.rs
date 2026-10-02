@@ -119,6 +119,22 @@ fn detect_format(conn: &Connection, format: Option<Format>) -> Result<Format> {
             ))
         }
     };
+    if format == Format::Nostoi {
+        crate::schema::check(conn, crate::schema::Component::Audit, false)?;
+    } else {
+        let id: i64 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
+        let owned = match id {
+            crate::schema::AUDIT_APPLICATION_ID => Some(crate::schema::Component::Audit),
+            crate::schema::OUTBOX_APPLICATION_ID => Some(crate::schema::Component::Outbox),
+            _ => None,
+        };
+        if let Some(component) = owned {
+            crate::schema::check(conn, component, false)?;
+            return Err(Error::Invalid(
+                "requested format differs from this Nostoi database's declared component".into(),
+            ));
+        }
+    }
     Ok(format)
 }
 
@@ -275,12 +291,16 @@ pub struct Store {
 impl Store {
     /// Open or create the store at `path` (WAL mode, synchronous FULL).
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
+        {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            crate::schema::initialize(&tx, crate::schema::Component::Audit)?;
+            tx.commit()?;
+        }
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         register(&conn)?;
-        conn.execute_batch(SCHEMA)?;
         Ok(Self { conn, head: None })
     }
 

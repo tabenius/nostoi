@@ -148,6 +148,7 @@ fn assert_durable(path: &Path, request: &Request) {
         assert!(!serialized.contains(secret));
     }
     let intent: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(intent["v"], nostoi::anchor::PREPARED_ANCHOR_V1);
     let bytes: Vec<u8> = serde_json::from_value(intent["body"].clone()).unwrap();
     assert_eq!(bytes, request.body);
     assert!(request

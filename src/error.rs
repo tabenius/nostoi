@@ -31,6 +31,12 @@ pub enum Error {
     AnchorMismatch(String),
     #[error("{0}")]
     Invalid(String),
+    #[error("unsupported schema for {component}: found {found:?}, supported {supported}")]
+    UnsupportedSchema {
+        component: &'static str,
+        found: String,
+        supported: String,
+    },
     /// Refused to extend a chain that does not verify.
     #[error("the chain is broken, so nothing was appended: {0}")]
     Broken(Problem),

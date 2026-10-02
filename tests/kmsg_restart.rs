@@ -237,3 +237,42 @@ fn competing_ingestor_cannot_append_duplicate_messages() {
     assert_eq!(fixture.lines().len(), 2);
     assert!(running.signal_and_wait("-INT").success());
 }
+
+#[test]
+fn legacy_checkpoint_is_resumed_without_backfilling_its_payload() {
+    let fixture = Fixture::new();
+    let previous = nostoi::append(&fixture.store, nostoi::Draft {
+        actor: Some("host:kmsg"), kind: "kmsg.line", subject: Some("kernel"),
+        body: serde_json::json!({"boot_id":BOOT_A,"source":fixture.source.display().to_string(),"kmsg_seq":1,"message":"legacy"}), at: None,
+    }).unwrap();
+    fixture.input(&[0, 1, 2]);
+    fixture.once();
+    let lines = fixture.lines();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], previous.record);
+    assert!(lines[0]["body"].get("schema").is_none());
+    assert_eq!(lines[1]["body"]["schema"], nostoi::kmsg::KMSG_PAYLOAD_V1);
+    assert_eq!(lines[1]["body"]["kmsg_seq"], 2);
+    assert!(fixture
+        .records()
+        .iter()
+        .filter(|record| record["seq"] != 1)
+        .all(|record| record["body"]["schema"] == nostoi::kmsg::KMSG_PAYLOAD_V1));
+}
+
+#[test]
+fn unknown_checkpoint_payload_schema_fails_before_new_records() {
+    for schema in [serde_json::json!("nostoi-kmsg-v2"), serde_json::Value::Null] {
+        let fixture = Fixture::new();
+        nostoi::append(&fixture.store, nostoi::Draft {
+            actor:Some("host:kmsg"),kind:"kmsg.line",subject:Some("kernel"),
+            body:serde_json::json!({"schema":schema,"boot_id":BOOT_A,"source":fixture.source.display().to_string(),"kmsg_seq":1}),at:None,
+        }).unwrap();
+        fixture.input(&[0, 1, 2]);
+        let before = fixture.records();
+        let output = fixture.command().arg("--once").output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported schema"));
+        assert_eq!(fixture.records(), before);
+    }
+}

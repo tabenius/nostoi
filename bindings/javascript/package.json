@@ -7,9 +7,12 @@
   "exports": {".": {"types": "./dist/nostoi.d.ts", "import": "./dist/nostoi.js"}},
   "files": ["dist"],
   "scripts": {
-    "build": "cargo build --manifest-path ../../Cargo.toml -p nostoi-component --target wasm32-wasip2 --release && jco transpile ../../target/wasm32-wasip2/release/nostoi_component.wasm --name nostoi -o dist",
-    "test": "node test.mjs"
+    "build": "cargo build --locked --manifest-path ../../Cargo.toml -p nostoi-component --target wasm32-wasip2 --release && jco transpile ../../target/wasm32-wasip2/release/nostoi_component.wasm --name nostoi -o dist",
+    "test": "node --test test-extraction.mjs && node test.mjs"
   },
   "dependencies": {"@bytecodealliance/preview2-shim": "0.26.0"},
-  "devDependencies": {"@bytecodealliance/jco": "1.35.0"}
+  "devDependencies": {"@bytecodealliance/jco": "1.35.0"},
+  "overrides": {
+    "@bytecodealliance/weval": "0.5.0"
+  }
 }

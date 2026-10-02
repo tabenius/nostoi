@@ -39,11 +39,17 @@ their original dates, but the current work is dated 2026-10-02.
 
 ### Follow-up verification queue
 
-1. Expand HTTP tests to cover anchor-level identical/mismatched existing objects,
-   retention mismatch/missing retention, transient retries and ambiguous uploads.
+Follow-up branch `codex/anchor-failure-paths` adds an injectable thread-safe
+signing clock and re-signs every retry, including across UTC midnight. Tests
+cover deterministic signatures, GET/conditional-PUT transient retry timestamps,
+identical and mismatched 412 anchor reconciliation, absent retention, wrong mode,
+short retention, and successful verified retention. The all-feature suite now
+passes 41 unit tests, 10 integration tests and one doctest; strict Clippy passes.
+
+1. Expand HTTP tests to cover ambiguous uploads (connection loss after commit).
 2. Add injected read failures to exercise EPIPE/EINVAL and the buffer ceiling;
    regular-file fixtures are not a full char-device simulation.
-3. Add signing clock injection and clock-skew diagnostics. Do not fabricate a
+3. Add clock-skew diagnostics. Do not fabricate a
    skew offset; synchronize the host clock instead.
 4. Benchmark startup peak memory and append latency at larger chain sizes. The
    earlier timings predate these edits and have not been remeasured.

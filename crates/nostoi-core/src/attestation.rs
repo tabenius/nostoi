@@ -145,12 +145,15 @@ impl Coverage {
 }
 
 impl Attestation {
-    /// Build an attestation for `head`.
+    /// Build an attestation for `head`, timestamped with an RFC 3339 string.
+    ///
+    /// The timestamp is validated rather than parsed here, so a caller does not
+    /// need a date type to produce a document.
     pub fn new(
         chain: &str,
         format: &str,
         head: &Head,
-        anchored_at: OffsetDateTime,
+        anchored_at: impl Into<String>,
         principal: &str,
         fingerprint: &str,
         anchor_key: Option<String>,
@@ -161,16 +164,38 @@ impl Attestation {
             format: format.to_string(),
             seq: head.seq,
             digest: head.digest.clone(),
-            anchored_at: anchored_at
-                .to_offset(time::UtcOffset::UTC)
-                .format(&Rfc3339)
-                .map_err(|error| Error::Invalid(format!("anchored_at: {error}")))?,
+            anchored_at: anchored_at.into(),
             principal: principal.to_string(),
             fingerprint: fingerprint.to_string(),
             anchor_key,
         };
         attestation.validate()?;
         Ok(attestation)
+    }
+
+    /// Build an attestation for `head` at a given instant.
+    pub fn at(
+        chain: &str,
+        format: &str,
+        head: &Head,
+        anchored_at: OffsetDateTime,
+        principal: &str,
+        fingerprint: &str,
+        anchor_key: Option<String>,
+    ) -> Result<Self> {
+        let timestamp = anchored_at
+            .to_offset(time::UtcOffset::UTC)
+            .format(&Rfc3339)
+            .map_err(|error| Error::Invalid(format!("anchored_at: {error}")))?;
+        Attestation::new(
+            chain,
+            format,
+            head,
+            timestamp,
+            principal,
+            fingerprint,
+            anchor_key,
+        )
     }
 
     /// The exact bytes a signature covers.
@@ -353,7 +378,7 @@ mod tests {
     }
 
     fn sample(seq: u64) -> Attestation {
-        Attestation::new(
+        Attestation::at(
             "production/kernel",
             "nostoi-v1",
             &head(seq, &"a".repeat(64)),

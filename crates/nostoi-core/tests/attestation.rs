@@ -35,7 +35,7 @@ fn chain(dir: &std::path::Path, records: usize) -> (std::path::PathBuf, Head) {
 }
 
 fn attest(head: &Head, chain: &str) -> Attestation {
-    Attestation::new(
+    Attestation::at(
         chain,
         "nostoi-v1",
         head,

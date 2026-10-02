@@ -28,6 +28,10 @@ pub mod anchor {
     }
 }
 
+pub mod attestation {
+    pub use nostoi_core::attestation::*;
+}
+pub mod attest;
 pub mod canonical {
     pub use nostoi_core::canonical::*;
 }

@@ -39,6 +39,10 @@ required-features = ["s3", "cli"]
 name = "scale"
 required-features = ["sqlite"]
 
+[[example]]
+name = "large_chain"
+required-features = ["sqlite"]
+
 [features]
 default = ["cli", "tui", "sqlite"]
 # SQLite stores: the native append-only store and Ephor's kagp-audit-v1 table.

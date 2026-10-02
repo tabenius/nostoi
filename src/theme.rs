@@ -414,10 +414,18 @@ mod tests {
     fn glyphs_narrow_to_ascii_and_never_to_nothing() {
         let unicode = palette("ragbaz", ColorMode::None).glyph("check");
         assert_eq!(unicode, "\u{2713}");
-        // Nerd is opt-in, and every nerd rendering in the token file is empty,
-        // so asking for it must still draw the check.
+        // Nerd is opt-in, and the nerd column carries real Codicon codepoints
+        // (U+EAB2, nf-cod-check). This assertion used to require the nerd
+        // rendering to fall back to the unicode one, which is how an empty nerd
+        // column shipped unnoticed: the test encoded the bug as the expectation.
         let nerd = Palette::new(&Look::new("ragbaz", ColorMode::None, Set::Nerd));
-        assert_eq!(nerd.glyph("check"), "\u{2713}");
+        assert_eq!(nerd.glyph("check"), "\u{EAB2}");
+        assert_ne!(
+            nerd.glyph("check"),
+            unicode,
+            "a nerd rendering that silently equals the unicode one is indistinguishable \
+             from an empty column"
+        );
         let ascii = Palette::new(&Look::new("ragbaz", ColorMode::None, Set::Ascii));
         assert_eq!(ascii.glyph("check"), "+");
         assert_eq!(ascii.glyph("ellipsis"), "...");

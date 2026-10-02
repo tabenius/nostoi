@@ -24,6 +24,8 @@ jobs:
         run: cargo test --workspace --all-features --locked
       - name: Scheduling helper syntax and credential separation
         run: sh -n contrib/systemd/nostoi-anchor-runner && python3 contrib/systemd/test_anchor_runner.py
+      - name: Benchmark fixture safety
+        run: cargo test --no-default-features --features sqlite --example large_chain --locked
       - name: The verifier alone builds (no default features)
         run: cargo build --no-default-features --lib --locked
   interoperability:

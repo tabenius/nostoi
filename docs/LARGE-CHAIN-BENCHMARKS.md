@@ -7,6 +7,51 @@ not a production kernel-ingestion benchmark. The public `nostoi::verify` API at
 this revision loads all entries; `Store::open_verified` already verifies one
 SQLite row at a time. There is no comparison with an unimplemented API here.
 
+## Integrated streaming measurements
+
+The same full suite was rerun on 2026-10-02 at integration revision
+`3ba67be79b70e01b42b1287b2ac4c763fb2dd0e7`, after all three implementation
+branches were merged. New fixtures used the same counts, 256-byte payload,
+batch size, three fresh-process trials and FULL-sync append settings as the
+baseline below. All 45 operations completed, including 9,000 individually
+committed appends and successful post-append checks.
+
+Preserved integrated fixtures:
+`/home/xyzzy/.cache/nostoi-large-chain-pdbn1zrd`.
+Raw results: `results-20261002T090603646373Z.jsonl` in that directory.
+
+Public verification now streams. Each range below is the minimum–maximum
+across three trials at the exact base size, excluding post-append checks.
+
+| Records | JSONL elapsed ms | JSONL peak RSS KiB | SQLite elapsed ms | SQLite peak RSS KiB |
+|---:|---:|---:|---:|---:|
+| 10,000 | 33.208–37.527 | 3,352–3,404 | 37.662–40.241 | 6,728–6,824 |
+| 100,000 | 306.789–339.549 | 3,584–3,640 | 362.047–382.424 | 6,632–6,860 |
+| 250,000 | 779.365–814.795 | 3,664–3,680 | 862.297–893.279 | 6,740–6,872 |
+
+At 250k records, baseline JSONL verification retained about 670 MiB; integrated
+streaming used about 3.6 MiB. SQLite fell from about 674 MiB to 6.7 MiB.
+Full history is still checked; this reduction does not use a cached trusted
+prefix or skip the suffix. Native verified-writer startup remained around
+0.9 seconds and 7 MiB at 250k records (901.647–913.958 ms,
+6,956–7,012 KiB). Its original verifier was already streaming.
+
+Native append quantiles remain per-trial values, not pooled percentiles:
+
+| Base records | p50 range ms | p95 range ms | p99 range ms | Largest observed sample ms |
+|---:|---:|---:|---:|---:|
+| 10,000 | 0.746–0.757 | 0.951–0.980 | 1.112–1.471 | 6.115 |
+| 100,000 | 0.757–0.764 | 0.949–0.997 | 1.082–1.461 | 10.656 |
+| 250,000 | 0.756–0.766 | 0.966–1.001 | 1.172–1.628 | 11.451 |
+
+WAL high-water lengths remained about 4.12–4.14 MB for measured append trials;
+all explicit PASSIVE checkpoints reported busy=0 and equal log/checkpointed
+frame counts. The baseline and integrated runs occurred at different times on
+the same shared host; elapsed-time differences are observations, not isolated
+causal speedup claims. Peak memory is dominated by the removed retained entry
+vector. The bounded-record and SQLite-cache qualifications in
+`docs/STREAMING-VERIFICATION.md` still apply.
+
 ## Reproduce
 
 Requirements: Linux with `/proc`, Python 3, Rust, `git`, `lscpu`, and `df`.
@@ -44,8 +89,8 @@ target/release/examples/large_chain append --target FIXTURE --count 1000 --paylo
 ```
 
 `--api public` calls `nostoi::verify`; `--api loaded` calls
-`nostoi::open(...).verify()` explicitly. Both currently use loaded verification.
-After integration, rerun these exact flags to compare the public API with the
+`nostoi::open(...).verify()` explicitly. Both used loaded verification in the
+baseline; the integrated public API streams. Rerun these flags to compare it with the
 loaded reference without modifying the tool to reference a new API.
 `startup` and `append` always use `Store::open_verified`; the API flag affects
 only `verify`. Append measurements cover the persistent native SQLite writer,

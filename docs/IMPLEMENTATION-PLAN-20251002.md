@@ -76,6 +76,29 @@ linear scan; it does not establish production throughput or peak memory.
 
 Remaining queue:
 
+### Streaming, diagnostics and measurement batch — 2026-10-02
+
+The three parallel branches are integrated: `codex/streaming-checkpoints`,
+`codex/s3-diagnostics`, and `codex/large-chain-benchmarks`.
+
+- Core and external-checkpoint verification now stream, using an incremental
+  verifier and coherent SQLite snapshot. Full prefix and suffix validation and
+  report counts/failure precedence are preserved. Native SQLite streaming
+  additionally rejects column/JSON inconsistency. Browse/load APIs remain.
+- S3 error diagnostics bound and sanitize remote metadata, omit reflective XML
+  and credentials, and estimate clock skew from the actual final signed request.
+  They do not adjust the clock or retry a 403.
+- The reproducible benchmark suite ran 10k/100k/250k records, three fresh-process
+  trials and 9,000 FULL-sync appends both before and after integration. At 250k,
+  public JSONL peak RSS fell from about 670 MiB to 3.6 MiB; SQLite from about
+  674 MiB to 6.7 MiB. Integrated append p50 was 0.756–0.766 ms at the largest
+  size. Raw results, commands and qualifications are in
+  `docs/LARGE-CHAIN-BENCHMARKS.md`.
+- The architecture question is captured in `docs/COMPARTMENT-ARCHITECTURE.md`:
+  retain separate runtime identities and extract portable core, anchor/outbox,
+  and Linux ingestion crates in stages. This is a proposal; the present batch
+  does not perform the crate migration.
+
 ### Parallel implementation batch completed — 2026-10-02
 
 - `codex/dependency-remediation`: upgraded PyO3 to 0.29.3 and replaced the

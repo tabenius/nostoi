@@ -12,14 +12,46 @@ required() {
 mode=$1
 case "$mode" in publish|verify) ;; *) fail 'expected publish or verify' ;; esac
 required CHAIN "${CHAIN:-}"
+required CHAIN_ID "${CHAIN_ID:-}"
+case "$CHAIN" in /*) ;; *) fail 'CHAIN must be absolute' ;; esac
+binary=${NOSTOI_ANCHOR_BIN:-/usr/local/bin/nostoi-anchor}
+case "$binary" in /*) ;; *) fail 'NOSTOI_ANCHOR_BIN must be absolute' ;; esac
+
+# Fan-out: several destinations from a target file. Credentials come only from
+# the service's own credential directory, one subdirectory per destination, so a
+# single shared key cannot reach every destination by accident.
+if [ -n "${TARGETS:-}" ]; then
+    case "$TARGETS" in /*) ;; *) fail 'TARGETS must be absolute' ;; esac
+    [ -r "$TARGETS" ] || fail 'TARGETS is not readable'
+    [ -z "${ENDPOINT:-}" ] && [ -z "${BUCKET:-}" ] && [ -z "${REGION:-}" ] ||
+        fail 'ENDPOINT, BUCKET and REGION address one destination; put each destination in the target file'
+    [ -z "${LOCK:-}" ] && [ -z "${RETAIN_DAYS:-}" ] ||
+        fail 'LOCK and RETAIN_DAYS belong in the target file, per destination'
+    required CREDENTIALS_DIRECTORY "${CREDENTIALS_DIRECTORY:-}"
+    case "$CREDENTIALS_DIRECTORY" in /*) ;; *) fail 'CREDENTIALS_DIRECTORY must be absolute' ;; esac
+    set -- "$CHAIN" --targets "$TARGETS" --chain-id "$CHAIN_ID" \
+        --credentials-dir "$CREDENTIALS_DIRECTORY"
+    case "$mode" in
+        publish)
+            required OUTBOX_DIR "${OUTBOX_DIR:-}"
+            case "$OUTBOX_DIR" in /*) ;; *) fail 'OUTBOX_DIR must be absolute' ;; esac
+            [ -z "${OUTBOX:-}" ] || fail 'OUTBOX holds one destination; use OUTBOX_DIR'
+            [ -z "${TRUSTED_KEY:-}" ] || fail 'TRUSTED_KEY is only valid for verification'
+            set -- "$@" --outbox-dir "$OUTBOX_DIR"
+            ;;
+        verify)
+            required TRUSTED_KEY "${TRUSTED_KEY:-}"
+            [ -z "${OUTBOX_DIR:-}" ] || fail 'verification forbids OUTBOX_DIR'
+            set -- "$@" --verify --key "$TRUSTED_KEY"
+            ;;
+    esac
+    exec "$binary" "$@"
+fi
+
 required ENDPOINT "${ENDPOINT:-}"
 required BUCKET "${BUCKET:-}"
 required REGION "${REGION:-}"
-required CHAIN_ID "${CHAIN_ID:-}"
-case "$CHAIN" in /*) ;; *) fail 'CHAIN must be absolute' ;; esac
 case "$ENDPOINT" in https://?*) ;; *) fail 'ENDPOINT must use HTTPS' ;; esac
-binary=${NOSTOI_ANCHOR_BIN:-/usr/local/bin/nostoi-anchor}
-case "$binary" in /*) ;; *) fail 'NOSTOI_ANCHOR_BIN must be absolute' ;; esac
 
 set -- "$CHAIN" --endpoint "$ENDPOINT" --bucket "$BUCKET" --region "$REGION" --chain-id "$CHAIN_ID"
 case "$mode" in

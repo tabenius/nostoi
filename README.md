@@ -142,14 +142,21 @@ included. For that, keep a copy they cannot reach:
 - **anchor the head:** put `nostoi head` somewhere else, e.g. in WeftMark
   evidence, a Dash record or a signed manifest;
 - **replicate:** stream the store to write-once storage (S3 Object Lock, an R2
-  bucket lock, an append-only SFTP target).
+  bucket lock, an append-only SFTP target);
+- **anchor to more than one destination:** one account is one answer to "was this
+  rewritten?", so publish the same checkpoint to several places under separate
+  administrations with `nostoi-anchor --targets`. Verification then requires them
+  to agree, which a single compromised destination cannot arrange. See
+  [anchoring to more than one destination](docs/ANCHOR-FANOUT.md).
 
 S3/R2 head publishing and remote-checkpoint verification are available through
 the optional `s3` feature and `nostoi-anchor`. Restart-safe Linux kernel ingestion
 is available through `kmsg-nostoi` with the `kmsg` feature. See
 [remote checkpoints and kernel ingestion](docs/ANCHORING-AND-KMSG.md) for build,
-locking, recovery, verification and shutdown behavior. Cryptographically signed
-head anchors remain on the roadmap.
+locking, recovery, verification and shutdown behavior, and
+[multi-destination anchoring](docs/ANCHOR-FANOUT.md) for publishing to several
+destinations at once, per-destination credentials and how to choose them.
+Cryptographically signed head anchors remain on the roadmap.
 
 For recurring operation, `nostoi-anchor --outbox PATH` persists the exact request
 before upload and recovers it after a crash. See

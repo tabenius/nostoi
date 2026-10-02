@@ -47,7 +47,13 @@ class RunnerTests(unittest.TestCase):
 
     def run_helper(self, mode, extra=None, remove=(), expect=0):
         env = dict(self.env)
-        env.update(extra or {})
+        for name, value in (extra or {}).items():
+            # A None value means "unset", so a mode can withhold a variable the
+            # shared fixture provides.
+            if value is None:
+                env.pop(name, None)
+            else:
+                env[name] = value
         for name in remove:
             env.pop(name, None)
         self.capture.unlink(missing_ok=True)
@@ -142,6 +148,88 @@ class RunnerTests(unittest.TestCase):
             self.run_helper("publish", {"OUTBOX": "/state/outbox", "LOCK": "compliance",
                                        "RETAIN_DAYS": days}, expect=1)
         self.run_helper("unsupported", expect=1)
+
+    def fanout_env(self, targets=None, **extra):
+        """A target file plus a credential directory with one dir per destination."""
+        targets = self.root / "anchors.json"
+        targets.write_text(json.dumps({"targets": [
+            {"name": "aws", "endpoint": "https://s3.us-west-2.amazonaws.com",
+             "bucket": "b", "credentials": "aws"},
+            {"name": "b2", "endpoint": "https://s3.us-west-004.backblazeb2.com",
+             "bucket": "b", "credentials": "b2"},
+        ]}))
+        for name in ("aws", "b2"):
+            directory = self.credentials / name
+            directory.mkdir(exist_ok=True)
+            (directory / "aws-access-key-id").write_text(f"{name}-id\n")
+            (directory / "aws-secret-access-key").write_text(f"{name}-secret\n")
+            (directory / "aws-session-token").write_text(f"{name}-token\n")
+        env = {
+            "TARGETS": str(targets),
+            "CREDENTIALS_DIRECTORY": str(self.credentials),
+        }
+        # Withhold everything the shared fixture provides that fan-out must not
+        # inherit: single-destination addressing, its retention, and a shared key.
+        for name in ("ENDPOINT", "BUCKET", "REGION", "OUTBOX", "LOCK", "RETAIN_DAYS",
+                     "TRUSTED_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                     "AWS_SESSION_TOKEN"):
+            env[name] = None
+        env.update(extra)
+        return env
+
+    def test_fanout_publish_argv_and_per_destination_credentials(self):
+        targets = str(self.root / "anchors.json")
+        record = self.run_helper("publish", self.fanout_env(OUTBOX_DIR="/state/outboxes"))
+        self.assertEqual(record["argv"], [self.env["CHAIN"], "--targets", targets,
+                                          "--chain-id", self.env["CHAIN_ID"],
+                                          "--credentials-dir", str(self.credentials),
+                                          "--outbox-dir", "/state/outboxes"])
+        # No single credential was exported; the executable reads one per destination.
+        self.assertEqual(record["credentials"], {
+            "AWS_ACCESS_KEY_ID": None, "AWS_SECRET_ACCESS_KEY": None,
+            "AWS_SESSION_TOKEN": None})
+
+    def test_fanout_verify_uses_the_trusted_key(self):
+        targets = str(self.root / "anchors.json")
+        record = self.run_helper("verify", self.fanout_env(TRUSTED_KEY="heads/trusted.json"))
+        self.assertEqual(record["argv"], [self.env["CHAIN"], "--targets", targets,
+                                          "--chain-id", self.env["CHAIN_ID"],
+                                          "--credentials-dir", str(self.credentials),
+                                          "--verify", "--key", "heads/trusted.json"])
+
+    def test_fanout_requires_a_credential_directory(self):
+        env = self.fanout_env(OUTBOX_DIR="/state/outboxes")
+        env.pop("CREDENTIALS_DIRECTORY")
+        self.run_helper("publish", env, expect=1)
+
+    def test_fanout_rejects_single_destination_configuration(self):
+        for name, value in (("ENDPOINT", "https://example.invalid"),
+                            ("BUCKET", "b"), ("REGION", "us-west-2"),
+                            ("LOCK", "compliance"), ("RETAIN_DAYS", "365")):
+            with self.subTest(option=name):
+                env = self.fanout_env(OUTBOX_DIR="/state/outboxes", **{name: value})
+                self.run_helper("publish", env, expect=1)
+
+    def test_fanout_rejects_mixed_paths(self):
+        for extra in ({"OUTBOX": "/state/outbox", "OUTBOX_DIR": "/state/outboxes"},
+                      {"TRUSTED_KEY": "heads/key", "OUTBOX_DIR": "/state/outboxes"},
+                      {"TARGETS": "relative/anchors.json"},
+                      {"TARGETS": "/state/missing.json"},
+                      {"OUTBOX_DIR": "relative"}):
+            with self.subTest(extra=sorted(extra)):
+                mode = "verify" if "TRUSTED_KEY" in extra else "publish"
+                env = self.fanout_env(**extra)
+                if "OUTBOX_DIR" not in extra:
+                    env["OUTBOX_DIR"] = "/state/outboxes"
+                self.run_helper(mode, env, expect=1)
+
+    def test_fanout_exit_codes_are_preserved(self):
+        # Exit 1 is the runner's own "configuration refused" code, so it cannot
+        # be told apart from a rejected configuration by the helper.
+        for code in (0, 2, 3, 4):
+            with self.subTest(code=code):
+                env = self.fanout_env(OUTBOX_DIR="/state/outboxes", FAKE_EXIT=str(code))
+                self.run_helper("publish", env, expect=code)
 
     def test_uncertain_and_unconfirmed_exits_are_preserved(self):
         for code in (2, 3):

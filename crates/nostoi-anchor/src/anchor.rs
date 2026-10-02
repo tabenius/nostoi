@@ -33,6 +33,11 @@ use crate::s3::{Client, LockMode as S3LockMode, ObjectLock, Provider, PutOptions
 
 pub const PREPARED_ANCHOR_V1: &str = "nostoi-prepared-anchor-v1";
 
+/// Object Lock mode.
+///
+/// The serde names are the ones already persisted inside durable outbox
+/// intents, so they must not be renamed; the lowercase spellings accepted in
+/// configuration are handled by the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LockMode {
     Governance,
@@ -82,12 +87,54 @@ pub struct Anchor {
     pub retain_until: Option<String>,
 }
 
+/// What a checkpoint commits to, independent of where it is stored.
+///
+/// A destination that is compromised can be made to say anything, so the value
+/// of a second destination is that it commits to the same tuple. `provider`,
+/// `key` and the retention fields describe the copy, not the claim.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CheckpointIdentity {
+    pub chain: String,
+    pub format: String,
+    pub seq: u64,
+    pub digest: String,
+}
+
 /// A fully checked local chain containing the trusted remote checkpoint.
 #[derive(Clone, Debug, Serialize)]
 pub struct VerifiedAnchor {
     pub anchor: Anchor,
     pub local_head: nostoi_core::Head,
     pub verified_records: u64,
+}
+
+impl Anchor {
+    /// The identity this checkpoint commits to.
+    pub fn identity(&self) -> CheckpointIdentity {
+        CheckpointIdentity {
+            chain: self.chain.clone(),
+            format: self.format.clone(),
+            seq: self.seq,
+            digest: self.digest.clone(),
+        }
+    }
+
+    /// Reject a checkpoint that could not have been produced by this code.
+    pub fn validate_shape(&self) -> Result<()> {
+        if self.v != "nostoi-anchor-v1"
+            || self.seq == 0
+            || self.digest.len() != 64
+            || !self
+                .digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(Error::AnchorMismatch(
+                "unsupported or malformed remote checkpoint".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Fetch the explicitly selected trusted object and compare its checkpoint
@@ -113,24 +160,18 @@ pub fn verify_anchor(
     verify_checkpoint(chain_path, anchor, key, expected_chain)
 }
 
-fn verify_checkpoint(
+/// Compare a locally held checkpoint against the chain, without fetching
+/// anything. [`verify_anchor`] fetches the object and then calls this.
+///
+/// This verifies content, not the storage policy: retention is enforced by the
+/// provider's object lock, not by anything here.
+pub fn verify_checkpoint(
     chain_path: &Path,
     anchor: Anchor,
     key: &str,
     expected_chain: &str,
 ) -> Result<VerifiedAnchor> {
-    if anchor.v != "nostoi-anchor-v1"
-        || anchor.seq == 0
-        || anchor.digest.len() != 64
-        || !anchor
-            .digest
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(Error::AnchorMismatch(
-            "unsupported or malformed remote checkpoint".into(),
-        ));
-    }
+    anchor.validate_shape()?;
     if anchor.chain != expected_chain || anchor.key != key {
         return Err(Error::AnchorMismatch(
             "remote chain identity or key does not match the expected checkpoint".into(),
@@ -320,9 +361,37 @@ pub fn prepare_anchor(
     options: AnchorOptions,
     provider: Provider,
 ) -> Result<PreparedAnchor> {
+    prepare_anchor_at(chain_path, options, provider, OffsetDateTime::now_utc())
+}
+
+/// As [`prepare_anchor`], with the checkpoint timestamp supplied by the caller.
+///
+/// A fan-out pins one timestamp for the whole batch, so every destination's
+/// checkpoint describes the same instant and can be compared field by field.
+pub fn prepare_anchor_at(
+    chain_path: &Path,
+    options: AnchorOptions,
+    provider: Provider,
+    anchored_at: OffsetDateTime,
+) -> Result<PreparedAnchor> {
     let report = nostoi_core::verify(chain_path, None)?;
-    if let Some(problem) = report.problem {
-        return Err(Error::Broken(problem));
+    prepare_from_report(chain_path, &report, options, provider, anchored_at)
+}
+
+/// Prepare from a verification that has already been computed.
+///
+/// Publishing to N destinations then costs one chain verification rather than
+/// N: the expensive part is proven once and reused. The caller is responsible
+/// for having verified the same chain file this report describes.
+pub fn prepare_from_report(
+    chain_path: &Path,
+    report: &nostoi_core::Report,
+    options: AnchorOptions,
+    provider: Provider,
+    anchored_at: OffsetDateTime,
+) -> Result<PreparedAnchor> {
+    if let Some(problem) = &report.problem {
+        return Err(Error::Broken(problem.clone()));
     }
     if options.lock.is_some() && !(1..=36500).contains(&options.retain_days) {
         return Err(Error::Invalid(
@@ -345,7 +414,7 @@ pub fn prepare_anchor(
         .head
         .clone()
         .ok_or_else(|| Error::Invalid("chain has no head to anchor (zero records)".into()))?;
-    let anchored_at = OffsetDateTime::now_utc()
+    let anchored_at = anchored_at
         .replace_nanosecond(0)
         .map_err(|e| Error::S3(e.to_string()))?;
     let chain_id = if options.chain_id.is_empty() {
@@ -381,7 +450,7 @@ pub fn prepare_anchor(
     let anchor = Anchor {
         v: "nostoi-anchor-v1".into(),
         chain: chain_id.clone(),
-        format: report.format,
+        format: report.format.clone(),
         seq: head.seq,
         digest: head.digest.clone(),
         anchored_at: anchored_at

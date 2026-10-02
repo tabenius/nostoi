@@ -36,6 +36,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
@@ -46,12 +47,22 @@ use crate::error::{Error, Result};
 type HmacSha256 = Hmac<Sha256>;
 
 /// Which object-locking model the target offers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Provider {
     /// AWS S3: per-object Object Lock via `PutObject` headers.
     S3,
     /// Cloudflare R2: no object lock; a bucket lock rule on the prefix.
     R2,
+}
+
+/// Check that an endpoint is usable, without needing credentials.
+///
+/// Configuration is validated before any destination is contacted, so a typo in
+/// a target file is reported up front rather than as one rejected destination
+/// among several.
+pub fn check_endpoint(endpoint: &str) -> Result<()> {
+    split_endpoint(endpoint).map(|_| ())
 }
 
 impl Provider {

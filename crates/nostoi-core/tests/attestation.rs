@@ -4,7 +4,9 @@
 //! perfectly well formed can still be wrong about the chain, and that each way
 //! of being wrong is reported as itself.
 
-use nostoi_core::attestation::{self, Attestation, Coverage, Sidecars, ATTESTATION_V1};
+use nostoi_core::attestation::{
+    self, read_document, Attestation, Canonicality, Coverage, Sidecars, ATTESTATION_V1,
+};
 use nostoi_core::{Draft, Format, Head};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -187,6 +189,122 @@ fn the_sidecars_are_written_next_to_the_chain_and_read_back() {
     std::fs::rename(&path, &moved).unwrap();
     let moved_sidecars = Sidecars::for_chain(&moved);
     assert!(!moved_sidecars.document.exists());
+}
+
+#[test]
+fn canonical_bytes_are_ascii_whatever_the_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, head) = chain(dir.path(), 1);
+    // A chain identity with a non-ASCII character, in NFC.
+    let attestation = Attestation::new(
+        "produktion/kerné",
+        "nostoi-v1",
+        &head,
+        "2026-02-01T12:00:00Z",
+        "zoë@laptop",
+        FINGERPRINT,
+        None,
+    )
+    .unwrap();
+
+    let bytes = attestation.canonical_bytes().unwrap();
+    assert!(
+        bytes.is_ascii(),
+        "the signed bytes must be ASCII so no encoding mismatch can corrupt them"
+    );
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(text.contains(r#"\u00e9"#), "é is escaped: {text}");
+    assert!(text.contains(r#"\u00eb"#), "ë is escaped: {text}");
+
+    // It round-trips: the escaped form parses back to the same content.
+    let parsed: Attestation = serde_json::from_slice(&attestation.canonical_bytes().unwrap())
+        .expect("canonical bytes parse back");
+    assert_eq!(parsed, attestation);
+    assert_eq!(
+        parsed.canonical_bytes().unwrap(),
+        attestation.canonical_bytes().unwrap()
+    );
+}
+
+#[test]
+fn the_two_unicode_normalizations_are_refused_rather_than_confused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, head) = chain(dir.path(), 1);
+
+    // NFC and NFD look identical, are canonically equivalent, and hash
+    // differently. Silently rewriting one into the other would mean the signed
+    // bytes are not the ones the operator typed, so the ambiguous one is refused.
+    let nfc = Attestation::new(
+        "produktion/kerné",
+        "nostoi-v1",
+        &head,
+        "2026-02-01T12:00:00Z",
+        "zoë@laptop",
+        FINGERPRINT,
+        None,
+    )
+    .unwrap();
+    let mut nfd = nfc.clone();
+    nfd.chain = "produktion/kerne\u{301}".into();
+    nfd.principal = "zo\u{e9}@laptop".into();
+
+    assert!(nfc.validate().is_ok());
+    let error = nfd.validate().unwrap_err();
+    assert!(error.to_string().contains("NFC"), "{error}");
+    // The two forms really would hash differently, which is why refusing beats
+    // guessing. Canonical bytes cannot be computed for the NFD document, because
+    // validation refuses it first; the escaped forms show the difference.
+    let nfc_bytes = String::from_utf8(nfc.canonical_bytes().unwrap()).unwrap();
+    assert!(nfc_bytes.contains(r#"\u00e9"#), "{nfc_bytes}");
+    assert!(
+        !nfc_bytes.contains(r#"\u0301"#),
+        "NFC has no combining acute to escape: {nfc_bytes}"
+    );
+}
+
+#[test]
+fn encoding_problems_are_named_rather_than_reported_as_invalid_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, head) = chain(dir.path(), 1);
+    let attestation = attest(&head, "kernel");
+    let document = dir.path().join("doc.json");
+    let sidecars = Sidecars {
+        document: document.clone(),
+        signature: dir.path().join("doc.json.sig"),
+    };
+    // A byte-order mark is not JSON, and "expected value" does not say so.
+    std::fs::write(&sidecars.document, b"\xEF\xBB\xBF{}").unwrap();
+    let error = read_document(&sidecars.document).unwrap_err();
+    assert!(error.to_string().contains("byte-order mark"), "{error}");
+
+    // Bytes that are not UTF-8 at all.
+    std::fs::write(&sidecars.document, b"{\"chain\":\"\xFF\xFE\"}").unwrap();
+    let error = read_document(&sidecars.document).unwrap_err();
+    let said = error.to_string();
+    assert!(said.contains("not valid UTF-8"), "{said}");
+    assert!(said.contains("byte "), "the offset helps: {said}");
+
+    // Two byte-order marks is a different mistake from one.
+    std::fs::write(&sidecars.document, b"\xEF\xBB\xBF\xEF\xBB\xBF{}").unwrap();
+    let error = read_document(&sidecars.document).unwrap_err();
+    assert!(error.to_string().contains("more than one"), "{error}");
+
+    // A missing file is still an IO error, not an encoding one.
+    let error = read_document(&dir.path().join("absent.json")).unwrap_err();
+    assert!(matches!(error, nostoi_core::Error::Io { .. }), "{error:?}");
+
+    // And the happy path reports canonical form accurately.
+    std::fs::write(&sidecars.document, attestation.canonical_bytes().unwrap()).unwrap();
+    let read = read_document(&sidecars.document).unwrap();
+    assert_eq!(read.canonicality(), Canonicality::Canonical);
+    std::fs::write(
+        &sidecars.document,
+        serde_json::to_vec_pretty(&attestation).unwrap(),
+    )
+    .unwrap();
+    let read = read_document(&sidecars.document).unwrap();
+    assert_eq!(read.canonicality(), Canonicality::Reformatted);
+    assert_eq!(read.attestation, attestation);
 }
 
 #[test]

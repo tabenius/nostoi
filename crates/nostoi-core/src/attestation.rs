@@ -40,6 +40,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::chain::{Head, StreamingVerification};
 use crate::{Error, Result};
@@ -209,9 +210,7 @@ impl Attestation {
     /// One line of canonical JSON, the same rule records use, so the digest below
     /// can be recomputed in any language without reimplementing anything.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
-        let value: Value =
-            serde_json::to_value(self).map_err(|error| Error::Invalid(error.to_string()))?;
-        Ok(crate::canonical::to_string(&value).into_bytes())
+        Ok(canonical_bytes(self)?.into_bytes())
     }
 
     /// The SHA-256 of [`Attestation::canonical_bytes`], in lowercase hex.
@@ -265,16 +264,52 @@ impl Attestation {
                 self.anchored_at
             ))
         })?;
+        // Normalization form is content, not formatting: NFC "café" and NFD
+        // "cafe" plus a combining acute look identical, are canonically
+        // equivalent, and hash differently. Refusing is better than silently
+        // rewriting, because rewriting would mean the signed bytes are not the
+        // ones the operator typed. Filesystems differ here too: macOS has
+        // historically produced decomposed names where Linux produces composed
+        // ones, so an accented chain path can digest differently per machine.
+        for (field, value) in [
+            ("chain", &self.chain),
+            ("principal", &self.principal),
+            ("fingerprint", &self.fingerprint),
+            ("anchored_at", &self.anchored_at),
+        ] {
+            if !is_nfc(value) {
+                return Err(Error::Invalid(format!(
+                    "{field} is not in Unicode NFC form; the same text can be written \
+                     two ways that look identical and hash differently, so attestation \
+                     refuses the ambiguous one"
+                )));
+            }
+        }
+        if let Some(key) = &self.anchor_key {
+            if !is_nfc(key) {
+                return Err(Error::Invalid(
+                    "anchor_key is not in Unicode NFC form".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
-    /// Read a document from disk.
+    /// Read a document from disk, requiring canonical bytes.
+    ///
+    /// Use [`read_document`] when the formatting should be reported rather than
+    /// refused.
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path).map_err(crate::error::io(path))?;
-        let attestation: Attestation = serde_json::from_str(&text)
-            .map_err(|error| Error::Invalid(format!("invalid attestation: {error}")))?;
-        attestation.validate()?;
-        Ok(attestation)
+        let document = read_document(path)?;
+        if !document.document.canonicality.is_canonical() {
+            return Err(Error::Invalid(format!(
+                "{} is not in canonical form; it says the same thing but its bytes \
+                 differ from what was signed. Re-sign it, or repair it with \
+                 `nostoi verify-attestation --canonicalize`",
+                path.display()
+            )));
+        }
+        Ok(document.attestation)
     }
 
     /// Whether this attestation covers a chain verified as `verification`.
@@ -308,6 +343,153 @@ impl Attestation {
     }
 }
 
+/// The one definition of the bytes a signature covers.
+///
+/// Everything that reads or writes them goes through here: signing, verifying,
+/// repairing and displaying. That is deliberate. If canonicalization existed in
+/// two places they could disagree, and a signature would then mean whatever the
+/// reader felt like.
+///
+/// Canonicalization is *not* text normalization. The document is parsed into a
+/// value and re-serialized with sorted keys and no insignificant whitespace,
+/// which is lossless for the value because JSON's grammar already says which
+/// whitespace is insignificant and that it lives outside string literals. Two
+/// consequences follow, and both matter:
+///
+/// * Formatting cannot matter. An indented, CRLF-terminated, differently ordered
+///   file describes the same content and produces the same bytes.
+/// * No lossy folding happens, because there is none to do. Collapsing
+///   whitespace or upper-casing would merge documents that differ: `a\u{a0}b` and
+///   `a b` are different chains, and `"straße"` and `"STRASSE"` are different
+///   identities.
+///
+/// Output is ASCII whatever the content, because strings are escaped as
+/// `\uXXXX` outside printable ASCII. The signed bytes therefore cannot be
+/// corrupted by an encoding mismatch; the one thing that *is* content is a
+/// string's Unicode normalization form, which [`Attestation::validate`] checks.
+pub fn canonical_bytes(attestation: &Attestation) -> Result<String> {
+    let value: Value =
+        serde_json::to_value(attestation).map_err(|error| Error::Invalid(error.to_string()))?;
+    Ok(crate::canonical::to_string(&value))
+}
+
+/// Whether a string is already in Unicode NFC.
+///
+/// `unicode-normalization` has no `is_nfc`; comparing against the NFC form is the
+/// way to ask.
+fn is_nfc(value: &str) -> bool {
+    value.chars().collect::<String>().nfc().collect::<String>() == value
+}
+
+/// How a document's bytes relate to its canonical form.
+///
+/// Never an error. Whether a file is pretty-printed says nothing about whether it
+/// is trustworthy, so it is reported rather than treated as a failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Canonicality {
+    /// The bytes on disk are exactly the canonical form.
+    Canonical,
+    /// The same content, formatted differently. The signature still applies,
+    /// because it is checked against the canonical bytes of the parsed content.
+    Reformatted,
+}
+
+impl Canonicality {
+    pub fn is_canonical(self) -> bool {
+        matches!(self, Canonicality::Canonical)
+    }
+}
+
+/// A document read from disk, its canonical form, and how the two compared.
+///
+/// The signature is always checked against [`Document::canonical`], never against
+/// the bytes that happened to be on disk. That is what makes formatting
+/// irrelevant to the signature while leaving every change to the *content*
+/// fatal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Document {
+    /// The bytes as they were read.
+    pub on_disk: Vec<u8>,
+    /// The canonical serialization of the parsed content. What a signature covers.
+    pub canonical: String,
+    pub canonicality: Canonicality,
+}
+
+/// Read a document and its canonical form.
+///
+/// The byte-level failures are named, because "invalid attestation" for a file
+/// with a byte-order mark or Latin-1 bytes sends people looking in the wrong
+/// place. The content is parsed as UTF-8 JSON, which is the only encoding the
+/// format accepts.
+pub fn read_document(path: &Path) -> Result<ReadDocument> {
+    let bytes = std::fs::read(path).map_err(crate::error::io(path))?;
+    let text = decode_utf8(&bytes, path)?;
+    let attestation: Attestation = serde_json::from_str(&text)
+        .map_err(|error| Error::Invalid(format!("{}: {error}", path.display())))?;
+    attestation.validate()?;
+    let canonical = canonical_bytes(&attestation)?;
+    let canonicality = if bytes == canonical.as_bytes() {
+        Canonicality::Canonical
+    } else {
+        Canonicality::Reformatted
+    };
+    Ok(ReadDocument {
+        attestation,
+        document: Document {
+            on_disk: bytes,
+            canonical,
+            canonicality,
+        },
+    })
+}
+
+/// A document with the canonical form it should have.
+#[derive(Clone, Debug)]
+pub struct ReadDocument {
+    pub attestation: Attestation,
+    pub document: Document,
+}
+
+impl ReadDocument {
+    /// Whether the bytes on disk are already canonical.
+    pub fn canonicality(&self) -> Canonicality {
+        self.document.canonicality
+    }
+}
+
+/// Decode UTF-8, naming the encoding problem rather than reporting "invalid
+/// input".
+///
+/// Three things are worth telling apart, because each has a different fix: a
+/// byte-order mark (remove it), bytes that are not UTF-8 (re-encode), and a
+/// second JSON value after the document (remove it).
+fn decode_utf8(bytes: &[u8], path: &Path) -> Result<String> {
+    const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+    let body = bytes.strip_prefix(BOM).unwrap_or(bytes);
+    if body.starts_with(BOM) {
+        return Err(Error::Invalid(format!(
+            "{}: starts with more than one byte-order mark",
+            path.display()
+        )));
+    }
+    let text = std::str::from_utf8(body).map_err(|error| {
+        let at = error.valid_up_to();
+        Error::Invalid(format!(
+            "{}: not valid UTF-8 at byte {at}; the format is UTF-8 JSON, and \
+             re-encoding the file will change which attestation it holds",
+            path.display()
+        ))
+    })?;
+    if bytes.starts_with(BOM) {
+        // serde_json rejects a BOM, and says so less helpfully than this does.
+        return Err(Error::Invalid(format!(
+            "{}: starts with a UTF-8 byte-order mark, which is not JSON; remove it",
+            path.display()
+        )));
+    }
+    Ok(text.to_string())
+}
+
 /// A verified attestation and how it relates to the chain.
 #[derive(Clone, Debug)]
 pub struct Attested {
@@ -315,6 +497,9 @@ pub struct Attested {
     pub coverage: Coverage,
     /// The chain head this was checked against.
     pub head: Head,
+    /// Whether the document on disk is already in canonical form. Reported, never
+    /// fatal: a reformatted file is signed, it is just untidy.
+    pub canonicality: Canonicality,
 }
 
 impl Attested {
@@ -369,6 +554,7 @@ pub fn check(
         attestation: attestation.clone(),
         coverage,
         head,
+        canonicality: Canonicality::Canonical,
     })
 }
 

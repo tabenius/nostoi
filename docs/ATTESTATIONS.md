@@ -71,6 +71,86 @@ beside the chain and never inside it. `nostoi-v1` records are immutable and
 append-only; putting signatures in them would mean a new record format and a new
 revision for something that is not part of the chain's integrity.
 
+## What canonical means here, and what it does not
+
+The signature is checked against the canonical bytes of the **parsed content**,
+never against the bytes that happened to be on disk. That one decision is what
+makes formatting irrelevant:
+
+| On disk | Canonical bytes | Result |
+| --- | --- | --- |
+| One line, sorted keys | identical | verifies |
+| Pretty-printed, any indent | same content | verifies, reported as reformatted |
+| CRLF line endings | same content | verifies |
+| Reordered keys | same content | verifies |
+| **Any changed value** | **different content** | **refused** |
+
+`nostoi verify-attestation` reports a reformatted document as a note rather than a
+failure, and `--canonicalize` rewrites it. That repair is lossless precisely
+because the signature was already checked against the bytes being replaced:
+
+```console
+$ nostoi verify-attestation audit.jsonl --allowed-signers allowed_signers --principal alice@laptop
+✓ …: signature verified, signed by alice@laptop with key SHA256:n/a9jjWMZ…
+  note: the document is formatted, not canonical; the signature covers the same content either way
+  fix with: nostoi verify-attestation audit.jsonl --canonicalize
+```
+
+`nostoi verify-attestation` also prints the exact bytes it verified, so they can
+be diffed against what you believe you signed.
+
+### Why not normalize the text instead
+
+The tempting alternative — collapse whitespace, upper-case, compare — is wrong, and
+demonstrably so:
+
+```
+{"body":{"note":"a  b"}}   and   {"body":{"note":"a b"}}
+```
+
+are different chains, and folding whitespace merges them. `a b` and `a b`
+(U+00A0 against U+0020) are different too: JSON's insignificant whitespace is
+exactly space, tab, LF and CR, and it lives *outside* string literals, so a
+Unicode-aware folder corrupts content. Case folding is not injective either —
+`"straße".to_uppercase()` is `"STRASSE"`. Any of those would mean the signature
+attests to the normalized text, so an attacker could hand you any byte sequence
+that normalizes into a valid document, including one that reads misleadingly to
+whoever inspects it.
+
+Canonicalization avoids all of it structurally rather than by rule: parse into a
+value, re-serialize with sorted keys. The value tree survives, so nothing is lost
+and nothing is invented.
+
+### Encodings
+
+The signed bytes are **ASCII whatever the content**, because strings are escaped
+as `\uXXXX` outside printable ASCII. An encoding mismatch cannot corrupt them:
+`"café"` is signed as `caf\u00e9`.
+
+The one encoding-related thing that *is* content is a string's Unicode
+normalization form. NFC `caf\u00e9` and NFD `cafe\u0301` are canonically
+equivalent, look identical, and hash differently — and filesystems disagree:
+macOS has historically handed out decomposed names where Linux hands out composed
+ones, so an accented chain path can digest differently per machine. Attestation
+**refuses** a non-NFC string rather than rewriting it:
+
+```
+chain is not in Unicode NFC form; the same text can be written two ways that
+look identical and hash differently, so attestation refuses the ambiguous one
+```
+
+Rewriting would be worse than refusing: the signed bytes would no longer be the
+ones you typed. Fix the input instead — rename the file, or restate the identity.
+
+Byte-level problems are named for what they are, because each has a different fix:
+a UTF-8 byte-order mark (remove it), bytes that are not UTF-8 (re-encode), and an
+unreadable file (permissions) are three distinct errors rather than one "invalid
+JSON".
+
+**Binary evidence never enters the document.** A digest, or hex/base64 with the
+encoding named in the field — digests are already hex. Never raw bytes, never a
+lossy transcoding.
+
 ## Signing
 
 Signing is a human step, and nothing here runs unattended.
@@ -102,9 +182,31 @@ $ nostoi attest audit.jsonl --key ~/.ssh/id_ed25519 --principal alice@laptop
   replaced an attestation of seq=1839 signed by alice@laptop
 ```
 
-If the key needs a passphrase, `ssh-keygen` wants a terminal. Without one it says
-"incorrect passphrase supplied to decrypt private key", which is misleading, so
-that case is recognised and explained:
+### Passphrases
+
+Whether a key needs one is read from the key file before anything runs: the
+OpenSSH format's cipher name is `none` when unencrypted, and traditional PEM
+announces `Proc-Type: 4,ENCRYPTED`. So the predictable failure is reported before
+`ssh-keygen` is spawned, instead of after, as:
+
+```
+could not unlock /home/you/.ssh/id_ed25519: ssh-keygen needs an interactive
+terminal, a loaded ssh-agent, or a key without a passphrase. Attesting is a human
+step by design: run this from a terminal, load the key into ssh-agent first, or
+use a key without a passphrase.
+```
+
+`ssh-keygen` says "incorrect passphrase supplied to decrypt private key" when it
+cannot reach a terminal, which sends people hunting for a typo in a passphrase
+that was never mistyped. That wording is still caught as a fallback, for agent and
+hardware-token cases.
+
+The public key for the `allowed_signers` line is read from the `.pub` file
+`ssh-keygen` writes beside the private key, so an encrypted key is prompted for
+**once** per signature rather than twice.
+
+Note also that `ssh-keygen` refuses a private key other users can read. `chmod
+600` your key.
 
 ```
 could not unlock /home/you/.ssh/id_ed25519: ssh-keygen needs an interactive
@@ -127,10 +229,11 @@ nostoi verify-attestation CHAIN --allowed-signers FILE --principal NAME --finger
 | `--program` | `ssh-keygen` | |
 | `--json` | off | |
 
-Every step fails closed. A missing sidecar, an empty signature, a document that
-is not in canonical form, a bad signature, a signature made in another
-namespace, an unknown principal, a key that is not the pinned one, and a chain
-that no longer matches are all failures.
+Every step fails closed. A missing sidecar, an empty signature, a bad signature,
+a signature made in another namespace, an unknown principal, a key that is not the
+pinned one, and a chain that no longer matches are all failures. Exit code 1 means
+"not trustworthy" and nothing else: formatting is reported, never fatal, so a stray
+pretty-print does not look like a security problem.
 
 ```
 $ nostoi verify-attestation audit.jsonl --allowed-signers allowed_signers \
@@ -176,6 +279,12 @@ rewrite the chain can rewrite that file. Somewhere out of band:
 - in a buyer- or customer-facing document, or a signed release;
 - in a hardware token's owner record, or a KRL you distribute;
 - in the operator's own password manager, referenced by the runbook.
+
+One more thing to know about `allowed_signers`: options on an entry do **not**
+narrow it for a plain public key. `cert-authority`, `principals=` and
+`expiry-time` constrain *certificates*; a raw key listed under two principals
+verifies for both. An entry is either a key you trust for that name or it is not
+there, so the fingerprint pin is what has to be right.
 
 `--fingerprint` is optional so that an allowed-signers-only workflow is possible,
 but verification then warns that the trust anchor is a file:
@@ -273,7 +382,11 @@ and that they could not have said it about any other head.
   attestation doubles as a record of "reviewed again on date X".
 - **Sidecars are ordinary files.** Whatever protects the chain should protect
   them, and they are safe to copy off-host: the document is canonical JSON and the
-  signature is text.
+  signature is text. Formatting a copy cannot invalidate it; only changing a value
+  can. Run `--canonicalize` on the original if you want byte fidelity back.
+- **The test fixture is not a trust anchor.** `tests/fixtures/id_ed25519` is a
+  passphrase-less key committed on purpose, so the suite can pin a fingerprint as
+  a literal. It signs nothing but test documents, and it must never be trusted.
 - **Verification is read-only.** It opens no lock, writes nothing, and needs only
   the chain and the two sidecars plus an allowed-signers file.
 - **A missing attestation is never treated as a pass.** `verify-attestation`

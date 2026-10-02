@@ -19,6 +19,9 @@ sha2 = "0.10"
 hex = "0.4"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+# Only for attestations: to check that a string is NFC. Record canonicalization
+# is unchanged, so no existing chain's digests move.
+unicode-normalization = "0.1"
 rusqlite = { version = "0.40", features = ["bundled", "functions"], optional = true }
 
 [dev-dependencies]

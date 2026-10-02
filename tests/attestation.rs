@@ -5,8 +5,8 @@
 //! `ssh-keygen` on the host; when it is missing the tests say so instead of
 //! failing mysteriously.
 
-use nostoi::attest::{self, Signer, Verifier};
-use nostoi::attestation::{self, Coverage, Sidecars};
+use nostoi::attest::{self, KeyEncryption, Signer, Verifier};
+use nostoi::attestation::{self, Attestation, Canonicality, Coverage, Sidecars};
 use nostoi::Draft;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -71,6 +71,22 @@ fn signer(key: &Path) -> Signer {
     signer
 }
 
+/// The committed fixture key's fingerprint, as a literal.
+///
+/// A known-answer test. Every other test derives the fingerprint at runtime,
+/// which means a parser that returned the wrong token would be wrong on both
+/// sides and the suite would still be green. This one cannot be.
+const FIXTURE_FINGERPRINT: &str = "SHA256:WUWp9u0c5YvfhNzCTTKwA5Am4wOtbQF4/owhgXOeukk";
+
+/// The committed trust anchor, as a deployment provisions it.
+fn fixture_allowed_signers() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/allowed_signers")
+}
+
+fn fixture_key() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/id_ed25519")
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     chain: PathBuf,
@@ -117,6 +133,11 @@ impl Fixture {
         verifier
     }
 
+    /// The attestation currently on disk, without checking its signature.
+    fn read_attestation(&self) -> Attestation {
+        attest::read(&self.chain).unwrap().unwrap().attestation
+    }
+
     fn pinned(&self) -> Verifier {
         let fingerprint = attest::fingerprint(&ssh_keygen().unwrap(), &self.key).unwrap();
         self.verifier().pin(fingerprint)
@@ -142,6 +163,108 @@ macro_rules! fixture {
             }
         }
     };
+}
+
+#[test]
+fn the_committed_fixture_key_has_the_fingerprint_this_suite_expects() {
+    let Some(program) = ssh_keygen() else { return };
+    // If the fixture key is ever regenerated, this fails and the constant above
+    // has to move with it. That is the point: it makes the fingerprint a known
+    // answer rather than something derived from the same code under test.
+    assert_eq!(
+        attest::fingerprint(&program, &fixture_key()).unwrap(),
+        FIXTURE_FINGERPRINT,
+        "tests/fixtures/id_ed25519 was replaced; update FIXTURE_FINGERPRINT"
+    );
+    // And the public key is read from the .pub sidecar, not by decrypting.
+    let sidecar = fixture_key().with_file_name("id_ed25519.pub");
+    let public = std::fs::read_to_string(sidecar).unwrap();
+    assert_eq!(
+        attest::allowed_signers_line(&program, &fixture_key(), "alice@laptop").unwrap(),
+        format!("alice@laptop {}", public.trim()),
+        "the line keeps the key's own comment, which is what ssh-keygen writes"
+    );
+}
+
+/// A private key copy that ssh-keygen will accept.
+///
+/// It refuses a key file other users can read, which is a deliberate safety
+/// property and also the reason a committed fixture cannot be signed with
+/// directly: git checks out a fresh clone as 0644. Copying and tightening is
+/// what an operator does too.
+fn usable_key(dir: &Path) -> PathBuf {
+    let key = dir.join("id_ed25519");
+    std::fs::copy(fixture_key(), &key).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    key
+}
+
+#[test]
+fn a_world_readable_private_key_is_refused_with_an_explanation() {
+    let Some(program) = ssh_keygen() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain(dir.path(), 1);
+    let key = usable_key(dir.path());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let mut signer = Signer::new(&key, "alice@laptop");
+    signer.program = program;
+
+    let error = attest::sign(&chain, "production/kernel", None, &signer, None).unwrap_err();
+    let said = error.to_string();
+    assert!(
+        said.contains("PRIVATE KEY") || said.contains("UNPROTECTED"),
+        "ssh-keygen's refusal should survive into the message: {said}"
+    );
+}
+
+#[test]
+fn a_signature_by_a_committed_fixture_key_verifies_against_the_committed_anchor() {
+    let Some(program) = ssh_keygen() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain(dir.path(), 2);
+    let mut signer = Signer::new(usable_key(dir.path()), "alice@laptop");
+    signer.program = program.clone();
+
+    let signed = attest::sign(&chain, "production/kernel", None, &signer, None).unwrap();
+    attest::write(&chain, &signed).unwrap();
+    assert_eq!(signed.attestation.fingerprint, FIXTURE_FINGERPRINT);
+
+    // The first principal in a comma-separated entry verifies, and so does the
+    // second: real allowed_signers files list several names per key.
+    for principal in ["alice@laptop", "alice@workstation"] {
+        let mut verifier = Verifier::new(fixture_allowed_signers(), principal);
+        verifier.program = program.clone();
+        verifier.fingerprint = Some(FIXTURE_FINGERPRINT.to_string());
+        let checked = attest::verify(&chain, &verifier)
+            .unwrap_or_else(|error| panic!("{principal} should verify: {error}"));
+        assert!(checked.covers_head());
+    }
+
+    // Options in the file do not narrow an entry for a plain public key. The same
+    // key blob listed under a second principal verifies for that principal too,
+    // with `cert-authority`, `principals=` and an expiry all present. Those
+    // options constrain *certificates*; they are not an access control on a raw
+    // key. Worth knowing before anyone assumes otherwise, and another reason the
+    // fingerprint pin is the thing that has to be right.
+    let mut verifier = Verifier::new(fixture_allowed_signers(), "contractor@laptop");
+    verifier.program = program;
+    let checked = attest::verify(&chain, &verifier)
+        .unwrap_or_else(|error| panic!("the same key is trusted for both: {error}"));
+    assert_eq!(checked.attestation.fingerprint, FIXTURE_FINGERPRINT);
+
+    // A principal the file does not mention at all is still refused.
+    let mut verifier = Verifier::new(fixture_allowed_signers(), "stranger@elsewhere");
+    verifier.program = ssh_keygen().unwrap();
+    let error = attest::verify(&chain, &verifier).unwrap_err();
+    assert!(error.to_string().contains("does not verify"), "{error}");
 }
 
 #[test]
@@ -198,23 +321,72 @@ fn an_edited_document_is_refused() {
 }
 
 #[test]
-fn a_document_that_is_not_canonical_is_refused_before_the_signature() {
+fn formatting_cannot_break_an_attestation_but_editing_it_still_can() {
     let fixture = fixture!();
     fixture.sign();
     let sidecars = Sidecars::for_chain(&fixture.chain);
-
-    // Pretty-printing does not change what the document says, but it does change
-    // the bytes the signature covers, so it must not be silently accepted.
     let parsed: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&sidecars.document).unwrap()).unwrap();
+    // The bytes that are actually on disk, and therefore the ones the signature
+    // covers. Signing again would produce a different timestamp and a different
+    // signature, so this must come from the file rather than from a fresh sign.
+    let canonical = std::fs::read(&sidecars.document).unwrap();
+
+    // Pretty-printing changes the bytes on disk and not the content. The
+    // signature is checked against the canonical bytes of the parsed content, so
+    // it still applies, and the difference is reported rather than fatal.
     std::fs::write(
         &sidecars.document,
         serde_json::to_vec_pretty(&parsed).unwrap(),
     )
     .unwrap();
 
+    let checked = attest::verify(&fixture.chain, &fixture.pinned()).unwrap();
+    assert_eq!(checked.canonicality, Canonicality::Reformatted);
+    assert!(checked.coverage.is_current());
+    assert_eq!(checked.attestation.canonical_bytes().unwrap(), canonical);
+
+    // Repairing touches formatting only, and the signature still applies.
+    assert!(attest::canonicalize(&fixture.chain).unwrap(), "repaired");
+    assert_eq!(std::fs::read(&sidecars.document).unwrap(), canonical);
+    assert!(
+        !attest::canonicalize(&fixture.chain).unwrap(),
+        "already canonical"
+    );
+    assert_eq!(
+        attest::verify(&fixture.chain, &fixture.pinned())
+            .unwrap()
+            .canonicality,
+        Canonicality::Canonical
+    );
+
+    // CRLF is formatting too.
+    let crlf = String::from_utf8(serde_json::to_vec_pretty(&parsed).unwrap())
+        .unwrap()
+        .replace('\n', "\r\n");
+    std::fs::write(&sidecars.document, crlf.as_bytes()).unwrap();
+    assert_eq!(
+        attest::verify(&fixture.chain, &fixture.pinned())
+            .unwrap()
+            .canonicality,
+        Canonicality::Reformatted
+    );
+    attest::canonicalize(&fixture.chain).unwrap();
+
+    // A changed *value* in a reformatted file is still refused. That is the
+    // property that matters, and the reason content is compared canonically.
+    let mut altered = parsed;
+    altered["seq"] = serde_json::json!(2);
+    std::fs::write(
+        &sidecars.document,
+        serde_json::to_vec_pretty(&altered).unwrap(),
+    )
+    .unwrap();
     let error = attest::verify(&fixture.chain, &fixture.pinned()).unwrap_err();
-    assert!(error.to_string().contains("canonical"), "{error}");
+    assert!(
+        error.to_string().contains("does not verify"),
+        "a reformatted document with a changed value must still fail: {error}"
+    );
 }
 
 #[test]
@@ -312,9 +484,9 @@ fn a_truncated_chain_fails_the_attestation() {
     assert!(attest::verify(&fixture.chain, &fixture.pinned()).is_err());
     // The document itself is still fine, which is the point: only the chain
     // binding can tell that something is missing.
-    let (document, _) = attest::read(&fixture.chain).unwrap().unwrap();
-    assert!(document.validate().is_ok());
-    assert!(attestation::check(&fixture.chain, &document, None).is_err());
+    let read = attest::read(&fixture.chain).unwrap().unwrap();
+    assert!(read.attestation.validate().is_ok());
+    assert!(attestation::check(&fixture.chain, &read.attestation, None).is_err());
 }
 
 #[test]
@@ -441,6 +613,147 @@ fn a_passphrase_protected_key_is_explained_not_reported_as_a_wrong_passphrase() 
         said.contains("interactive terminal") || said.contains("ssh-agent"),
         "the failure must name the real cause, not repeat ssh-keygen's wording: {said}"
     );
+}
+
+#[test]
+fn key_encryption_is_read_from_the_file_before_anything_is_run() {
+    let Some(program) = ssh_keygen() else { return };
+    let dir = tempfile::tempdir().unwrap();
+
+    // Unencrypted: detected without running ssh-keygen, so the answer is
+    // available even where the tool cannot prompt.
+    let plain = usable_key(dir.path());
+    assert_eq!(attest::key_encryption(&plain), KeyEncryption::None);
+
+    // Traditional PEM with a DEK-Info header.
+    let pem = dir.path().join("traditional.pem");
+    std::fs::write(
+        &pem,
+        "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\nabc\n-----END RSA PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    assert_eq!(attest::key_encryption(&pem), KeyEncryption::Encrypted);
+
+    // A file we do not recognise says so rather than guessing.
+    let unknown = dir.path().join("notes.txt");
+    std::fs::write(&unknown, "not a key at all\n").unwrap();
+    assert_eq!(attest::key_encryption(&unknown), KeyEncryption::Unknown);
+    assert_eq!(
+        attest::key_encryption(&dir.path().join("absent")),
+        KeyEncryption::Unknown
+    );
+
+    // And the pre-flight refuses before ssh-keygen can complain about a
+    // passphrase that was never mistyped.
+    let chain = chain(dir.path(), 1);
+    let locked = dir.path().join("id_locked");
+    std::process::Command::new(&program)
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "a-passphrase",
+            "-C",
+            "locked@host",
+            "-f",
+            &locked.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(attest::key_encryption(&locked), KeyEncryption::Encrypted);
+
+    let mut signer = Signer::new(&locked, "locked@host");
+    signer.program = program;
+    let error = attest::sign(&chain, "kernel", None, &signer, None).unwrap_err();
+    let said = error.to_string();
+    assert!(said.contains("no terminal"), "{said}");
+    // The pre-flight message, not ssh-keygen's "incorrect passphrase".
+    assert!(!said.contains("incorrect passphrase"), "{said}");
+    assert!(
+        !said.contains("@@@@"),
+        "the banner is not a message: {said}"
+    );
+}
+
+#[test]
+fn an_encrypted_key_is_only_asked_for_once() {
+    let Some(program) = ssh_keygen() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("id_locked");
+    std::process::Command::new(&program)
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "a-passphrase",
+            "-C",
+            "locked@host",
+            "-f",
+            &locked.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    // ssh-keygen writes the .pub beside the private key even for an encrypted
+    // one, so the allowed_signers line can be built without a second prompt.
+    let sidecar = locked.with_file_name("id_locked.pub");
+    assert!(
+        sidecar.is_file(),
+        "ssh-keygen should have written {}",
+        sidecar.display()
+    );
+    let line = attest::allowed_signers_line(&program, &locked, "locked@host").unwrap();
+    assert!(line.starts_with("locked@host ssh-ed25519 "), "{line}");
+}
+
+#[test]
+fn display_output_is_never_read_back_or_compared() {
+    let fixture = fixture!();
+    fixture.sign();
+
+    // Everything shown to a human is rendered from the parsed document, so there
+    // is no path by which what someone saw can become what was checked. This test
+    // pins that by mangling every rendering and confirming verification is
+    // unmoved: if any of these were compared, or re-read, it would fail.
+    let sidecars = Sidecars::for_chain(&fixture.chain);
+    let canonical = std::fs::read(&sidecars.document).unwrap();
+
+    for rendered in [
+        serde_json::to_string_pretty(&fixture.read_attestation()).unwrap(),
+        format!("{}\n\n", String::from_utf8_lossy(&canonical)),
+        canonical
+            .iter()
+            .rev()
+            .map(|b| *b as char)
+            .collect::<String>(),
+        canonical
+            .iter()
+            .map(|b| char::from(b.to_ascii_uppercase()))
+            .collect::<String>(),
+    ] {
+        assert_ne!(rendered, String::from_utf8_lossy(&canonical));
+        // The canonical bytes are a function of the content alone, so a rendering
+        // cannot change them.
+        assert_eq!(
+            fixture.read_attestation().canonical_bytes().unwrap(),
+            canonical
+        );
+        let checked = attest::verify(&fixture.chain, &fixture.pinned()).unwrap();
+        assert_eq!(checked.attestation.canonical_bytes().unwrap(), canonical);
+        assert!(checked.covers_head());
+    }
+
+    // And nothing in the read-only reporting path writes to the chain or its
+    // sidecars.
+    let before = std::fs::read(&sidecars.document).unwrap();
+    let summary = nostoi::attest::summary(&fixture.chain, checked_head(&fixture.chain));
+    assert!(summary.contains("attested by"), "{summary}");
+    assert_eq!(std::fs::read(&sidecars.document).unwrap(), before);
+}
+
+fn checked_head(chain: &Path) -> u64 {
+    nostoi::verify(chain, None).unwrap().head.unwrap().seq
 }
 
 #[test]

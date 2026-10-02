@@ -133,6 +133,14 @@ impl Fixture {
         verifier
     }
 
+    /// Sign and write, so a test can assert on the write itself.
+    fn sign_and_write(&self) -> std::result::Result<Sidecars, nostoi::Error> {
+        let mut signer = signer(&self.key);
+        signer.program = ssh_keygen().expect("ssh-keygen");
+        let signed = attest::sign(&self.chain, "production/kernel", None, &signer, None)?;
+        attest::write(&self.chain, &signed)
+    }
+
     /// The attestation currently on disk, without checking its signature.
     fn read_attestation(&self) -> Attestation {
         attest::read(&self.chain).unwrap().unwrap().attestation
@@ -803,6 +811,62 @@ fn an_oversized_sidecar_is_refused_rather_than_read_into_memory() {
     verifier.program = ssh_keygen().unwrap();
     let error = nostoi::attest::verify(&chain, &verifier).unwrap_err();
     assert!(error.to_string().contains("byte limit"), "{error}");
+}
+
+#[test]
+fn a_sidecar_that_is_a_symlink_is_not_written_through() {
+    let Some(program) = ssh_keygen() else { return };
+    let fixture = fixture!();
+    let sidecars = Sidecars::for_chain(&fixture.chain);
+
+    // A planted symlink where the sidecar goes would otherwise be followed by
+    // fs::write, turning a create into an overwrite of something else entirely.
+    let elsewhere = fixture._dir.path().join("not-a-sidecar");
+    std::fs::write(&elsewhere, b"original").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&elsewhere, &sidecars.document).unwrap();
+    #[cfg(not(unix))]
+    return;
+
+    let error = fixture.sign_and_write().unwrap_err();
+    assert!(error.to_string().contains("symlink"), "{error}");
+    assert_eq!(
+        std::fs::read(&elsewhere).unwrap(),
+        b"original",
+        "the file the symlink pointed at must be untouched"
+    );
+
+    // Replacing it with a real file works, so this is a refusal and not a
+    // restriction on the directory.
+    std::fs::remove_file(&sidecars.document).unwrap();
+    let _ = program;
+    fixture.sign_and_write().unwrap();
+    assert!(attest::verify(&fixture.chain, &fixture.pinned()).is_ok());
+}
+
+#[test]
+fn a_tilde_path_is_expanded_and_other_accounts_are_not() {
+    // A shell expands `~/` before argv ever sees it; nothing here does.
+    let home = std::env::var("HOME").expect("HOME");
+    assert_eq!(
+        attest::expand_home(Path::new("~/.ssh/id_ed25519")).unwrap(),
+        Path::new(&home).join(".ssh/id_ed25519"),
+        "a leading ~/ is the one form that expands"
+    );
+    assert_eq!(
+        attest::expand_home(Path::new("relative/key")).unwrap(),
+        Path::new("relative/key"),
+        "anything else is left alone"
+    );
+    assert_eq!(
+        attest::expand_home(Path::new("/absolute/key")).unwrap(),
+        Path::new("/absolute/key")
+    );
+
+    // ~user would mean signing with someone else's key by accident.
+    let error = attest::expand_home(Path::new("~root/.ssh/id_ed25519")).unwrap_err();
+    assert!(error.to_string().contains("only ~/"), "{error}");
+    assert!(attest::expand_home(Path::new("~")).is_err());
 }
 
 #[test]

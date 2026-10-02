@@ -110,6 +110,32 @@ impl Verifier {
     }
 }
 
+/// Expand a leading `~/`, which a shell would normally do and an argv will not.
+///
+/// `~user` is deliberately refused rather than resolved: looking up another
+/// account's home means reading the password database, and silently signing with
+/// someone else's key is worse than an error. `HOME` unset is also an error, since
+/// the literal path would otherwise reach `ssh-keygen` and produce a complaint
+/// about a file that cannot exist.
+pub fn expand_home(path: &Path) -> Result<PathBuf> {
+    let text = path.to_string_lossy();
+    if text.starts_with('~') && !text.starts_with("~/") {
+        return Err(Error::Invalid(format!(
+            "{text} cannot be expanded: only ~/ is understood here. Pass the path to the \
+             key directly if you meant another account."
+        )));
+    }
+    match text.strip_prefix("~/") {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(home) if !home.is_empty() => Ok(Path::new(&home).join(rest)),
+            _ => Err(Error::Invalid(format!(
+                "cannot expand {text}: HOME is not set, so pass an absolute path to the key"
+            ))),
+        },
+        None => Ok(path.to_path_buf()),
+    }
+}
+
 /// Whether a private key file is encrypted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyEncryption {
@@ -312,11 +338,36 @@ pub fn sign(
 /// Write a signed attestation beside its chain.
 pub fn write(chain: &Path, signed: &Signed) -> Result<Sidecars> {
     let sidecars = Sidecars::for_chain(chain);
-    std::fs::write(&sidecars.document, &signed.document)
-        .map_err(crate::error::io(&sidecars.document))?;
-    std::fs::write(&sidecars.signature, &signed.signature)
-        .map_err(crate::error::io(&sidecars.signature))?;
+    write_sidecar(&sidecars.document, &signed.document)?;
+    write_sidecar(&sidecars.signature, &signed.signature)?;
     Ok(sidecars)
+}
+
+/// Write one sidecar, refusing to write through a symlink.
+///
+/// `fs::write` follows symlinks, so a planted `audit.jsonl.attestation.sig`
+/// pointing somewhere else would be overwritten by us rather than created. That
+/// is worth refusing: these files sit next to an audit chain, which is exactly
+/// where something might try to redirect a write.
+///
+/// This is best effort and says so. A symlink created between the check and the
+/// write still wins, and protecting the directory components too would need
+/// `openat` with `O_NOFOLLOW` on each one. Catching the planted-in-advance case
+/// and the accidental one is what this buys.
+fn write_sidecar(path: &Path, bytes: &[u8]) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(Error::Invalid(format!(
+                "{} is a symlink, so it was not written; move it aside if that is \
+                 intended, and check what it points at",
+                path.display()
+            )))
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(crate::error::io(path)(error)),
+    }
+    std::fs::write(path, bytes).map_err(crate::error::io(path))
 }
 
 /// The chain's head and the format name the verifier detected.
@@ -499,8 +550,7 @@ pub fn canonicalize(chain: &Path, verified: &nostoi_core::attestation::Document)
             sidecars.document.display()
         )));
     }
-    std::fs::write(&sidecars.document, &verified.canonical)
-        .map_err(crate::error::io(&sidecars.document))?;
+    write_sidecar(&sidecars.document, verified.canonical.as_bytes())?;
     Ok(true)
 }
 

@@ -580,7 +580,10 @@ fn attest(path: &Path, options: AttestOptions<'_>) -> Result<ExitCode, String> {
         dry_run,
         json,
     } = options;
-    let mut signer = nostoi::attest::Signer::new(expand(key), principal);
+    let mut signer = nostoi::attest::Signer::new(
+        nostoi::attest::expand_home(key).map_err(|e| e.to_string())?,
+        principal,
+    );
     signer.namespace = namespace.to_string();
     signer.program = program.to_path_buf();
     let signed = nostoi::attest::sign(path, chain_id, format, &signer, anchor_key)
@@ -790,18 +793,6 @@ fn verify_attestation(path: &Path, options: VerifyOptions) -> Result<ExitCode, S
             }
             Ok(ExitCode::from(1))
         }
-    }
-}
-
-/// Expand a leading `~`, which a shell would normally do and an argv will not.
-fn expand(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    match text.strip_prefix("~/") {
-        Some(rest) => match std::env::var("HOME") {
-            Ok(home) => Path::new(&home).join(rest),
-            Err(_) => path.to_path_buf(),
-        },
-        None => path.to_path_buf(),
     }
 }
 

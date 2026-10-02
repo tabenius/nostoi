@@ -85,6 +85,11 @@ crate above is a facade that re-exports them:
 and bindings use only that. Existing `nostoi::` paths keep working; see
 [compartment boundaries](docs/COMPARTMENT-ARCHITECTURE.md).
 
+Signed attestations (`nostoi_core::attestation`) live in the core: the document
+format, its canonical bytes and its binding to a chain head are portable and need
+no SSH tooling, so any language can verify one. The `ssh-keygen -Y sign`
+driver is in the facade, and only that part shells out.
+
 ## Python and WebAssembly
 
 Native Python bindings (PyO3), a versioned WIT component, and generated
@@ -147,7 +152,12 @@ included. For that, keep a copy they cannot reach:
   rewritten?", so publish the same checkpoint to several places under separate
   administrations with `nostoi-anchor --targets`. Verification then requires them
   to agree, which a single compromised destination cannot arrange. See
-  [anchoring to more than one destination](docs/ANCHOR-FANOUT.md).
+  [anchoring to more than one destination](docs/ANCHOR-FANOUT.md);
+- **have someone sign for it:** a chain proves nothing inside it changed and an
+  anchor proves a copy exists, but neither says *who* vouched for a head or
+  *when*. `nostoi attest` signs a small document with `ssh-keygen -Y sign`, and
+  `nostoi verify-attestation` fails closed on a bad signature, an unpinned key or
+  a chain that no longer matches. See [attestations](docs/ATTESTATIONS.md).
 
 S3/R2 head publishing and remote-checkpoint verification are available through
 the optional `s3` feature and `nostoi-anchor`. Restart-safe Linux kernel ingestion
@@ -155,8 +165,8 @@ is available through `kmsg-nostoi` with the `kmsg` feature. See
 [remote checkpoints and kernel ingestion](docs/ANCHORING-AND-KMSG.md) for build,
 locking, recovery, verification and shutdown behavior, and
 [multi-destination anchoring](docs/ANCHOR-FANOUT.md) for publishing to several
-destinations at once, per-destination credentials and how to choose them.
-Cryptographically signed head anchors remain on the roadmap.
+destinations at once, per-destination credentials and how to choose them, and
+[attestations](docs/ATTESTATIONS.md) for signed statements about a head.
 
 For recurring operation, `nostoi-anchor --outbox PATH` persists the exact request
 before upload and recovers it after a crash. See

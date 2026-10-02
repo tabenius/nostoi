@@ -1,8 +1,22 @@
-//! Compatibility facade over the portable core and optional network/ingestion crates.
+//! # Nostoi
 //!
-//! Existing `nostoi::` paths remain stable. New code should depend on
-//! `nostoi-core`, `nostoi-anchor`, or `nostoi-kmsg` directly when it belongs to
-//! one of those compartments.
+//! Tamper-evident audit chains: verify them, append to them, stream them and
+//! browse them.
+//!
+//! This package is the compatibility facade. The implementation now lives in
+//! three crates, one per compartment:
+//!
+//! - [`nostoi_core`] formats, streaming verification and local audit storage.
+//!   Portable, and the only one of the three with no network or platform
+//!   assumptions.
+//! - `nostoi-anchor` (with the `s3` feature) checkpoints to S3-compatible
+//!   storage, verifies them again, and recovers interrupted publications.
+//! - `nostoi-kmsg` (with the `kmsg` feature) reads the Linux kernel ring
+//!   buffer into a chain.
+//!
+//! Every `nostoi::` path below is a re-export, so existing code keeps
+//! compiling against this crate. New code should depend on the compartment it
+//! actually needs, and get an order of magnitude less to compile and audit.
 
 #[cfg(feature = "s3")]
 pub mod anchor {
@@ -30,6 +44,10 @@ pub mod jsonl {
 #[cfg(all(feature = "kmsg", target_os = "linux"))]
 pub mod kmsg {
     pub use nostoi_kmsg::*;
+}
+#[cfg(all(feature = "s3", feature = "sqlite"))]
+pub mod outbox {
+    pub use nostoi_anchor::outbox::*;
 }
 pub mod portable {
     pub use nostoi_core::portable::*;
@@ -62,11 +80,7 @@ use std::path::Path;
 /// Read the chain at `path`: a JSONL file, or (with the `sqlite` feature) an
 /// SQLite database. The format is detected unless given.
 pub fn open(path: &Path, format: Option<Format>) -> Result<Loaded> {
-    #[cfg(feature = "sqlite")]
-    if sqlite::is_sqlite(path) {
-        return sqlite::load(path, format).map_err(Error::from);
-    }
-    jsonl::load(path, format).map_err(Error::from)
+    nostoi_core::open(path, format).map_err(Error::from)
 }
 
 /// Verify the entire chain at `path` with record memory bounded by its largest
@@ -86,33 +100,12 @@ pub fn verify_streaming(
     format: Option<Format>,
     checkpoint_seq: Option<u64>,
 ) -> Result<StreamingVerification> {
-    #[cfg(feature = "sqlite")]
-    if sqlite::is_sqlite(path) {
-        return sqlite::verify_streaming(path, format, checkpoint_seq).map_err(Error::from);
-    }
-    jsonl::verify_reader(
-        std::fs::File::open(path).map_err(error::io(path))?,
-        format,
-        checkpoint_seq,
-    )
-    .map_err(Error::from)
+    nostoi_core::verify_streaming(path, format, checkpoint_seq).map_err(Error::from)
 }
 
 /// Append a `nostoi-v1` record to the chain at `path`, creating it if needed:
 /// the SQLite store for an existing SQLite file or a new `.sqlite`/`.db`
 /// path, JSON Lines otherwise. A broken chain is never extended.
 pub fn append(path: &Path, draft: Draft<'_>) -> Result<Entry> {
-    #[cfg(feature = "sqlite")]
-    {
-        let sqlite_name = matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("sqlite" | "sqlite3" | "db")
-        );
-        if sqlite::is_sqlite(path) || (!path.exists() && sqlite_name) {
-            return sqlite::Store::open(path)
-                .and_then(|mut store| store.append(draft))
-                .map_err(Error::from);
-        }
-    }
-    jsonl::append(path, draft).map_err(Error::from)
+    nostoi_core::append(path, draft).map_err(Error::from)
 }

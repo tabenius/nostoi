@@ -1,4 +1,4 @@
-use nostoi::{chain, format, jsonl, verify_streaming, Format, Problem, GENESIS};
+use nostoi_core::{chain, format, jsonl, verify_streaming, Format, Problem, GENESIS};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -25,7 +25,7 @@ fn native_records() -> Vec<Value> {
 fn lines(records: &[Value]) -> String {
     records
         .iter()
-        .map(|r| format!("{}\n", nostoi::canonical::to_string(r)))
+        .map(|r| format!("{}\n", nostoi_core::canonical::to_string(r)))
         .collect()
 }
 
@@ -44,7 +44,7 @@ fn parity(
 }
 
 fn file_parity(path: &Path, format: Option<Format>, checkpoint: u64) {
-    let loaded = nostoi::open(path, format).unwrap();
+    let loaded = nostoi_core::open(path, format).unwrap();
     let streamed = verify_streaming(path, format, Some(checkpoint)).unwrap();
     assert_eq!(
         serde_json::to_value(&streamed.report).unwrap(),
@@ -54,13 +54,13 @@ fn file_parity(path: &Path, format: Option<Format>, checkpoint: u64) {
         streamed.checkpoint,
         (streamed.report.verified >= checkpoint)
             .then(|| loaded.entries[(checkpoint - 1) as usize].clone())
-            .map(|e| nostoi::Head {
+            .map(|e| nostoi_core::Head {
                 seq: e.seq,
                 digest: e.digest
             })
     );
     assert_eq!(
-        serde_json::to_value(nostoi::verify(path, format).unwrap()).unwrap(),
+        serde_json::to_value(nostoi_core::verify(path, format).unwrap()).unwrap(),
         serde_json::to_value(streamed.report).unwrap()
     );
 }
@@ -252,11 +252,11 @@ fn a_rehashed_history_verifies_but_changes_the_checkpoint() {
 #[cfg(feature = "sqlite")]
 mod sqlite {
     use super::*;
-    use nostoi::sqlite::Store;
+    use nostoi_core::sqlite::Store;
     use rusqlite::{params, Connection};
 
-    fn draft() -> nostoi::Draft<'static> {
-        nostoi::Draft {
+    fn draft() -> nostoi_core::Draft<'static> {
+        nostoi_core::Draft {
             actor: None,
             kind: "test",
             subject: None,
@@ -334,7 +334,7 @@ mod sqlite {
             [],
         )
         .unwrap();
-        let loaded = nostoi::open(&path, None).unwrap().verify();
+        let loaded = nostoi_core::open(&path, None).unwrap().verify();
         let result = verify_streaming(&path, None, Some(2)).unwrap();
         assert_eq!(
             serde_json::to_value(&result.report).unwrap(),

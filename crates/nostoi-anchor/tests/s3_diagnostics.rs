@@ -1,7 +1,5 @@
-#![cfg(feature = "s3")]
-
-use nostoi::s3::{Client, Credentials, PutOptions};
-use nostoi::Error;
+use nostoi_anchor::s3::{Client, Credentials, PutOptions};
+use nostoi_anchor::Error;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};

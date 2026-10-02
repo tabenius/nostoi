@@ -1,8 +1,7 @@
-#![cfg(feature = "s3")]
-
-use nostoi::anchor::{anchor_head, Anchor, AnchorOptions, LockMode};
-use nostoi::s3::{Client, Credentials, Provider};
-use nostoi::{Draft, Error};
+use nostoi_anchor::anchor::{anchor_head, Anchor, AnchorOptions, LockMode};
+use nostoi_anchor::s3::{Client, Credentials, Provider};
+use nostoi_anchor::Error;
+use nostoi_core::Draft;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
@@ -125,10 +124,10 @@ where
     (client, handle)
 }
 
-fn call_anchor(client: &Client, lock: Option<LockMode>) -> nostoi::Result<Anchor> {
+fn call_anchor(client: &Client, lock: Option<LockMode>) -> nostoi_anchor::Result<Anchor> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("audit.jsonl");
-    nostoi::append(
+    nostoi_core::append(
         &path,
         Draft {
             actor: Some("test"),
@@ -363,7 +362,7 @@ fn retention_case(
     status: &'static str,
     mode: &'static str,
     seconds: i64,
-) -> nostoi::Result<Anchor> {
+) -> nostoi_anchor::Result<Anchor> {
     let mut retain_until = String::new();
     let (client, server) = server(2, move |index, request| {
         if index == 0 {
@@ -449,7 +448,7 @@ fn remote_checkpoint_detects_truncation_rewrite_and_identity_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         let append = |value| {
-            nostoi::append(
+            nostoi_core::append(
                 &path,
                 Draft {
                     actor: None,
@@ -486,7 +485,7 @@ fn remote_checkpoint_detects_truncation_rewrite_and_identity_mismatch() {
                 std::fs::remove_file(&path).unwrap();
                 append(10);
                 append(20);
-                assert!(nostoi::verify(&path, None).unwrap().ok);
+                assert!(nostoi_core::verify(&path, None).unwrap().ok);
             }
             "identity" => checkpoint.chain = "other-chain".into(),
             "format" => checkpoint.format = "other-format".into(),
@@ -497,8 +496,12 @@ fn remote_checkpoint_detects_truncation_rewrite_and_identity_mismatch() {
             assert_eq!(request.line, format!("GET {OBJECT} HTTP/1.1"));
             ("200 OK", remote.clone())
         });
-        let result =
-            nostoi::anchor::verify_anchor(&path, &client, "heads/test.json", "trusted-chain");
+        let result = nostoi_anchor::anchor::verify_anchor(
+            &path,
+            &client,
+            "heads/test.json",
+            "trusted-chain",
+        );
         server.join().unwrap();
         if case == "extended" {
             let result = result.unwrap();
@@ -519,7 +522,7 @@ fn remote_checkpoint_detects_truncation_rewrite_and_identity_mismatch() {
 fn verify_cli_fetches_checkpoint_without_uploading() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("audit.sqlite");
-    let head = nostoi::append(
+    let head = nostoi_core::append(
         &path,
         Draft {
             actor: None,

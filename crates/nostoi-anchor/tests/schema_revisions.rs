@@ -1,9 +1,7 @@
 #![cfg(feature = "sqlite")]
 
-#[cfg(feature = "s3")]
-use nostoi::Error;
-use nostoi::{schema, sqlite::Store, Draft};
-#[cfg(feature = "s3")]
+use nostoi_anchor::Error;
+use nostoi_core::{schema, sqlite::Store, Draft};
 use rusqlite::params;
 use rusqlite::Connection;
 use serde_json::json;
@@ -51,7 +49,7 @@ fn legacy_read_is_unmodified_and_writer_adoption_preserves_record_bytes() {
     let info = schema::inspect(&path).unwrap();
     assert!(info.legacy_unversioned);
     assert_eq!(info.schema_revision, 0);
-    assert!(nostoi::verify(&path, None).unwrap().ok);
+    assert!(nostoi_core::verify(&path, None).unwrap().ok);
     assert_eq!(std::fs::read(&path).unwrap(), file);
     drop(Store::open_verified(&path).unwrap());
     let info = schema::inspect(&path).unwrap();
@@ -70,7 +68,7 @@ fn legacy_read_is_unmodified_and_writer_adoption_preserves_record_bytes() {
 }
 
 #[test]
-fn new_database_is_labelled_and_readable_through_metadata_cli() {
+fn new_database_is_labelled_and_readable_through_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("audit.sqlite");
     audit(&path);
@@ -82,24 +80,6 @@ fn new_database_is_labelled_and_readable_through_metadata_cli() {
         info.created_by_version.as_deref(),
         Some(env!("CARGO_PKG_VERSION"))
     );
-    #[cfg(feature = "cli")]
-    {
-        let before = records(&path);
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_nostoi"))
-            .args(["schema", "--json"])
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(metadata["schema_revision"], 1);
-        assert_eq!(metadata["application_id"], schema::AUDIT_APPLICATION_ID);
-        assert_eq!(records(&path), before);
-    }
 }
 
 #[test]
@@ -121,7 +101,7 @@ fn future_wrong_identity_and_inconsistent_metadata_fail_without_persistent_chang
         drop(conn);
         let original = std::fs::read(&path).unwrap();
         assert!(Store::open(&path).is_err(), "{mutation}");
-        assert!(nostoi::verify(&path, None).is_err(), "{mutation}");
+        assert!(nostoi_core::verify(&path, None).is_err(), "{mutation}");
         assert!(schema::inspect(&path).is_err(), "{mutation}");
         assert_eq!(std::fs::read(&path).unwrap(), original, "{mutation}");
     }
@@ -151,12 +131,11 @@ fn external_ephor_metadata_is_never_relabelled() {
     conn.execute_batch("CREATE TABLE governance_events (chain_sequence INTEGER,id TEXT,node_id TEXT,aggregate_id TEXT,agent_class TEXT,action TEXT,arguments TEXT,outcome TEXT,occurred_at_ms INTEGER,caller_stack TEXT,previous_hash TEXT,signature TEXT); PRAGMA application_id=1234; PRAGMA user_version=42;").unwrap();
     drop(conn);
     let original = std::fs::read(&path).unwrap();
-    assert!(nostoi::verify(&path, None).unwrap().ok);
+    assert!(nostoi_core::verify(&path, None).unwrap().ok);
     assert!(Store::open(&path).is_err());
     assert_eq!(std::fs::read(&path).unwrap(), original);
 }
 
-#[cfg(feature = "s3")]
 fn legacy_outbox(path: &Path, source: &Path) {
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(schema::OUTBOX_SCHEMA).unwrap();
@@ -167,10 +146,9 @@ fn legacy_outbox(path: &Path, source: &Path) {
     .unwrap();
 }
 
-#[cfg(feature = "s3")]
 #[test]
 fn outbox_migration_is_atomic_and_wrong_source_is_not_adopted() {
-    use nostoi::outbox::Outbox;
+    use nostoi_anchor::outbox::Outbox;
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source.sqlite");
     audit(&source);
@@ -212,7 +190,6 @@ fn outbox_migration_is_atomic_and_wrong_source_is_not_adopted() {
     assert!(info.adopted_legacy);
 }
 
-#[cfg(feature = "s3")]
 #[test]
 fn future_outboxes_and_wrong_components_are_rejected_without_changes() {
     for mutation in [
@@ -225,25 +202,24 @@ fn future_outboxes_and_wrong_components_are_rejected_without_changes() {
         let source = dir.path().join("source.sqlite");
         audit(&source);
         let path = dir.path().join("outbox.sqlite");
-        drop(nostoi::outbox::Outbox::open(&path, &source).unwrap());
+        drop(nostoi_anchor::outbox::Outbox::open(&path, &source).unwrap());
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
         conn.execute_batch(&mutation).unwrap();
         drop(conn);
         let before = std::fs::read(&path).unwrap();
         assert!(
-            nostoi::outbox::Outbox::open(&path, &source).is_err(),
+            nostoi_anchor::outbox::Outbox::open(&path, &source).is_err(),
             "{mutation}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), before, "{mutation}");
     }
 }
 
-#[cfg(feature = "s3")]
 #[test]
 fn legacy_outbox_envelopes_and_upload_bytes_survive_migration_and_recovery() {
-    use nostoi::anchor::{prepare_anchor, AnchorOptions, LockMode};
-    use nostoi::s3::{Client, Credentials, Provider};
+    use nostoi_anchor::anchor::{prepare_anchor, AnchorOptions, LockMode};
+    use nostoi_anchor::s3::{Client, Credentials, Provider};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
@@ -281,7 +257,7 @@ fn legacy_outbox_envelopes_and_upload_bytes_survive_migration_and_recovery() {
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(intent["v"], nostoi::anchor::PREPARED_ANCHOR_V1);
+    assert_eq!(intent["v"], nostoi_anchor::anchor::PREPARED_ANCHOR_V1);
     intent.as_object_mut().unwrap().remove("v");
     let request = intent.to_string();
     let bytes: Vec<u8> = serde_json::from_value(intent["body"].clone()).unwrap();
@@ -306,7 +282,7 @@ fn legacy_outbox_envelopes_and_upload_bytes_survive_migration_and_recovery() {
     )
     .unwrap();
     drop(conn);
-    let mut outbox = nostoi::outbox::Outbox::open(&path, &source).unwrap();
+    let mut outbox = nostoi_anchor::outbox::Outbox::open(&path, &source).unwrap();
     assert_eq!(
         Connection::open(&path)
             .unwrap()
@@ -384,11 +360,10 @@ fn legacy_outbox_envelopes_and_upload_bytes_survive_migration_and_recovery() {
     );
 }
 
-#[cfg(feature = "s3")]
 #[test]
 fn prepared_request_future_versions_are_explicit_and_malformed_versions_are_not_legacy() {
-    use nostoi::anchor::{prepare_anchor, publish_prepared, AnchorOptions, PreparedAnchor};
-    use nostoi::s3::{Client, Credentials, Provider};
+    use nostoi_anchor::anchor::{prepare_anchor, publish_prepared, AnchorOptions, PreparedAnchor};
+    use nostoi_anchor::s3::{Client, Credentials, Provider};
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source.sqlite");
     audit(&source);

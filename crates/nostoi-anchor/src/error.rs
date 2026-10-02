@@ -18,7 +18,8 @@ pub enum Error {
     UploadUncertain { key: String, detail: String },
     #[error("s3: object {key} may already be stored; verification failed: {detail}")]
     AnchorUnconfirmed { key: String, detail: String },
-    #[error("s3: original anchor retention has expired for {key} at {retain_until}; publish a new immutable key")]
+    /// The original requested Object Lock deadline has elapsed; no renewal is implicit.
+    #[error("anchor intent {key} expired at {retain_until}; publish under a new immutable key with a new deadline")]
     AnchorExpired { key: String, retain_until: String },
     #[error("external anchor verification failed: {0}")]
     AnchorMismatch(String),

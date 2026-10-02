@@ -383,8 +383,18 @@ fn run(command: Command) -> Result<ExitCode, String> {
             dry_run,
             json,
         } => attest(
-            &path, &key, &principal, &chain_id, format, &namespace, anchor_key, &program, dry_run,
-            json,
+            &path,
+            AttestOptions {
+                key: &key,
+                principal: &principal,
+                chain_id: &chain_id,
+                format,
+                namespace: &namespace,
+                anchor_key,
+                program: &program,
+                dry_run,
+                json,
+            },
         ),
         Command::VerifyAttestation {
             path,
@@ -543,20 +553,33 @@ fn attestation_summary(path: &Path, report: &Report) -> String {
     nostoi::attest::summary(path, report.head.as_ref().map_or(0, |head| head.seq))
 }
 
-/// `nostoi attest`: sign the current head and report what to install.
-#[allow(clippy::too_many_arguments)]
-fn attest(
-    path: &Path,
-    key: &Path,
-    principal: &str,
-    chain_id: &str,
+/// The options `attest` takes, gathered for the same reason as
+/// [`VerifyOptions`].
+struct AttestOptions<'a> {
+    key: &'a Path,
+    principal: &'a str,
+    chain_id: &'a str,
     format: Option<Format>,
-    namespace: &str,
+    namespace: &'a str,
     anchor_key: Option<String>,
-    program: &Path,
+    program: &'a Path,
     dry_run: bool,
     json: bool,
-) -> Result<ExitCode, String> {
+}
+
+/// `nostoi attest`: sign the current head and report what to install.
+fn attest(path: &Path, options: AttestOptions<'_>) -> Result<ExitCode, String> {
+    let AttestOptions {
+        key,
+        principal,
+        chain_id,
+        format,
+        namespace,
+        anchor_key,
+        program,
+        dry_run,
+        json,
+    } = options;
     let mut signer = nostoi::attest::Signer::new(expand(key), principal);
     signer.namespace = namespace.to_string();
     signer.program = program.to_path_buf();
@@ -628,8 +651,7 @@ fn attest(
     Ok(ExitCode::SUCCESS)
 }
 
-/// The options `verify-attestation` takes, gathered so the call site reads as
-/// named arguments rather than eight positional ones.
+/// The options `verify-attestation` takes, gathered for the same reason.
 struct VerifyOptions<'a> {
     allowed_signers: &'a Path,
     principal: &'a str,

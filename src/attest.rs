@@ -229,7 +229,7 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
 /// The signing key's fingerprint, as `ssh-keygen` reports it.
 pub fn fingerprint(program: &Path, key: &Path) -> Result<String> {
     let output = run(program, &["-lf", &key.to_string_lossy()])?;
-    parse_fingerprint(&output.stdout)
+    parse_fingerprint(&output)
         .ok_or_else(|| Error::Invalid(format!("could not read a fingerprint from {key:?}")))
 }
 
@@ -250,7 +250,7 @@ fn public_key(program: &Path, key: &Path) -> Result<String> {
     let sidecar = std::path::PathBuf::from(sidecar);
     let text = match std::fs::read_to_string(&sidecar) {
         Ok(text) => text,
-        Err(_) => run(program, &["-y", "-f", &key.to_string_lossy()])?.stdout,
+        Err(_) => run(program, &["-y", "-f", &key.to_string_lossy()])?,
     };
     let public = text.trim();
     if !(public.starts_with("ssh-")
@@ -667,36 +667,37 @@ fn read_bounded(path: &Path, limit: u64) -> std::result::Result<Vec<u8>, String>
     Ok(bytes)
 }
 
-/// Run a program and capture its output.
-fn run(program: &Path, args: &[&str]) -> Result<Output> {
+/// Run a program and return its standard output.
+///
+/// Both streams are read because some of ssh-keygen's refusals are split across
+/// them, but only standard output is returned: the interesting part of a failure is
+/// folded into the error here, and a captured stderr that nothing reads is worse
+/// than no field at all.
+fn run(program: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| Error::Invalid(format!("cannot run {}: {error}", program.display())))?;
     if !output.status.success() {
-        let said = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
         return Err(Error::Invalid(format!(
             "{} {} failed: {}",
             program.display(),
             args.first().copied().unwrap_or_default(),
-            first_line(&said)
+            first_line(&both(&output.stdout, &output.stderr))
         )));
     }
-    Ok(Output {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-struct Output {
-    stdout: String,
-    #[allow(dead_code)]
-    stderr: String,
+/// Two captured streams as one string, since some tools split a message across
+/// them and reporting half of it sends people looking in the wrong place.
+fn both(a: &[u8], b: &[u8]) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(a),
+        String::from_utf8_lossy(b)
+    )
 }
 
 /// The `SHA256:...` token from an `ssh-keygen` line.

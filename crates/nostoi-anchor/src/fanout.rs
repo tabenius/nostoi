@@ -328,11 +328,18 @@ pub fn publish(
     Ok(results)
 }
 
+/// Each destination's outbox path, or `None` for every one of them.
+///
+/// A destination either has its own durable outbox or none of them do: mixing the
+/// two would mean some destinations could be retried with their exact bytes after
+/// a crash while others could not, and the report says `durable` per destination
+/// so the operator has to read it. `nostoi-anchor --outbox-dir` therefore applies
+/// to all of them.
 #[cfg(feature = "sqlite")]
 fn outboxes(config: &Fanout, outbox_dir: Option<&Path>) -> Vec<Option<PathBuf>> {
     match outbox_dir {
-        Some(_) => config
-            .outbox_paths(outbox_dir.unwrap_or_else(|| Path::new(".")))
+        Some(dir) => config
+            .outbox_paths(dir)
             .into_iter()
             .map(|(_, path)| Some(path))
             .collect(),

@@ -80,6 +80,98 @@ pub struct Anchor {
     pub retain_until: Option<String>,
 }
 
+/// A fully checked local chain containing the trusted remote checkpoint.
+#[derive(Clone, Debug, Serialize)]
+pub struct VerifiedAnchor {
+    pub anchor: Anchor,
+    pub local_head: crate::Head,
+    pub verified_records: u64,
+}
+
+/// Fetch the explicitly selected trusted object and compare its checkpoint
+/// against the local chain. The caller supplies the expected logical identity;
+/// neither the local path nor remote JSON is allowed to choose it implicitly.
+///
+/// This verifies content, not the bucket's retention policy. The endpoint,
+/// bucket and key must identify an independently trusted retained checkpoint.
+/// A valid local suffix after that checkpoint is allowed and verified as well.
+pub fn verify_anchor(
+    chain_path: &Path,
+    client: &Client,
+    key: &str,
+    expected_chain: &str,
+) -> Result<VerifiedAnchor> {
+    if key.is_empty() || expected_chain.trim().is_empty() {
+        return Err(Error::Invalid(
+            "remote verification requires an explicit key and chain ID".into(),
+        ));
+    }
+    let anchor: Anchor = serde_json::from_str(&client.get_object(key)?)
+        .map_err(|e| Error::AnchorMismatch(format!("invalid remote anchor: {e}")))?;
+    verify_checkpoint(chain_path, anchor, key, expected_chain)
+}
+
+fn verify_checkpoint(
+    chain_path: &Path,
+    anchor: Anchor,
+    key: &str,
+    expected_chain: &str,
+) -> Result<VerifiedAnchor> {
+    if anchor.v != "nostoi-anchor-v1"
+        || anchor.seq == 0
+        || anchor.digest.len() != 64
+        || !anchor
+            .digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(Error::AnchorMismatch(
+            "unsupported or malformed remote checkpoint".into(),
+        ));
+    }
+    if anchor.chain != expected_chain || anchor.key != key {
+        return Err(Error::AnchorMismatch(
+            "remote chain identity or key does not match the expected checkpoint".into(),
+        ));
+    }
+    let loaded = crate::open(chain_path, None)?;
+    let report = loaded.verify();
+    if let Some(problem) = report.problem {
+        return Err(Error::AnchorMismatch(format!(
+            "local chain does not verify: {problem}"
+        )));
+    }
+    if anchor.format != report.format {
+        return Err(Error::AnchorMismatch(
+            "remote and local formats differ".into(),
+        ));
+    }
+    let local_head = report.head.ok_or_else(|| {
+        Error::AnchorMismatch("local chain is empty: trusted history is missing".into())
+    })?;
+    if local_head.seq < anchor.seq {
+        return Err(Error::AnchorMismatch(format!(
+            "local tail is truncated: head {} precedes trusted checkpoint {}",
+            local_head.seq, anchor.seq
+        )));
+    }
+    let entry = loaded
+        .entries
+        .iter()
+        .find(|entry| entry.seq == anchor.seq)
+        .ok_or_else(|| Error::AnchorMismatch("trusted checkpoint position is missing".into()))?;
+    if entry.digest != anchor.digest {
+        return Err(Error::AnchorMismatch(
+            "local history differs from the trusted checkpoint (rewrite or wrong chain)".into(),
+        ));
+    }
+    Ok(VerifiedAnchor {
+        anchor,
+        local_head,
+        verified_records: report.verified,
+    })
+}
+
 /// Write an anchor for the head of `chain_path` to S3/R2.
 pub fn anchor_head(
     chain_path: &Path,
@@ -180,10 +272,30 @@ pub fn anchor_head(
         },
         only_if_absent: options.only_if_absent,
     };
-    let result = client.put_object(&key, &body, &put_options)?;
-    let anchor = if result.existed {
-        let existing: Anchor = serde_json::from_str(&client.get_object(&key)?)
-            .map_err(|e| Error::S3(format!("existing anchor is invalid: {e}")))?;
+    let unconfirmed = |detail: String| Error::AnchorUnconfirmed {
+        key: key.clone(),
+        detail,
+    };
+    let existing_body = match client.put_object(&key, &body, &put_options) {
+        Ok(result) if result.existed => Some(
+            client
+                .get_object(&key)
+                .map_err(|e| unconfirmed(e.to_string()))?,
+        ),
+        Ok(_) => None,
+        Err(error @ Error::UploadUncertain { .. }) if options.only_if_absent => {
+            // All receipts may have been lost. Read the deterministic key once
+            // before reporting uncertainty; never overwrite it to "repair" it.
+            match client.get_object(&key) {
+                Ok(body) => Some(body),
+                Err(_) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    let anchor = if let Some(body) = existing_body {
+        let existing: Anchor = serde_json::from_str(&body)
+            .map_err(|e| unconfirmed(format!("existing anchor is invalid: {e}")))?;
         if existing.v != anchor.v
             || existing.chain != anchor.chain
             || existing.format != anchor.format
@@ -191,7 +303,7 @@ pub fn anchor_head(
             || existing.digest != anchor.digest
             || existing.key != anchor.key
         {
-            return Err(Error::S3(
+            return Err(unconfirmed(
                 "existing object anchors a different chain or head".into(),
             ));
         }
@@ -200,13 +312,16 @@ pub fn anchor_head(
         anchor
     };
     if let Some(lock) = &put_options.lock {
-        let retention = client.get_object_retention(&key)?.ok_or_else(|| {
-            Error::S3("anchor uploaded, but Object Lock retention was not returned".into())
-        })?;
+        let retention = client
+            .get_object_retention(&key)
+            .map_err(|e| unconfirmed(e.to_string()))?
+            .ok_or_else(|| {
+                unconfirmed("anchor uploaded, but Object Lock retention was not returned".into())
+            })?;
         let retain_until = OffsetDateTime::parse(&retention.retain_until, &Rfc3339)
-            .map_err(|e| Error::S3(format!("invalid retention timestamp: {e}")))?;
+            .map_err(|e| unconfirmed(format!("invalid retention timestamp: {e}")))?;
         if retention.mode != lock.mode.as_str() || retain_until < lock.retain_until {
-            return Err(Error::S3(
+            return Err(unconfirmed(
                 "anchor uploaded, but Object Lock retention does not meet the request".into(),
             ));
         }

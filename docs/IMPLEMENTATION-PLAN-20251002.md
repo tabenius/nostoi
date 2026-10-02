@@ -76,7 +76,19 @@ linear scan; it does not establish production throughput or peak memory.
 
 Remaining queue:
 
-1. Extend ambiguous-upload coverage to locked objects and exhausted retries.
+The next implementation pass completes locked-upload and exhausted-retry
+reconciliation, typed unknown/unconfirmed outcomes, explicit remote-checkpoint
+verification (including truncation and fully rehashed rewrites), and boot-aware
+kernel restart/shutdown handling. The ingestor uses a store-side lock and verified
+in-chain checkpoints. Details and CLI examples are in
+`docs/ANCHORING-AND-KMSG.md`. HTTP and subprocess tests cover lost receipts,
+retention verification failure, reboot, empty restart, SIGKILL, SIGTERM/SIGINT,
+and duplicate-ingestor rejection.
+Validation for this pass: 45 unit tests, 24 integration tests and one doctest
+pass with all features; strict Clippy and diff checks pass. Minimal library,
+S3-only library, and kmsg/SQLite/CLI feature builds also pass.
+
+1. Validate remote locking with real S3/R2 credentials when available.
 2. Validate kernel-device behavior on additional distro/kernel configurations.
 3. Add clock-skew diagnostics. Do not fabricate a
    skew offset; synchronize the host clock instead.

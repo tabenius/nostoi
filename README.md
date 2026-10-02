@@ -131,7 +131,12 @@ included. For that, keep a copy they cannot reach:
 - **replicate:** stream the store to write-once storage (S3 Object Lock, an R2
   bucket lock, an append-only SFTP target).
 
-Signed head anchors are on the roadmap.
+S3/R2 head publishing and remote-checkpoint verification are available through
+the optional `s3` feature and `nostoi-anchor`. Restart-safe Linux kernel ingestion
+is available through `kmsg-nostoi` with the `kmsg` feature. See
+[remote checkpoints and kernel ingestion](docs/ANCHORING-AND-KMSG.md) for build,
+locking, recovery, verification and shutdown behavior. Cryptographically signed
+head anchors remain on the roadmap.
 
 ## Status
 

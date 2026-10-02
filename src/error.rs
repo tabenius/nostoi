@@ -14,6 +14,17 @@ pub enum Error {
     #[cfg(feature = "s3")]
     #[error("s3: {0}")]
     S3(String),
+    /// A PUT may have reached storage, but no definitive receipt was obtained.
+    #[cfg(feature = "s3")]
+    #[error("s3: upload outcome unknown for {key}: {detail}")]
+    UploadUncertain { key: String, detail: String },
+    /// Object data was stored/found but its identity or retention is unconfirmed.
+    #[cfg(feature = "s3")]
+    #[error("s3: object {key} may already be stored; verification failed: {detail}")]
+    AnchorUnconfirmed { key: String, detail: String },
+    #[cfg(feature = "s3")]
+    #[error("external anchor verification failed: {0}")]
+    AnchorMismatch(String),
     #[error("{0}")]
     Invalid(String),
     /// Refused to extend a chain that does not verify.

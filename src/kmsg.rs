@@ -241,6 +241,11 @@ impl Reader {
         std::mem::take(&mut self.lost)
     }
 
+    /// An overrun was observed and no subsequent sequence has resolved it yet.
+    pub fn has_pending_overrun(&self) -> bool {
+        self.overrun_pending
+    }
+
     /// Read the next event.
     ///
     /// `EPIPE` becomes [`Event::Overrun`]: the buffer overwrote records while

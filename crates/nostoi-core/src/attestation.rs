@@ -309,6 +309,14 @@ pub fn check(
 ) -> Result<Attested> {
     attestation.validate()?;
     let verification = crate::verify_streaming(chain, format, Some(attestation.seq))?;
+    // The format is part of the claim, not decoration: the same digest under a
+    // different format is not the same record.
+    if verification.report.format != attestation.format {
+        return Err(Error::Invalid(format!(
+            "attestation names format {:?} but the chain is {:?}",
+            attestation.format, verification.report.format
+        )));
+    }
     let coverage = attestation.coverage(&verification);
     if coverage == Coverage::Rewritten {
         // Prefer the verifier's own diagnosis of where the chain stops fitting.

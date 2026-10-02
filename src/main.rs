@@ -529,57 +529,8 @@ fn report_json(path: &Path, report: &Report) -> Value {
 }
 
 /// A short description of a chain's attestation, for the read-only commands.
-///
-/// These commands have no allowed-signers file, so they cannot check the
-/// signature and must not imply that they did. What they can report is what the
-/// document claims, whether it still covers the current head, and what to do
-/// next.
 fn attestation_summary(path: &Path, report: &Report) -> String {
-    let Some((attestation, _)) = nostoi::attest::present(path) else {
-        let sidecars = nostoi::attestation::Sidecars::for_chain(path);
-        return match sidecars.missing_description() {
-            Some(missing) => format!(
-                "no attestation ({missing}); sign one with: nostoi attest {} --principal you@host",
-                path.display()
-            ),
-            None => format!("no readable attestation beside {}", path.display()),
-        };
-    };
-    let head = report.head.as_ref().map(|head| head.seq).unwrap_or(0);
-    let short = |fingerprint: &str| {
-        fingerprint
-            .split_once(':')
-            .map(|(_, rest)| rest.to_string())
-            .unwrap_or_else(|| fingerprint.to_string())
-    };
-    let mut line = format!(
-        "attested by {} with key SHA256:{} at seq {} ({})",
-        attestation.principal,
-        short(&attestation.fingerprint),
-        attestation.seq,
-        attestation.anchored_at
-    );
-    if attestation.seq == head {
-        line.push_str(" [covers the current head; signature not checked here]");
-    } else if attestation.seq < head {
-        line.push_str(&format!(
-            " [stale: the chain is at {head}; nostoi attest {} --principal {} to cover it, \
-             nostoi verify-attestation to check the signature]",
-            path.display(),
-            attestation.principal
-        ));
-    } else {
-        // The chain is shorter than what was attested: only a signature check can
-        // resolve this, but it is worth saying out loud.
-        line.push_str(&format!(
-            " [the chain ends at {head}, before the attested {}: nostoi verify-attestation {} \
-             --allowed-signers FILE --principal {}]",
-            attestation.seq,
-            path.display(),
-            attestation.principal
-        ));
-    }
-    line
+    nostoi::attest::summary(path, report.head.as_ref().map_or(0, |head| head.seq))
 }
 
 /// `nostoi attest`: sign the current head and report what to install.

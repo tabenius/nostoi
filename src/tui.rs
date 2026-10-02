@@ -24,7 +24,18 @@ pub struct App {
     editing_filter: bool,
     follow: bool,
     detail: bool,
+    /// One line about the chain's attestation, shown under the status.
+    attestation: String,
+    /// Whether the detail pane is showing a record or the attestation.
+    pane: Pane,
     quit: bool,
+}
+
+/// What the detail pane is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    Record,
+    Attestation,
 }
 
 impl App {
@@ -41,6 +52,8 @@ impl App {
             editing_filter: false,
             follow: false,
             detail: true,
+            attestation: String::new(),
+            pane: Pane::Record,
             quit: false,
         };
         app.reload();
@@ -52,11 +65,19 @@ impl App {
         let selected = self.selected().map(|e| e.seq);
         match open(&self.path, self.format) {
             Ok(loaded) => {
-                self.report = Some(loaded.verify());
+                let report = loaded.verify();
+                self.attestation = crate::attest::summary(
+                    &self.path,
+                    report.head.as_ref().map_or(0, |head| head.seq),
+                );
+                self.report = Some(report);
                 self.entries = loaded.entries;
                 self.error = None;
             }
-            Err(error) => self.error = Some(error.to_string()),
+            Err(error) => {
+                self.attestation = crate::attest::summary(&self.path, 0);
+                self.error = Some(error.to_string());
+            }
         }
         self.refilter();
         if self.follow {
@@ -182,6 +203,14 @@ impl App {
                 }
             }
             KeyCode::Char('r') => self.reload(),
+            KeyCode::Char('a') => {
+                self.pane = if self.pane == Pane::Record {
+                    Pane::Attestation
+                } else {
+                    Pane::Record
+                };
+                self.detail = true;
+            }
             KeyCode::Enter | KeyCode::Char('d') => self.detail = !self.detail,
             _ => {}
         }
@@ -194,7 +223,9 @@ impl App {
             Constraint::Length(0)
         };
         let [status, table, detail, help] = Layout::vertical([
-            Constraint::Length(3),
+            // Verdict, plus an attestation line that may need two wrapped rows.
+            // Truncating it would hide the very thing being reported.
+            Constraint::Length(5),
             Constraint::Min(5),
             detail_height,
             Constraint::Length(1),
@@ -248,15 +279,22 @@ impl App {
         if self.follow {
             title.push(Span::raw("· following ").fg(Color::Yellow));
         }
-        let line = Line::from(vec![
-            Span::styled(
-                format!(" {mark} "),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(text, Style::default().fg(color)),
-        ]);
+        // Two lines: the verdict, then the attestation state.
+        let lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!(" {mark} "),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(text, Style::default().fg(color)),
+            ]),
+            Line::from(Span::styled(
+                format!(" {}", self.attestation),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
         frame.render_widget(
-            Paragraph::new(line).block(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(Line::from(title)),
@@ -328,6 +366,35 @@ impl App {
     }
 
     fn draw_detail(&self, frame: &mut Frame, area: Rect) {
+        if self.pane == Pane::Attestation {
+            let (title, body) = match crate::attest::present(&self.path) {
+                Some((attestation, _)) => (
+                    format!(
+                        " attestation seq={} · signature NOT checked here ",
+                        attestation.seq
+                    ),
+                    serde_json::to_string_pretty(&attestation).unwrap_or_default(),
+                ),
+                None => (
+                    " attestation ".into(),
+                    format!(
+                        "{}\n\nsign one with:\n  nostoi attest {} --principal you@host\n\n\
+                         check an existing one with:\n  nostoi verify-attestation {} \
+                         --allowed-signers FILE --principal you@host --fingerprint SHA256:…",
+                        crate::attest::summary(&self.path, 0),
+                        self.path.display(),
+                        self.path.display()
+                    ),
+                ),
+            };
+            frame.render_widget(
+                Paragraph::new(body)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::default().borders(Borders::ALL).title(title)),
+                area,
+            );
+            return;
+        }
         let (title, body) = match self.selected() {
             Some(entry) => {
                 let verdict = if self.verified(entry) {
@@ -351,8 +418,8 @@ impl App {
     }
 
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
-        let help =
-            " ↑↓/jk move · g/G ends · b break · / filter · f follow · r reload · ⏎ detail · q quit";
+        let help = " ↑↓/jk move · g/G ends · b break · / filter · f follow · r reload · \
+                    a attestation · ⏎ detail · q quit";
         frame.render_widget(Paragraph::new(help).fg(Color::DarkGray), area);
     }
 }
@@ -384,7 +451,8 @@ pub fn run(path: &Path, format: Option<Format>) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{append, Draft};
+    use crate::attestation::{Attestation, Sidecars};
+    use crate::{append, Draft, Head};
     use crossterm::event::KeyEventState;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -444,6 +512,89 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.selected().unwrap().kind, "tool.call");
         assert!(screen(&mut app).contains("records 1/3"));
+    }
+
+    #[test]
+    fn the_attestation_is_summarised_and_can_be_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = chain(dir.path());
+        let mut app = App::new(&path, None);
+
+        // With no attestation, the browser says so and how to make one.
+        let rendered = screen(&mut app);
+        assert!(rendered.contains("no attestation"), "{rendered}");
+        assert!(rendered.contains("nostoi attest"), "{rendered}");
+
+        // `a` shows the instructions when there is nothing to show.
+        press(&mut app, KeyCode::Char('a'));
+        let rendered = screen(&mut app);
+        assert!(rendered.contains("attestation"), "{rendered}");
+        assert!(rendered.contains("verify-attestation"), "{rendered}");
+        press(&mut app, KeyCode::Char('a'));
+
+        // A document beside the chain is reported in the status line.
+        let head = app.report.as_ref().unwrap().head.clone().unwrap();
+        let attestation = Attestation::new(
+            "kernel",
+            "nostoi-v1",
+            &head,
+            "2026-02-01T12:00:00Z",
+            "alice@laptop",
+            "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+            None,
+        )
+        .unwrap();
+        let sidecars = Sidecars::for_chain(&path);
+        std::fs::write(&sidecars.document, attestation.canonical_bytes().unwrap()).unwrap();
+        std::fs::write(&sidecars.signature, b"placeholder").unwrap();
+        app.reload();
+        let rendered = screen(&mut app);
+        assert!(rendered.contains("attested by alice@laptop"), "{rendered}");
+        assert!(rendered.contains("covers the current head"), "{rendered}");
+        // Never claims the signature was checked.
+        assert!(rendered.contains("signature not checked"), "{rendered}");
+
+        press(&mut app, KeyCode::Char('a'));
+        let rendered = screen(&mut app);
+        assert!(
+            rendered.contains("signature NOT checked here"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("alice@laptop"), "{rendered}");
+    }
+
+    #[test]
+    fn an_attestation_behind_the_head_is_reported_as_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = chain(dir.path());
+        let head = App::new(&path, None)
+            .report
+            .as_ref()
+            .unwrap()
+            .head
+            .clone()
+            .unwrap();
+        let early = Head {
+            seq: 1,
+            digest: head.digest.clone(),
+        };
+        let attestation = Attestation::new(
+            "kernel",
+            "nostoi-v1",
+            &early,
+            "2026-02-01T12:00:00Z",
+            "alice@laptop",
+            "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+            None,
+        )
+        .unwrap();
+        let sidecars = Sidecars::for_chain(&path);
+        std::fs::write(&sidecars.document, attestation.canonical_bytes().unwrap()).unwrap();
+        std::fs::write(&sidecars.signature, b"placeholder").unwrap();
+
+        let rendered = screen(&mut App::new(&path, None));
+        assert!(rendered.contains("stale"), "{rendered}");
+        assert!(rendered.contains("the chain is at 3"), "{rendered}");
     }
 
     #[test]

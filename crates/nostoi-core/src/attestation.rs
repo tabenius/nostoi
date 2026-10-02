@@ -198,6 +198,12 @@ impl Attestation {
         )
     }
 
+    /// The RFC 3339 instant an attestation was made.
+    pub fn instant(&self) -> Result<OffsetDateTime> {
+        OffsetDateTime::parse(&self.anchored_at, &Rfc3339)
+            .map_err(|error| Error::Invalid(format!("anchored_at: {error}")))
+    }
+
     /// The exact bytes a signature covers.
     ///
     /// One line of canonical JSON, the same rule records use, so the digest below

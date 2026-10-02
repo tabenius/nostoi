@@ -208,6 +208,54 @@ pub fn read(chain: &Path) -> Result<Option<(Attestation, Vec<u8>)>> {
     Ok(Some((attestation, document)))
 }
 
+/// A short description of a chain's attestation, for the read-only commands.
+///
+/// `head_seq` is the chain's current head, or 0 when it is empty. Nothing here
+/// checks the signature, and the wording says so: the read-only commands are not
+/// given an allowed-signers file, so they can report what a document claims and
+/// whether it still covers the head, but not that it is genuine. See
+/// [`verify`] for that.
+pub fn summary(chain: &Path, head_seq: u64) -> String {
+    let Some((attestation, _)) = present(chain) else {
+        let sidecars = Sidecars::for_chain(chain);
+        return match sidecars.missing_description() {
+            Some(missing) => format!(
+                "no attestation ({missing}); sign one with: nostoi attest {} --principal you@host",
+                chain.display()
+            ),
+            None => format!("no readable attestation beside {}", chain.display()),
+        };
+    };
+    let short = attestation
+        .fingerprint
+        .split_once(':')
+        .map(|(_, rest)| rest.to_string())
+        .unwrap_or_else(|| attestation.fingerprint.clone());
+    let mut line = format!(
+        "attested by {} with key SHA256:{short} at seq {} ({})",
+        attestation.principal, attestation.seq, attestation.anchored_at
+    );
+    if attestation.seq == head_seq {
+        line.push_str(" [covers the current head; signature not checked here]");
+    } else if attestation.seq < head_seq {
+        line.push_str(&format!(
+            " [stale: the chain is at {head_seq}; nostoi attest {} --principal {} to cover it, \
+             nostoi verify-attestation to check the signature]",
+            chain.display(),
+            attestation.principal
+        ));
+    } else {
+        line.push_str(&format!(
+            " [the chain ends at {head_seq}, before the attested {}: nostoi verify-attestation {} \
+             --allowed-signers FILE --principal {}]",
+            attestation.seq,
+            chain.display(),
+            attestation.principal
+        ));
+    }
+    line
+}
+
 /// The attestation sidecars for a chain, if both are there.
 ///
 /// Deliberately total: the read-only commands use this to *mention* an

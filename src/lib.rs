@@ -40,6 +40,7 @@
 
 #[cfg(feature = "s3")]
 pub mod anchor;
+
 pub mod canonical;
 pub mod chain;
 mod error;
@@ -47,6 +48,8 @@ pub mod format;
 pub mod jsonl;
 #[cfg(all(feature = "kmsg", target_os = "linux"))]
 pub mod kmsg;
+#[cfg(all(feature = "s3", feature = "sqlite"))]
+pub mod outbox;
 pub mod portable;
 #[cfg(feature = "s3")]
 pub mod s3;

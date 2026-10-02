@@ -17,13 +17,15 @@ jobs:
         with:
           components: clippy, rustfmt
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Test (with the Python conformance checks)
-        run: cargo test
+        run: cargo test --workspace --all-features --locked
+      - name: Scheduling helper syntax and credential separation
+        run: sh -n contrib/systemd/nostoi-anchor-runner && python3 contrib/systemd/test_anchor_runner.py
       - name: The verifier alone builds (no default features)
-        run: cargo build --no-default-features --lib
+        run: cargo build --no-default-features --lib --locked
   interoperability:
     runs-on: ubuntu-latest
     steps:
@@ -38,14 +40,14 @@ jobs:
         with:
           node-version: '24'
       - run: python -m pip install maturin
-      - run: maturin build --manifest-path bindings/python/Cargo.toml --out dist
+      - run: maturin build --locked --manifest-path bindings/python/Cargo.toml --out dist
       - run: python -m pip install dist/*.whl
       - run: mkdir -p /tmp/nostoi-interop
       - run: python -m unittest discover -s bindings/python/tests -v
         env:
           NOSTOI_INTEROP_DIR: /tmp/nostoi-interop
       - run: cargo build --no-default-features --lib --target wasm32-unknown-unknown --locked
-      - run: npm ci && npm run build && npm test
+      - run: npm ci && npm audit && npm run build && npm test
         working-directory: bindings/javascript
         env:
           NOSTOI_INTEROP_DIR: /tmp/nostoi-interop

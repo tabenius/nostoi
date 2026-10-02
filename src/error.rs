@@ -22,6 +22,10 @@ pub enum Error {
     #[cfg(feature = "s3")]
     #[error("s3: object {key} may already be stored; verification failed: {detail}")]
     AnchorUnconfirmed { key: String, detail: String },
+    /// The original requested Object Lock deadline has elapsed; no renewal is implicit.
+    #[cfg(feature = "s3")]
+    #[error("anchor intent {key} expired at {retain_until}; publish under a new immutable key with a new deadline")]
+    AnchorExpired { key: String, retain_until: String },
     #[cfg(feature = "s3")]
     #[error("external anchor verification failed: {0}")]
     AnchorMismatch(String),

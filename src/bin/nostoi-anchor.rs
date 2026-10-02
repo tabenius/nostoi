@@ -18,6 +18,10 @@ struct Args {
     /// Requires --key and --chain-id; does not upload an object.
     #[arg(long, conflicts_with = "lock")]
     verify: bool,
+    /// Durable SQLite anchor outbox, separate from the audit chain.
+    #[cfg(feature = "sqlite")]
+    #[arg(long, conflicts_with = "verify")]
+    outbox: Option<PathBuf>,
     /// S3 endpoint, e.g. https://s3.us-west-2.amazonaws.com or https://<account>.r2.cloudflarestorage.com
     #[arg(long)]
     endpoint: String,
@@ -110,6 +114,18 @@ fn run() -> Result<(), Error> {
         retain_days: args.retain_days,
     };
 
+    #[cfg(feature = "sqlite")]
+    let anchor = if let Some(path) = args.outbox {
+        nostoi::outbox::Outbox::open(&path, &args.chain)?.anchor_head(
+            &args.chain,
+            &client,
+            options,
+            provider,
+        )?
+    } else {
+        nostoi::anchor::anchor_head(&args.chain, &client, options, provider)?
+    };
+    #[cfg(not(feature = "sqlite"))]
     let anchor = nostoi::anchor::anchor_head(&args.chain, &client, options, provider)?;
     if args.json {
         println!(

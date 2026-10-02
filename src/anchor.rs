@@ -31,7 +31,7 @@ use time::{Duration, OffsetDateTime, UtcOffset};
 use crate::error::{Error, Result};
 use crate::s3::{Client, LockMode as S3LockMode, ObjectLock, Provider, PutOptions};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LockMode {
     Governance,
     Compliance,
@@ -179,6 +179,127 @@ pub fn anchor_head(
     options: AnchorOptions,
     provider: Provider,
 ) -> Result<Anchor> {
+    let prepared = prepare_anchor(chain_path, options, provider)?;
+    publish_prepared(client, &prepared, false)
+}
+
+/// Immutable checkpoint and upload parameters, without credentials or signatures.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedAnchor {
+    pub(crate) anchor: Anchor,
+    pub(crate) body: Vec<u8>,
+    pub(crate) only_if_absent: bool,
+    pub(crate) lock: Option<LockMode>,
+    pub(crate) retain_days: i64,
+}
+
+impl PreparedAnchor {
+    /// Check internal consistency before trusting a deserialized request.
+    /// This detects inconsistent intents, not a complete malicious rewrite.
+    pub(crate) fn validate(&self, durable: bool) -> Result<()> {
+        let invalid = |detail: &str| Error::Invalid(format!("invalid prepared anchor: {detail}"));
+        let anchor = &self.anchor;
+        if durable && !self.only_if_absent {
+            return Err(invalid("durable requests must be conditional"));
+        }
+        if anchor.v != "nostoi-anchor-v1"
+            || anchor.seq == 0
+            || anchor.digest.len() != 64
+            || !anchor
+                .digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || !crate::format::Format::ALL
+                .iter()
+                .any(|format| format.name() == anchor.format)
+        {
+            return Err(invalid("unsupported schema/format or malformed checkpoint"));
+        }
+        if anchor.chain.trim().is_empty() || anchor.chain.chars().any(char::is_control) {
+            return Err(invalid("empty or invalid chain identity"));
+        }
+        if anchor.key.is_empty()
+            || anchor.key.starts_with('/')
+            || anchor.key.chars().any(char::is_control)
+            || anchor
+                .key
+                .split('/')
+                .any(|part| part == "." || part == "..")
+        {
+            return Err(invalid("empty or unsafe object key"));
+        }
+        if !matches!(anchor.provider.as_str(), "s3" | "r2") {
+            return Err(invalid("unsupported provider"));
+        }
+        let anchored_at = OffsetDateTime::parse(&anchor.anchored_at, &Rfc3339)
+            .map_err(|_| invalid("invalid checkpoint timestamp"))?;
+        match self.lock {
+            Some(mode) => {
+                if anchor.provider != "s3"
+                    || anchor.mode.as_deref() != Some(mode.as_str())
+                    || !(1..=36500).contains(&self.retain_days)
+                {
+                    return Err(invalid(
+                        "inconsistent provider, lock mode or retention duration",
+                    ));
+                }
+                let deadline = anchor
+                    .retain_until
+                    .as_deref()
+                    .ok_or_else(|| invalid("missing retention deadline"))?;
+                let deadline = OffsetDateTime::parse(deadline, &Rfc3339)
+                    .map_err(|_| invalid("invalid retention deadline"))?;
+                if anchored_at.checked_add(Duration::days(self.retain_days)) != Some(deadline) {
+                    return Err(invalid(
+                        "retention deadline differs from timestamp plus retain-days",
+                    ));
+                }
+            }
+            None => {
+                if anchor.mode.is_some() || anchor.retain_until.is_some() || self.retain_days != 0 {
+                    return Err(invalid(
+                        "retention metadata present without a requested lock",
+                    ));
+                }
+            }
+        }
+        let expected = serde_json::to_vec_pretty(anchor)
+            .map_err(|_| invalid("cannot serialize checkpoint"))?;
+        if self.body != expected {
+            return Err(invalid(
+                "payload bytes differ from the serialized checkpoint",
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_expiry(&self) -> Result<()> {
+        if self.lock.is_some() {
+            let deadline = self
+                .anchor
+                .retain_until
+                .as_deref()
+                .ok_or_else(|| Error::Invalid("missing retention deadline".into()))?;
+            let parsed = OffsetDateTime::parse(deadline, &Rfc3339)
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+            if parsed <= OffsetDateTime::now_utc() {
+                return Err(Error::AnchorExpired {
+                    key: self.anchor.key.clone(),
+                    retain_until: deadline.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Verify the entire chain and prepare a request without network effects.
+pub fn prepare_anchor(
+    chain_path: &Path,
+    options: AnchorOptions,
+    provider: Provider,
+) -> Result<PreparedAnchor> {
     let report = crate::verify(chain_path, None)?;
     if let Some(problem) = report.problem {
         return Err(Error::Broken(problem));
@@ -258,11 +379,37 @@ pub fn anchor_head(
 
     let body = serde_json::to_vec_pretty(&anchor)
         .map_err(|error| Error::S3(format!("serialize anchor: {error}")))?;
+    Ok(PreparedAnchor {
+        anchor,
+        body,
+        only_if_absent: options.only_if_absent,
+        lock: options.lock,
+        retain_days: if options.lock.is_some() {
+            options.retain_days
+        } else {
+            0
+        },
+    })
+}
+
+/// Publish the original bytes and deadline. Conditional objects are never overwritten.
+pub fn publish_prepared(client: &Client, prepared: &PreparedAnchor, exact: bool) -> Result<Anchor> {
+    prepared.validate(false)?;
+    prepared.check_expiry()?;
+    let anchor = prepared.anchor.clone();
+    let key = anchor.key.clone();
     let put_options = PutOptions {
         content_type: "application/json; charset=utf-8".to_string(),
-        lock: match (provider, options.lock) {
-            (Provider::S3, Some(mode)) => {
-                let retain_until = anchored_at + Duration::days(options.retain_days);
+        lock: match prepared.lock {
+            Some(mode) => {
+                let retain_until = OffsetDateTime::parse(
+                    anchor
+                        .retain_until
+                        .as_deref()
+                        .ok_or_else(|| Error::Invalid("missing retention deadline".into()))?,
+                    &Rfc3339,
+                )
+                .map_err(|e| Error::Invalid(e.to_string()))?;
                 Some(ObjectLock {
                     mode: mode.into(),
                     retain_until,
@@ -270,20 +417,20 @@ pub fn anchor_head(
             }
             _ => None,
         },
-        only_if_absent: options.only_if_absent,
+        only_if_absent: prepared.only_if_absent,
     };
     let unconfirmed = |detail: String| Error::AnchorUnconfirmed {
         key: key.clone(),
         detail,
     };
-    let existing_body = match client.put_object(&key, &body, &put_options) {
+    let existing_body = match client.put_object(&key, &prepared.body, &put_options) {
         Ok(result) if result.existed => Some(
             client
                 .get_object(&key)
                 .map_err(|e| unconfirmed(e.to_string()))?,
         ),
         Ok(_) => None,
-        Err(error @ Error::UploadUncertain { .. }) if options.only_if_absent => {
+        Err(error @ Error::UploadUncertain { .. }) if prepared.only_if_absent => {
             // All receipts may have been lost. Read the deterministic key once
             // before reporting uncertainty; never overwrite it to "repair" it.
             match client.get_object(&key) {
@@ -294,6 +441,11 @@ pub fn anchor_head(
         Err(error) => return Err(error),
     };
     let anchor = if let Some(body) = existing_body {
+        if exact && body.as_bytes() != prepared.body {
+            return Err(unconfirmed(
+                "existing object differs from the durable request bytes".into(),
+            ));
+        }
         let existing: Anchor = serde_json::from_str(&body)
             .map_err(|e| unconfirmed(format!("existing anchor is invalid: {e}")))?;
         if existing.v != anchor.v
@@ -324,6 +476,12 @@ pub fn anchor_head(
             return Err(unconfirmed(
                 "anchor uploaded, but Object Lock retention does not meet the request".into(),
             ));
+        }
+        // A request that expired during reconciliation must not become a fresh
+        // assurance merely because the server returned its historical deadline.
+        prepared.check_expiry()?;
+        if retain_until <= OffsetDateTime::now_utc() {
+            return Err(unconfirmed("Object Lock retention has expired".into()));
         }
     }
     Ok(anchor)

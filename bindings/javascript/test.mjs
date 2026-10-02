@@ -13,7 +13,7 @@ assert.equal(JSON.parse(chains.verifyJsonl(altered, undefined)).ok, false);
 assert.throws(() => chains.appendJsonl(altered, draft));
 assert.throws(() => chains.appendJsonl('', {...draft, bodyJson:'{"float":0.1}'}));
 assert.throws(() => chains.verifyJsonl('', 'unknown'));
-const vector = readFileSync(new URL('../../tests/vectors/weftmark-ledger.jsonl', import.meta.url), 'utf8');
+const vector = readFileSync(new URL('../../crates/nostoi-core/tests/vectors/weftmark-ledger.jsonl', import.meta.url), 'utf8');
 assert.equal(JSON.parse(chains.verifyJsonl(vector, undefined)).ok, true);
 if (process.env.NOSTOI_INTEROP_DIR) {
   const dir = process.env.NOSTOI_INTEROP_DIR;

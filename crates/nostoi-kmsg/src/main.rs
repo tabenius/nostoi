@@ -3,8 +3,8 @@
 //!
 //! This is the daemon half of the `/dev/kmsg` attachment — the transport loop,
 //! which is deployment-specific. The reusable halves live in the library:
-//! [`nostoi::kmsg`] parses the ring buffer, and
-//! [`nostoi::sqlite::Store::open_verified`] is the long-lived writer that
+//! [`nostoi_kmsg`] parses the ring buffer, and
+//! [`nostoi_core::sqlite::Store::open_verified`] is the long-lived writer that
 //! verifies the chain once and then appends in O(log n).
 //!
 //! Reading `/dev/kmsg` does not consume records for anyone else
@@ -30,8 +30,8 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use clap::Parser;
-use nostoi::kmsg::{self, Event, Record};
-use nostoi::{sqlite, Draft, Error};
+use nostoi_core::{sqlite, Draft, Error};
+use nostoi_kmsg::{self, Event, Record};
 use rusqlite::OptionalExtension;
 use serde_json::{json, Map, Value};
 
@@ -132,8 +132,8 @@ fn run(args: &Args) -> Result<(), Error> {
         .and_then(|checkpoint| checkpoint.kernel_seq);
     writer.boot_id = boot_id.clone();
     writer.source = source.clone();
-    let mut reader =
-        kmsg::Reader::open_path(&args.source).map_err(|error| to_nostoi(error, &args.source))?;
+    let mut reader = nostoi_kmsg::Reader::open_path(&args.source)
+        .map_err(|error| to_nostoi(error, &args.source))?;
     if let Some(previous) = &previous {
         let reason = if previous.boot_id.as_deref() != Some(&boot_id) {
             "boot_changed_or_legacy_checkpoint"
@@ -208,8 +208,8 @@ fn run(args: &Args) -> Result<(), Error> {
                 }
                 sleep(Duration::from_millis(args.poll_ms));
             }
-            Err(error @ kmsg::Error::Io(_)) => return Err(to_nostoi(error, &args.source)),
-            Err(kmsg::Error::Malformed(reason)) => {
+            Err(error @ nostoi_kmsg::Error::Io(_)) => return Err(to_nostoi(error, &args.source)),
+            Err(nostoi_kmsg::Error::Malformed(reason)) => {
                 // Never drop a line silently: record why it could not be read.
                 writer.append("kmsg.unparsable", json!({ "reason": reason }), args.print)?;
             }
@@ -275,7 +275,7 @@ impl Writer {
     }
 
     fn append(&mut self, kind: &str, mut body: Value, print: bool) -> Result<(), Error> {
-        body["schema"] = json!(kmsg::KMSG_PAYLOAD_V1);
+        body["schema"] = json!(nostoi_kmsg::KMSG_PAYLOAD_V1);
         body["boot_id"] = json!(self.boot_id);
         body["source"] = json!(self.source);
         let draft = Draft {
@@ -316,7 +316,7 @@ impl Writer {
                     serde_json::from_str(&text).map_err(|e| Error::Invalid(e.to_string()))?;
                 let body = &record["body"];
                 if let Some(version) = body.get("schema") {
-                    if version.as_str() != Some(kmsg::KMSG_PAYLOAD_V1) {
+                    if version.as_str() != Some(nostoi_kmsg::KMSG_PAYLOAD_V1) {
                         return Err(Error::UnsupportedSchema {
                             component: "kmsg checkpoint payload",
                             found: version
@@ -325,7 +325,7 @@ impl Writer {
                                 .chars()
                                 .take(128)
                                 .collect(),
-                            supported: kmsg::KMSG_PAYLOAD_V1.into(),
+                            supported: nostoi_kmsg::KMSG_PAYLOAD_V1.into(),
                         });
                     }
                 }
@@ -371,12 +371,12 @@ impl Drop for ShutdownSignals {
     }
 }
 
-fn to_nostoi(error: kmsg::Error, path: &std::path::Path) -> Error {
+fn to_nostoi(error: nostoi_kmsg::Error, path: &std::path::Path) -> Error {
     match error {
-        kmsg::Error::Io(source) => Error::Io {
+        nostoi_kmsg::Error::Io(source) => Error::Io {
             path: path.display().to_string(),
             source,
         },
-        kmsg::Error::Malformed(reason) => Error::Invalid(reason),
+        nostoi_kmsg::Error::Malformed(reason) => Error::Invalid(reason),
     }
 }

@@ -1,4 +1,4 @@
-//! The chain formats Nostoi reads (and, for `nostoi-v1`, writes).
+//! The core chain formats Nostoi reads (and, for `nostoi-v1`, writes).
 //!
 //! | Format | Used by | Record | Digest |
 //! | --- | --- | --- | --- |

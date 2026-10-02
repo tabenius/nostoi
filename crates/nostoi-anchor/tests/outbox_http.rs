@@ -1,9 +1,9 @@
-#![cfg(all(feature = "s3", feature = "sqlite"))]
+#![cfg(feature = "sqlite")]
 
-use nostoi::anchor::{AnchorOptions, LockMode};
-use nostoi::outbox::Outbox;
-use nostoi::s3::{Client, Credentials, Provider};
-use nostoi::Error;
+use nostoi_anchor::anchor::{AnchorOptions, LockMode};
+use nostoi_anchor::outbox::Outbox;
+use nostoi_anchor::s3::{Client, Credentials, Provider};
+use nostoi_anchor::Error;
 use rusqlite::Connection;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -98,9 +98,9 @@ fn client(endpoint: &str, bucket: &str) -> Client {
     .unwrap()
 }
 fn append(path: &Path) {
-    nostoi::append(
+    nostoi_core::append(
         path,
-        nostoi::Draft {
+        nostoi_core::Draft {
             actor: None,
             kind: "test",
             subject: None,
@@ -148,7 +148,7 @@ fn assert_durable(path: &Path, request: &Request) {
         assert!(!serialized.contains(secret));
     }
     let intent: serde_json::Value = serde_json::from_str(&serialized).unwrap();
-    assert_eq!(intent["v"], nostoi::anchor::PREPARED_ANCHOR_V1);
+    assert_eq!(intent["v"], nostoi_anchor::anchor::PREPARED_ANCHOR_V1);
     let bytes: Vec<u8> = serde_json::from_value(intent["body"].clone()).unwrap();
     assert_eq!(bytes, request.body);
     assert!(request
@@ -423,10 +423,11 @@ fn ordinary_prepared_api_preserves_nonconditional_uploads_and_old_unlocked_times
     append(&source);
     let mut config = options(false);
     config.only_if_absent = false;
-    let prepared = nostoi::anchor::prepare_anchor(&source, config, Provider::S3).unwrap();
+    let prepared = nostoi_anchor::anchor::prepare_anchor(&source, config, Provider::S3).unwrap();
     let mut value = serde_json::to_value(prepared).unwrap();
     value["anchor"]["anchored_at"] = serde_json::json!("2000-01-01T00:00:00Z");
-    let anchor: nostoi::anchor::Anchor = serde_json::from_value(value["anchor"].clone()).unwrap();
+    let anchor: nostoi_anchor::anchor::Anchor =
+        serde_json::from_value(value["anchor"].clone()).unwrap();
     value["body"] = serde_json::to_value(serde_json::to_vec_pretty(&anchor).unwrap()).unwrap();
     let prepared = serde_json::from_value(value).unwrap();
     let (client, handle) = server(1, |_, request| {
@@ -444,7 +445,7 @@ fn ordinary_prepared_api_preserves_nonconditional_uploads_and_old_unlocked_times
             .contains("2000-01-01T00:00:00Z"));
         ("200 OK", String::new())
     });
-    nostoi::anchor::publish_prepared(&client, &prepared, false).unwrap();
+    nostoi_anchor::anchor::publish_prepared(&client, &prepared, false).unwrap();
     handle.join().unwrap();
 }
 
@@ -456,7 +457,8 @@ fn fresh_ordinary_request_cannot_confirm_existing_object_with_expired_actual_ret
     let mut existing = String::new();
     let (client, handle) = server(3, move |i, request| match i {
         0 => {
-            let mut old: nostoi::anchor::Anchor = serde_json::from_slice(&request.body).unwrap();
+            let mut old: nostoi_anchor::anchor::Anchor =
+                serde_json::from_slice(&request.body).unwrap();
             old.anchored_at = "2000-01-01T00:00:00Z".into();
             old.retain_until = Some("2000-01-31T00:00:00Z".into());
             existing = serde_json::to_string_pretty(&old).unwrap();
@@ -470,7 +472,7 @@ fn fresh_ordinary_request_cannot_confirm_existing_object_with_expired_actual_ret
         _ => unreachable!(),
     });
     assert!(matches!(
-        nostoi::anchor::anchor_head(&source, &client, options(true), Provider::S3),
+        nostoi_anchor::anchor::anchor_head(&source, &client, options(true), Provider::S3),
         Err(Error::AnchorUnconfirmed { .. })
     ));
     handle.join().unwrap();

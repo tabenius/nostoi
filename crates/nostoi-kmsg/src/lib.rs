@@ -1,4 +1,4 @@
-//! Reading the kernel log ring buffer at `/dev/kmsg`.
+//! Linux kernel ring-buffer ingestion compartment.
 //!
 //! The kernel's `Documentation/ABI/testing/dev-kmsg` defines the record format
 //! and, importantly, the concurrency rules this module relies on:
@@ -40,11 +40,15 @@
 //! further unescaping to be chained.
 
 use std::fs::File;
-
-pub const KMSG_PAYLOAD_V1: &str = "nostoi-kmsg-v1";
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
+
+pub mod error;
+pub use error::{Error, Result};
+
+/// Payload `schema` written for every kernel record this crate chains.
+pub const KMSG_PAYLOAD_V1: &str = "nostoi-kmsg-v1";
 
 /// One record from the ring buffer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,18 +66,6 @@ pub struct Record {
     /// `key=value` pairs from the record's continuation lines.
     pub context: Vec<(String, String)>,
 }
-
-/// Why a record could not be read.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// The bytes are not a `/dev/kmsg` record.
-    #[error("not a kmsg record: {0}")]
-    Malformed(String),
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
 
 /// Parse one record: a header line plus any continuation lines.
 ///

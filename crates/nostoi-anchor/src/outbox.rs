@@ -1,4 +1,4 @@
-//! Durable, target-bound anchor intents, separate from the audit chain.
+//! Publisher-owned durable intents, separate from the audit chain.
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -29,41 +29,7 @@ impl Outbox {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA synchronous=FULL;")?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        crate::schema::check(&tx, crate::schema::Component::Outbox, true)?;
-        let source_name = source
-            .to_str()
-            .ok_or_else(|| Error::Invalid("source path must be UTF-8".into()))?;
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='outbox_meta')",
-            [],
-            |r| r.get(0),
-        )?;
-        if exists {
-            let original: Option<String> = tx
-                .query_row("SELECT source FROM outbox_meta WHERE id=1", [], |r| {
-                    r.get(0)
-                })
-                .optional()?;
-            if original.as_deref() != Some(source_name) {
-                return Err(Error::Invalid(
-                    "outbox belongs to a different or unknown source audit file".into(),
-                ));
-            }
-        }
-        crate::schema::initialize(&tx, crate::schema::Component::Outbox)?;
-        tx.execute(
-            "INSERT OR IGNORE INTO outbox_meta(id,source) VALUES(1,?1)",
-            [source_name],
-        )?;
-        let stored: String =
-            tx.query_row("SELECT source FROM outbox_meta WHERE id=1", [], |r| {
-                r.get(0)
-            })?;
-        if stored != source_name {
-            return Err(Error::Invalid(
-                "outbox belongs to a different source audit file".into(),
-            ));
-        }
+        nostoi_core::schema::initialize_outbox(&tx, &source)?;
         tx.commit()?;
         let journal: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;

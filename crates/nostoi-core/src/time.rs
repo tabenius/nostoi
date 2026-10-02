@@ -1,4 +1,4 @@
-//! Timestamps: RFC 3339, UTC, millisecond precision.
+//! Core timestamps: RFC 3339, UTC, millisecond precision.
 
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;

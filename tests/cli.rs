@@ -145,3 +145,31 @@ fn log_follow_streams_new_records_once_verified() {
     child.kill().unwrap();
     let _ = child.wait();
 }
+
+#[test]
+fn schema_is_read_only_and_reports_persisted_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.sqlite");
+    let p = path.to_str().unwrap().to_string();
+    nostoi(&["append", &p, "--kind", "first"]);
+    let before = std::fs::read(&path).unwrap();
+
+    let output = nostoi(&["schema", "--json", &p]);
+    assert_eq!(
+        code(&output),
+        0,
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(metadata["schema_revision"], 1);
+    assert_eq!(
+        metadata["application_id"].as_i64().unwrap(),
+        nostoi::schema::AUDIT_APPLICATION_ID
+    );
+    assert_eq!(metadata["record_format"], "nostoi-v1");
+
+    // Reporting schema must never write: a read that stamped the file would be
+    // indistinguishable from opening it for writing.
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}

@@ -72,6 +72,19 @@ Features: `sqlite` (the SQLite stores), `cli`, `tui`; all on by default.
 `default-features = false` leaves the pure verifier: canonical JSON, the three
 digests, JSONL.
 
+The implementation is split into one crate per compartment, and the `nostoi`
+crate above is a facade that re-exports them:
+
+| Crate | Contains | Extra features |
+| --- | --- | --- |
+| `nostoi-core` | formats, canonical JSON, streaming verification, JSONL/SQLite stores | `sqlite` |
+| `nostoi-anchor` | S3/R2 checkpoints, verification, durable outbox, the `nostoi-anchor` binary | `sqlite`, `cli` |
+| `nostoi-kmsg` | the Linux kernel ring-buffer reader and the `kmsg-nostoi` daemon | `sqlite`, `cli` |
+
+`nostoi-core` has no networking, CLI or Linux dependency, so portable consumers
+and bindings use only that. Existing `nostoi::` paths keep working; see
+[compartment boundaries](docs/COMPARTMENT-ARCHITECTURE.md).
+
 ## Python and WebAssembly
 
 Native Python bindings (PyO3), a versioned WIT component, and generated
@@ -108,7 +121,7 @@ against each other in both directions.
 
 WeftMark's `weftmark-ledger-v1` is hashed the same way (its record: `sequence`,
 `previous_digest`, `kind`, `entity_id`, `payload`, `recorded_at`, `digest`).
-Ephor's `ephor-audit-v1` hashes length-prefixed fields; see `src/format.rs`.
+Ephor's `ephor-audit-v1` hashes length-prefixed fields; see `crates/nostoi-core/src/format.rs`.
 
 ## The SQLite store
 

@@ -1,4 +1,4 @@
-//! Chains stored as JSON Lines: one record per line, appended, never edited.
+//! Core JSON Lines storage: one record per line, appended, never edited.
 //!
 //! Reading detects the format from the first record (`"v": "nostoi-v1"`, or
 //! WeftMark's `sequence`/`previous_digest`, or Ephor's

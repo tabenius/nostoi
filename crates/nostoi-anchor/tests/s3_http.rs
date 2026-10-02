@@ -1,6 +1,4 @@
-#![cfg(feature = "s3")]
-
-use nostoi::s3::{Client, Credentials, LockMode, ObjectLock, PutOptions};
+use nostoi_anchor::s3::{Client, Credentials, LockMode, ObjectLock, PutOptions};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 

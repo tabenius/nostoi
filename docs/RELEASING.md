@@ -21,8 +21,8 @@ cargo publish --dry-run
 
 Build/install the Python wheel, run bindings/python/tests, build the JavaScript
 package and run its tests as described in INTEROPERABILITY.md. CI repeats the
-cross-language equality check. Inspect `cargo package --list`: only the core
-crate, licenses, README, logo and conformance sources should enter crates.io.
+cross-language equality check. Inspect `cargo package --list`: each crate should
+enter crates.io with only its own source, tests, licenses, README and logo.
 
 Before publishing: review the diff and CI, confirm crates.io ownership, check
 license files, choose a tag matching Cargo.toml, and record the tested toolchain.
@@ -30,6 +30,31 @@ The manifest's Rust floor applies to the core crate; the independently versioned
 binding tools may need newer Rust. Publish only after explicitly authorizing a
 registry release. `cargo publish` uploads the crate; a GitHub visibility change
 does not publish it to crates.io.
+
+## Publication order
+
+The workspace is split into crates that depend on each other, and none of them
+has been published yet. crates.io requires a dependency to exist before the
+crate that requires it can be packaged, so a release cannot be a single
+`cargo publish`. Publish in dependency order:
+
+```sh
+cargo publish -p nostoi-core        # no intra-workspace dependencies
+cargo publish -p nostoi-anchor      # needs nostoi-core
+cargo publish -p nostoi-kmsg        # needs nostoi-core
+cargo publish -p nostoi             # needs all three
+```
+
+Until `nostoi-core` is on the registry, `cargo package`/`cargo publish` for the
+other three fails with `no matching package named nostoi-core found`. That is
+the expected pre-release state, not a manifest defect, and CI therefore dry-runs
+`nostoi-core` only and checks the other three with `cargo package --list`,
+which needs no registry resolution. Inspect those lists: each crate must carry
+only its own source, tests and manifest, and the root crate must not carry
+`crates/`.
+
+`nostoi::` paths remain available from the root `nostoi` crate, so consumers do
+not have to migrate. New code should depend on the compartment it needs.
 
 ## Current limits
 

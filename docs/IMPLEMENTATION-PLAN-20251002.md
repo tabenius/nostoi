@@ -193,7 +193,7 @@ Likewise, a stale cached head is not evidence of tampering by itself.
 - Test passes; API semantics preserved; no behavior change on intact chain.
 
 ## 2. P0: Anchor idempotency + robust status handling
-**Files**: `src/anchor.rs`, `src/s3.rs`
+**Files**: `crates/nostoi-anchor/src/anchor.rs`, `crates/nostoi-anchor/src/s3.rs`
 
 ### 2a S3: surface non-2xx clearly and allow idempotent 412
 - In `s3::Client::put_object`, when `only_if_absent` and `response.status==412`, do not immediately error with a generic string; instead return a structured result or a specific error variant? Or have `put_object` return `Result<PutResult, PutError>` with `AlreadyExists` variant. But `Error` enum is flat.
@@ -234,7 +234,7 @@ On 412 + only_if_absent: return `Ok(PutResult{etag:None, existed:true})` (do not
 - Absolute paths don't produce leading `_`; keys are safe.
 
 ## 4. P0: kmsg loss accounting on overrun before next record
-**File**: `src/kmsg.rs`
+**File**: `crates/nostoi-kmsg/src/lib.rs`
 
 ### Approach
 - Add state: `overrun_pending: bool` (or count pending). When `read()` returns `-EPIPE`, set `overrun_pending = true` and `lost += ?` but we don't know yet. The gap is `(next.seq - last.seq - 1)` when next record arrives. So on `Event::Overrun`, set a flag: `self.overrun_pending = true`.

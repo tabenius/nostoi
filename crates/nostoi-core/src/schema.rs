@@ -1,4 +1,4 @@
-//! Database identity, explicit schema revisions, and transactional legacy adoption.
+//! Shared storage identity, explicit schema revisions, and legacy adoption.
 //! These labels describe compatibility; they are not tamper-evidence or trusted heads.
 
 use crate::{Error, Result};
@@ -312,6 +312,45 @@ pub fn inspect(path: &Path) -> Result<SchemaInfo> {
         }
     };
     check(&tx, component, false)
+}
+
+/// Initialize/bind a dedicated outbox schema inside the caller's transaction.
+/// Cloud upload logic lives outside core; this helper owns only the SQL contract.
+/// `source` must identify an existing audit file. No intent or upload data changes.
+pub fn initialize_outbox(conn: &Connection, source: &Path) -> Result<()> {
+    if conn.is_autocommit() {
+        return Err(Error::Invalid(
+            "outbox schema initialization requires a transaction".into(),
+        ));
+    }
+    check(conn, Component::Outbox, true)?;
+    let source = std::fs::canonicalize(source).map_err(crate::error::io(source))?;
+    let name = source
+        .to_str()
+        .ok_or_else(|| Error::Invalid("source path must be UTF-8".into()))?;
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='outbox_meta')",
+        [],
+        |r| r.get(0),
+    )?;
+    if exists {
+        let original: Option<String> = conn
+            .query_row("SELECT source FROM outbox_meta WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if original.as_deref() != Some(name) {
+            return Err(Error::Invalid(
+                "outbox belongs to a different or unknown source audit file".into(),
+            ));
+        }
+    }
+    initialize(conn, Component::Outbox)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO outbox_meta(id,source) VALUES(1,?1)",
+        [name],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

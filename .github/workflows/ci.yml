@@ -60,4 +60,13 @@ jobs:
           import nostoi
           assert nostoi.verify_jsonl(Path('/tmp/nostoi-interop/javascript.jsonl').read_text())['verified'] == 2
           PY
-      - run: cargo publish --dry-run --locked
+      # Only nostoi-core can be packaged before the split reaches the registry;
+      # the others resolve their intra-workspace dependency first. See
+      # docs/RELEASING.md for the publication order.
+      - name: Publishable crate dry-run
+        run: cargo publish --dry-run --locked -p nostoi-core
+      - name: Each crate packages only its own files
+        run: |
+          for crate in nostoi nostoi-anchor nostoi-kmsg; do
+            cargo package --list --locked -p "$crate"
+          done

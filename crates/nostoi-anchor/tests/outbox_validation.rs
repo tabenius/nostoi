@@ -1,9 +1,11 @@
-#![cfg(all(feature = "s3", feature = "sqlite"))]
+#![cfg(feature = "sqlite")]
 
-use nostoi::anchor::{prepare_anchor, publish_prepared, AnchorOptions, LockMode, PreparedAnchor};
-use nostoi::outbox::Outbox;
-use nostoi::s3::{Client, Credentials, Provider};
-use nostoi::Error;
+use nostoi_anchor::anchor::{
+    prepare_anchor, publish_prepared, AnchorOptions, LockMode, PreparedAnchor,
+};
+use nostoi_anchor::outbox::Outbox;
+use nostoi_anchor::s3::{Client, Credentials, Provider};
+use nostoi_anchor::Error;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -101,9 +103,9 @@ fn options() -> AnchorOptions {
 }
 
 fn source(path: &Path) {
-    nostoi::append(
+    nostoi_core::append(
         path,
-        nostoi::Draft {
+        nostoi_core::Draft {
             actor: None,
             kind: "test",
             subject: None,
@@ -115,7 +117,8 @@ fn source(path: &Path) {
 }
 
 fn sync_body(request: &mut Value) {
-    let anchor: nostoi::anchor::Anchor = serde_json::from_value(request["anchor"].clone()).unwrap();
+    let anchor: nostoi_anchor::anchor::Anchor =
+        serde_json::from_value(request["anchor"].clone()).unwrap();
     request["body"] = serde_json::to_value(serde_json::to_vec_pretty(&anchor).unwrap()).unwrap();
 }
 

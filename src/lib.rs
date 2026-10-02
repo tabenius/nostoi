@@ -1,63 +1,72 @@
 //! # Nostoi
 //!
-//! Tamper-evident audit chains, one library for all of them: verify them,
-//! append to them, stream them and browse them.
+//! Tamper-evident audit chains: verify them, append to them, stream them and
+//! browse them.
 //!
-//! A chain is a sequence of records where each record carries the digest of
-//! the one before it and a digest of its own content. Change, remove or
-//! reorder any record and verification names the first one that no longer
-//! fits; everything before it is intact.
+//! This package is the compatibility facade. The implementation now lives in
+//! three crates, one per compartment:
 //!
-//! Nostoi reads three formats (see [`format`]):
+//! - [`nostoi_core`] formats, streaming verification and local audit storage.
+//!   Portable, and the only one of the three with no network or platform
+//!   assumptions.
+//! - `nostoi-anchor` (with the `s3` feature) checkpoints to S3-compatible
+//!   storage, verifies them again, and recovers interrupted publications.
+//! - `nostoi-kmsg` (with the `kmsg` feature) reads the Linux kernel ring
+//!   buffer into a chain.
 //!
-//! - `nostoi-v1`, its own, as JSON Lines or an append-only SQLite store;
-//! - `weftmark-ledger-v1`, WeftMark's `ledger.jsonl`;
-//! - `ephor-audit-v1`, Ephor's `governance_events`.
-//!
-//! and writes `nostoi-v1`, whose digest any language can compute: SHA-256 of
-//! the record's canonical JSON without its `digest`, where canonical JSON is
-//! Python's `json.dumps(record, sort_keys=True, separators=(",", ":"))`.
-//!
-//! ```no_run
-//! use nostoi::{append, verify, Draft};
-//! use serde_json::json;
-//!
-//! let path = std::path::Path::new("audit.jsonl");
-//! append(path, Draft {
-//!     actor: Some("agent:claude"),
-//!     kind: "tool.call",
-//!     subject: Some("cs-42"),
-//!     body: json!({"tool": "weft_handoff_create"}),
-//!     at: None,
-//! })?;
-//! let report = verify(path, None)?;
-//! assert!(report.ok);
-//! # Ok::<(), nostoi::Error>(())
-//! ```
-//!
-//! *Nostoi* (Νόστοι, "homecomings") are the lost epic poems of the Greek heroes'
-//! journeys home: records that should have survived and did not.
+//! Every `nostoi::` path below is a re-export, so existing code keeps
+//! compiling against this crate. New code should depend on the compartment it
+//! actually needs, and get an order of magnitude less to compile and audit.
 
 #[cfg(feature = "s3")]
-pub mod anchor;
+pub mod anchor {
+    pub use nostoi_anchor::anchor::*;
+    pub use nostoi_anchor::{Error, Result};
+    #[cfg(feature = "sqlite")]
+    pub mod outbox {
+        pub use nostoi_anchor::outbox::*;
+    }
+}
 
-pub mod canonical;
-pub mod chain;
+pub mod canonical {
+    pub use nostoi_core::canonical::*;
+}
+pub mod chain {
+    pub use nostoi_core::chain::*;
+}
 mod error;
-pub mod format;
-pub mod jsonl;
+pub mod format {
+    pub use nostoi_core::format::*;
+}
+pub mod jsonl {
+    pub use nostoi_core::jsonl::*;
+}
 #[cfg(all(feature = "kmsg", target_os = "linux"))]
-pub mod kmsg;
+pub mod kmsg {
+    pub use nostoi_kmsg::*;
+}
 #[cfg(all(feature = "s3", feature = "sqlite"))]
-pub mod outbox;
-pub mod portable;
+pub mod outbox {
+    pub use nostoi_anchor::outbox::*;
+}
+pub mod portable {
+    pub use nostoi_core::portable::*;
+}
 #[cfg(feature = "s3")]
-pub mod s3;
+pub mod s3 {
+    pub use nostoi_anchor::s3::*;
+}
 #[cfg(feature = "sqlite")]
-pub mod schema;
+pub mod schema {
+    pub use nostoi_core::schema::*;
+}
 #[cfg(feature = "sqlite")]
-pub mod sqlite;
-pub mod time;
+pub mod sqlite {
+    pub use nostoi_core::sqlite::*;
+}
+pub mod time {
+    pub use nostoi_core::time::*;
+}
 #[cfg(feature = "tui")]
 pub mod tui;
 
@@ -71,11 +80,7 @@ use std::path::Path;
 /// Read the chain at `path`: a JSONL file, or (with the `sqlite` feature) an
 /// SQLite database. The format is detected unless given.
 pub fn open(path: &Path, format: Option<Format>) -> Result<Loaded> {
-    #[cfg(feature = "sqlite")]
-    if sqlite::is_sqlite(path) {
-        return sqlite::load(path, format);
-    }
-    jsonl::load(path, format)
+    nostoi_core::open(path, format).map_err(Error::from)
 }
 
 /// Verify the entire chain at `path` with record memory bounded by its largest
@@ -95,30 +100,12 @@ pub fn verify_streaming(
     format: Option<Format>,
     checkpoint_seq: Option<u64>,
 ) -> Result<StreamingVerification> {
-    #[cfg(feature = "sqlite")]
-    if sqlite::is_sqlite(path) {
-        return sqlite::verify_streaming(path, format, checkpoint_seq);
-    }
-    jsonl::verify_reader(
-        std::fs::File::open(path).map_err(error::io(path))?,
-        format,
-        checkpoint_seq,
-    )
+    nostoi_core::verify_streaming(path, format, checkpoint_seq).map_err(Error::from)
 }
 
 /// Append a `nostoi-v1` record to the chain at `path`, creating it if needed:
 /// the SQLite store for an existing SQLite file or a new `.sqlite`/`.db`
 /// path, JSON Lines otherwise. A broken chain is never extended.
 pub fn append(path: &Path, draft: Draft<'_>) -> Result<Entry> {
-    #[cfg(feature = "sqlite")]
-    {
-        let sqlite_name = matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("sqlite" | "sqlite3" | "db")
-        );
-        if sqlite::is_sqlite(path) || (!path.exists() && sqlite_name) {
-            return sqlite::Store::open(path)?.append(draft);
-        }
-    }
-    jsonl::append(path, draft)
+    nostoi_core::append(path, draft).map_err(Error::from)
 }

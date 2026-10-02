@@ -1,4 +1,4 @@
-//! SQLite: Nostoi's own append-only store, and Ephor's `governance_events`.
+//! Core SQLite storage: Nostoi's own store, and Ephor's `governance_events`.
 //!
 //! The Nostoi store keeps each `nostoi-v1` record whole (`record`, canonical
 //! JSON) beside its chain fields. Triggers refuse any UPDATE or DELETE, and an

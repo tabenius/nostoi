@@ -1,9 +1,4 @@
-#![cfg(all(
-    feature = "s3",
-    feature = "sqlite",
-    feature = "cli",
-    target_os = "linux"
-))]
+#![cfg(all(feature = "sqlite", feature = "cli", target_os = "linux"))]
 
 //! Offline integration of the scheduling helper with the real Rust binary.
 //! The test-only executable adapter maps local HTTPS to HTTP and adds path-style
@@ -15,14 +10,24 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+/// The deployment helpers under test live in the repository, not in this crate,
+/// so walk up from the manifest directory until they turn up.
+fn repo_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .find(|dir| dir.join("contrib/systemd/nostoi-anchor-runner").is_file())
+        .expect("repository root containing contrib/systemd")
+        .to_path_buf()
+}
+
 #[test]
 fn scheduled_publish_uses_durable_outbox_and_verifier_uses_separate_credentials() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("audit.jsonl");
     let outbox = dir.path().join("outbox.sqlite");
-    nostoi::append(
+    nostoi_core::append(
         &source,
-        nostoi::Draft {
+        nostoi_core::Draft {
             actor: None,
             kind: "test",
             subject: None,
@@ -138,8 +143,7 @@ fn scheduled_publish_uses_durable_outbox_and_verifier_uses_separate_credentials(
     };
     let publisher = credentials("publisher");
     let verifier = credentials("verifier");
-    let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("contrib/systemd/nostoi-anchor-runner");
+    let runner = repo_root().join("contrib/systemd/nostoi-anchor-runner");
     let command = |mode: &str, credentials: &std::path::Path| {
         let mut command = Command::new("sh");
         command

@@ -1,9 +1,4 @@
-#![cfg(all(
-    feature = "kmsg",
-    feature = "sqlite",
-    feature = "cli",
-    target_os = "linux"
-))]
+#![cfg(all(feature = "sqlite", feature = "cli", target_os = "linux"))]
 
 use serde_json::Value;
 use std::path::PathBuf;
@@ -61,11 +56,11 @@ impl Fixture {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(nostoi::verify(&self.store, None).unwrap().ok);
+        assert!(nostoi_core::verify(&self.store, None).unwrap().ok);
     }
 
     fn records(&self) -> Vec<Value> {
-        nostoi::open(&self.store, None)
+        nostoi_core::open(&self.store, None)
             .unwrap()
             .entries
             .into_iter()
@@ -95,7 +90,7 @@ impl Fixture {
                 "writer exited before readiness"
             );
             if self.store.exists()
-                && nostoi::open(&self.store, None).is_ok_and(|loaded| {
+                && nostoi_core::open(&self.store, None).is_ok_and(|loaded| {
                     loaded
                         .entries
                         .iter()
@@ -241,7 +236,7 @@ fn competing_ingestor_cannot_append_duplicate_messages() {
 #[test]
 fn legacy_checkpoint_is_resumed_without_backfilling_its_payload() {
     let fixture = Fixture::new();
-    let previous = nostoi::append(&fixture.store, nostoi::Draft {
+    let previous = nostoi_core::append(&fixture.store, nostoi_core::Draft {
         actor: Some("host:kmsg"), kind: "kmsg.line", subject: Some("kernel"),
         body: serde_json::json!({"boot_id":BOOT_A,"source":fixture.source.display().to_string(),"kmsg_seq":1,"message":"legacy"}), at: None,
     }).unwrap();
@@ -251,20 +246,20 @@ fn legacy_checkpoint_is_resumed_without_backfilling_its_payload() {
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0], previous.record);
     assert!(lines[0]["body"].get("schema").is_none());
-    assert_eq!(lines[1]["body"]["schema"], nostoi::kmsg::KMSG_PAYLOAD_V1);
+    assert_eq!(lines[1]["body"]["schema"], nostoi_kmsg::KMSG_PAYLOAD_V1);
     assert_eq!(lines[1]["body"]["kmsg_seq"], 2);
     assert!(fixture
         .records()
         .iter()
         .filter(|record| record["seq"] != 1)
-        .all(|record| record["body"]["schema"] == nostoi::kmsg::KMSG_PAYLOAD_V1));
+        .all(|record| record["body"]["schema"] == nostoi_kmsg::KMSG_PAYLOAD_V1));
 }
 
 #[test]
 fn unknown_checkpoint_payload_schema_fails_before_new_records() {
     for schema in [serde_json::json!("nostoi-kmsg-v2"), serde_json::Value::Null] {
         let fixture = Fixture::new();
-        nostoi::append(&fixture.store, nostoi::Draft {
+        nostoi_core::append(&fixture.store, nostoi_core::Draft {
             actor:Some("host:kmsg"),kind:"kmsg.line",subject:Some("kernel"),
             body:serde_json::json!({"schema":schema,"boot_id":BOOT_A,"source":fixture.source.display().to_string(),"kmsg_seq":1}),at:None,
         }).unwrap();

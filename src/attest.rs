@@ -431,7 +431,7 @@ pub fn verify(chain: &Path, verifier: &Verifier) -> Result<Attested> {
     let canonicality = read.document.canonicality;
     let canonical = read.document.canonical;
     let signature =
-        std::fs::read(&sidecars.signature).map_err(crate::error::io(&sidecars.signature))?;
+        read_bounded(&sidecars.signature, MAX_SIGNATURE_BYTES).map_err(Error::Invalid)?;
     if signature.is_empty() {
         return Err(Error::Invalid(format!(
             "{} is empty: an attestation with no signature proves nothing",
@@ -503,12 +503,11 @@ fn sign_bytes(program: &Path, key: &Path, namespace: &str, document: &[u8]) -> R
     )
     .map_err(|error| explain_signing_failure(error, key))?;
     let signature_path = dir.join("attestation.json.sig");
-    let signature = std::fs::read(&signature_path).map_err(|error| {
+    let signature = read_bounded(&signature_path, MAX_SIGNATURE_BYTES).map_err(|error| {
         Error::Invalid(format!(
-            "ssh-keygen reported success but wrote no signature ({error})"
+            "ssh-keygen reported success but wrote no readable signature ({error})"
         ))
     })?;
-    let _ = std::fs::remove_dir_all(&dir);
     Ok(signature)
 }
 
@@ -551,7 +550,6 @@ fn verify_bytes(
     let output = child.wait_with_output().map_err(|error| {
         Error::Invalid(format!("{} did not finish: {error}", program.display()))
     })?;
-    let _ = std::fs::remove_dir_all(&dir);
     if !output.status.success() {
         return Err(Error::Invalid(verification_failure(
             &allowed_signers.to_string_lossy(),
@@ -622,6 +620,42 @@ fn explain_signing_failure(error: Error, key: &Path) -> Error {
     ))
 }
 
+/// The largest signature we will read. An armored SSHSIG block is around a
+/// kilobyte.
+///
+/// The document limit lives next to the document reader, in `nostoi-core`, since
+/// that is where the read happens and every caller benefits.
+const MAX_SIGNATURE_BYTES: u64 = 1024 * 1024;
+
+/// Read a file, refusing one larger than `limit`.
+fn read_bounded(path: &Path, limit: u64) -> std::result::Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot open {} ({error})", path.display()))?;
+    let size = file
+        .metadata()
+        .map_err(|error| format!("cannot stat {} ({error})", path.display()))?
+        .len();
+    if size > limit {
+        return Err(format!(
+            "{} is {size} bytes, over the {limit} byte limit for this kind of file",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {} ({error})", path.display()))?;
+    if bytes.len() as u64 > limit {
+        // The file grew between the stat and the read.
+        return Err(format!(
+            "{} is larger than the {limit} byte limit",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Run a program and capture its output.
 fn run(program: &Path, args: &[&str]) -> Result<Output> {
     let output = Command::new(program)
@@ -681,19 +715,119 @@ fn first_line(text: &str) -> String {
     }
 }
 
-/// A private directory for the bytes handed to `ssh-keygen`.
-fn temp_dir(prefix: &str) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
-        // Time is not available in nostoi-core without its own clock import, and
-        // the pid plus an existing-file check is enough to avoid collisions
-        // between concurrent runs on one host.
-        std::time::SystemTime::now()
+/// A private directory for the bytes handed to `ssh-keygen`, removed on drop.
+///
+/// Three properties, each of which `create_dir_all` alone does not give:
+///
+/// * **Private.** The mode is forced to 0700. A umask-derived directory is
+///   typically 0775, which is group-writable: another account in the same group
+///   could read the document or, worse, write into it.
+/// * **Exclusive.** `mkdir` fails if the name exists, and the name is derived
+///   from the pid and a clock, so it is guessable. Adopting a directory somebody
+///   else created is how an attacker gets a path they control into our own
+///   process. A collision retries under a new name instead.
+/// * **Temporary.** The guard removes the directory on every path out, including
+///   the error paths. Removing it by hand at the end of the happy path leaks a
+///   directory per failed attempt otherwise.
+///
+/// The remaining risk is a symlink planted inside the directory after it is
+/// created: `ssh-keygen` writes `<file>.sig` beside the file it is given, and
+/// would follow a symlink there. The window is small and the directory is 0700,
+/// so this is hardening rather than a guarantee.
+fn temp_dir(prefix: &str) -> Result<TempDir> {
+    for attempt in 0..ATTEMPTS {
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos())
-            .unwrap_or_default()
-    ));
-    std::fs::create_dir_all(&dir).map_err(crate::error::io(&dir))?;
-    Ok(dir)
+            .unwrap_or_default();
+        let dir =
+            std::env::temp_dir().join(format!("{prefix}-{}-{nanos}-{attempt}", std::process::id()));
+        match create_private(&dir) {
+            Ok(()) => return Ok(TempDir { path: dir }),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists && attempt + 1 < ATTEMPTS => {}
+            Err(error) => return Err(crate::error::io(&dir)(error)),
+        }
+    }
+    Err(Error::Invalid(format!(
+        "could not create a private directory under {}",
+        std::env::temp_dir().display()
+    )))
+}
+
+/// How many names to try before giving up on a collision.
+const ATTEMPTS: usize = 8;
+
+/// Create one directory, privately, and fail if it already exists.
+///
+/// `create_dir_all` is the wrong call twice over: it derives the mode from the
+/// umask, and it succeeds on a directory that is already there. The second is
+/// the dangerous one, because the name is derived from the pid and a clock.
+fn create_private(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// A directory that deletes itself when it goes out of scope.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn join(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // A failure here would mask the error that caused the drop, so it is
+        // deliberately ignored. Nothing of value is left behind either way: the
+        // only files are the document being signed and the signature.
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_directory_is_private_and_unique_and_self_removing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let first = temp_dir("nostoi-test").unwrap();
+        let second = temp_dir("nostoi-test").unwrap();
+        assert_ne!(first.path, second.path, "each call gets its own directory");
+        assert_eq!(
+            std::fs::metadata(&first.path).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the mode must be forced, not inherited from the umask"
+        );
+
+        let path = first.path.clone();
+        drop(first);
+        assert!(
+            !path.exists(),
+            "dropping the guard must remove the directory"
+        );
+        drop(second);
+    }
+
+    #[test]
+    fn an_existing_directory_is_refused_rather_than_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("taken");
+        create_private(&existing).unwrap();
+        // Adopting somebody else's directory is how a path they control ends up in
+        // our own process, so a second attempt has to fail.
+        let error = create_private(&existing).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    }
 }

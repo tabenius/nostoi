@@ -422,7 +422,7 @@ pub struct Document {
 /// place. The content is parsed as UTF-8 JSON, which is the only encoding the
 /// format accepts.
 pub fn read_document(path: &Path) -> Result<ReadDocument> {
-    let bytes = std::fs::read(path).map_err(crate::error::io(path))?;
+    let bytes = read_bounded(path, MAX_DOCUMENT_BYTES)?;
     let text = decode_utf8(&bytes, path)?;
     let attestation: Attestation = serde_json::from_str(&text)
         .map_err(|error| Error::Invalid(format!("{}: {error}", path.display())))?;
@@ -455,6 +455,41 @@ impl ReadDocument {
     pub fn canonicality(&self) -> Canonicality {
         self.document.canonicality
     }
+}
+
+/// The largest attestation document we will read, in bytes.
+///
+/// The document is a handful of short fields, so this is not a format limit. It
+/// is that this code is meant to run on machines an attacker may already partly
+/// control, where replacing a sidecar with a multi-gigabyte file should produce
+/// an error rather than an out-of-memory kill.
+pub const MAX_DOCUMENT_BYTES: u64 = 64 * 1024;
+
+/// Read a file, refusing one larger than `limit`.
+///
+/// The size is checked before reading and the read itself is capped, so a file
+/// that grows between the two is still refused rather than followed.
+fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(crate::error::io(path))?;
+    let size = file.metadata().map_err(crate::error::io(path))?.len();
+    if size > limit {
+        return Err(Error::Invalid(format!(
+            "{} is {size} bytes, over the {limit} byte limit for this kind of file",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(crate::error::io(path))?;
+    if bytes.len() as u64 > limit {
+        return Err(Error::Invalid(format!(
+            "{} is larger than the {limit} byte limit",
+            path.display()
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Decode UTF-8, naming the encoding problem rather than reporting "invalid

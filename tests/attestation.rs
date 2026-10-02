@@ -757,6 +757,36 @@ fn checked_head(chain: &Path) -> u64 {
 }
 
 #[test]
+fn an_oversized_sidecar_is_refused_rather_than_read_into_memory() {
+    let Some(_) = ssh_keygen() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain(dir.path(), 1);
+    let sidecars = Sidecars::for_chain(&chain);
+    std::fs::write(&sidecars.document, vec![b'x'; 4 * 1024 * 1024]).unwrap();
+    std::fs::write(&sidecars.signature, vec![b'x'; 4 * 1024 * 1024]).unwrap();
+
+    // The document limit is 64 KiB, so this is refused on size rather than parsed.
+    let error = nostoi::attest::read(&chain).unwrap_err();
+    let said = error.to_string();
+    assert!(
+        said.contains("byte limit") || said.contains("not valid JSON"),
+        "{said}"
+    );
+
+    // And the signature limit is independent of it.
+    std::fs::write(
+        &sidecars.document,
+        br#"{"v":"nostoi-attestation-v1","chain":"k","format":"nostoi-v1","seq":1,"digest":"0000000000000000000000000000000000000000000000000000000000000000","anchored_at":"2026-01-01T00:00:00Z","principal":"p","fingerprint":"SHA256:x"}"#,
+    )
+    .unwrap();
+    std::fs::write(&sidecars.signature, vec![b'x'; 4 * 1024 * 1024]).unwrap();
+    let mut verifier = Verifier::new(dir.path().join("allowed"), "p");
+    verifier.program = ssh_keygen().unwrap();
+    let error = nostoi::attest::verify(&chain, &verifier).unwrap_err();
+    assert!(error.to_string().contains("byte limit"), "{error}");
+}
+
+#[test]
 fn a_missing_program_is_reported_clearly() {
     let fixture = fixture!();
     let mut signer = signer(&fixture.key);

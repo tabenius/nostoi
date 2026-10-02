@@ -208,6 +208,17 @@ pub fn read(chain: &Path) -> Result<Option<(Attestation, Vec<u8>)>> {
     Ok(Some((attestation, document)))
 }
 
+/// The attestation sidecars for a chain, if both are there.
+///
+/// Deliberately total: the read-only commands use this to *mention* an
+/// attestation, and it must never fail because one is missing or malformed.
+/// Nothing here checks the signature, so nothing here may claim an attestation is
+/// good; `nostoi verify-attestation` is the command that does that.
+pub fn present(chain: &Path) -> Option<(Attestation, Vec<u8>)> {
+    let (attestation, document) = read(chain).ok()??;
+    Some((attestation, document))
+}
+
 fn read_document(path: &Path) -> CoreResult<Option<Attestation>> {
     if !path.is_file() {
         return Ok(None);

@@ -146,6 +146,184 @@ fn log_follow_streams_new_records_once_verified() {
     let _ = child.wait();
 }
 
+fn ssh_keygen() -> Option<std::path::PathBuf> {
+    let path = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .map(|dir| Path::new(dir).join("ssh-keygen"))
+        .find(|candidate| candidate.is_file())?;
+    Some(path)
+}
+
+#[test]
+fn attesting_signs_the_head_and_verifying_checks_it() {
+    let Some(ssh_keygen) = ssh_keygen() else {
+        eprintln!("skipping: ssh-keygen is not on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let chain = path.to_str().unwrap().to_string();
+    nostoi(&["append", &chain, "--kind", "first"]);
+    nostoi(&["append", &chain, "--kind", "second"]);
+
+    // Before: the read-only commands say what is missing and how to fix it.
+    let verify = nostoi(&["verify", &chain]);
+    assert_eq!(code(&verify), 0);
+    let said = String::from_utf8_lossy(&verify.stdout);
+    assert!(said.contains("no attestation"), "{said}");
+    assert!(said.contains("nostoi attest"), "{said}");
+
+    let key = dir.path().join("id_ed25519");
+    let generated = std::process::Command::new(&ssh_keygen)
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "alice@laptop",
+            "-f",
+            &key.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(generated.status.success());
+
+    let attested = nostoi(&[
+        "attest",
+        &chain,
+        "--key",
+        &key.to_string_lossy(),
+        "--principal",
+        "alice@laptop",
+    ]);
+    assert_eq!(
+        code(&attested),
+        0,
+        "{}",
+        String::from_utf8_lossy(&attested.stderr)
+    );
+    let said = String::from_utf8_lossy(&attested.stdout);
+    assert!(said.contains("attested seq=2"), "{said}");
+    assert!(said.contains("alice@laptop"), "{said}");
+    // The operator is told how to check it, and warned about the timestamp gap.
+    assert!(said.contains("verify-attestation"), "{said}");
+    assert!(said.contains("proves authorship"), "{said}");
+
+    // After: the document is reported, still labelled unchecked.
+    let verify = nostoi(&["verify", &chain]);
+    let said = String::from_utf8_lossy(&verify.stdout);
+    assert!(said.contains("attested by alice@laptop"), "{said}");
+    assert!(said.contains("covers the current head"), "{said}");
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&nostoi(&["verify", &chain, "--json"]).stdout).unwrap();
+    assert_eq!(json["attestation"]["present"], true);
+    assert_eq!(json["attestation"]["signature"], "unchecked");
+    assert_eq!(json["attestation"]["principal"], "alice@laptop");
+    assert_eq!(json["attestation"]["covers_head"], true);
+
+    // Now the signature, with the key pinned.
+    let public = std::process::Command::new(&ssh_keygen)
+        .args(["-y", "-f", &key.to_string_lossy()])
+        .output()
+        .unwrap();
+    let allowed = dir.path().join("allowed_signers");
+    std::fs::write(
+        &allowed,
+        format!(
+            "alice@laptop {}\n",
+            String::from_utf8_lossy(&public.stdout).trim()
+        ),
+    )
+    .unwrap();
+    let fingerprint = String::from_utf8_lossy(
+        &std::process::Command::new(&ssh_keygen)
+            .args(["-lf", &key.to_string_lossy()])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .split_whitespace()
+    .nth(1)
+    .unwrap()
+    .to_string();
+
+    let checked = nostoi(&[
+        "verify-attestation",
+        &chain,
+        "--allowed-signers",
+        &allowed.to_string_lossy(),
+        "--principal",
+        "alice@laptop",
+        "--fingerprint",
+        &fingerprint,
+    ]);
+    assert_eq!(
+        code(&checked),
+        0,
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert!(String::from_utf8_lossy(&checked.stdout).contains("signature verified"));
+
+    // A different pin is refused.
+    let wrong = nostoi(&[
+        "verify-attestation",
+        &chain,
+        "--allowed-signers",
+        &allowed.to_string_lossy(),
+        "--principal",
+        "alice@laptop",
+        "--fingerprint",
+        "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    ]);
+    assert_eq!(code(&wrong), 1);
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("not the pinned key"));
+}
+
+#[test]
+fn appending_makes_an_attestation_visibly_stale() {
+    let Some(ssh_keygen) = ssh_keygen() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let chain = path.to_str().unwrap().to_string();
+    nostoi(&["append", &chain, "--kind", "first"]);
+    let key = dir.path().join("id");
+    std::process::Command::new(&ssh_keygen)
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "alice@laptop",
+            "-f",
+            &key.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    nostoi(&[
+        "attest",
+        &chain,
+        "--key",
+        &key.to_string_lossy(),
+        "--principal",
+        "alice@laptop",
+    ]);
+
+    nostoi(&["append", &chain, "--kind", "second"]);
+    let verify = nostoi(&["verify", &chain]);
+    let said = String::from_utf8_lossy(&verify.stdout);
+    assert!(said.contains("stale"), "{said}");
+    assert!(said.contains("the chain is at 2"), "{said}");
+}
+
 #[test]
 fn schema_is_read_only_and_reports_persisted_identity() {
     let dir = tempfile::tempdir().unwrap();

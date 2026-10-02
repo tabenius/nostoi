@@ -106,3 +106,10 @@ impl From<nostoi_anchor::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+pub(crate) fn io(path: &std::path::Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
+    move |source| Error::Io {
+        path: path.display().to_string(),
+        source,
+    }
+}

@@ -61,7 +61,10 @@ not have to migrate. New code should depend on the compartment it needs.
 Verification is linear and reads the chain into memory. Each file append
 re-verifies history, so repeated single-record appends have quadratic total
 verification cost as a chain grows. Benchmark real workloads before promising
-large-log throughput. There is no external security audit, signed-head protocol,
-PII scanner or crypto-shredding yet. A valid chain does not prove the events are
+large-log throughput. There is no external security audit, PII scanner or
+crypto-shredding yet. Signed attestations exist
+(`docs/ATTESTATIONS.md`) but they carry no independent timestamp: a signature
+proves authorship, not when, so publishing it somewhere append-only remains the
+operator's job. A valid chain does not prove the events are
 true or complete, and tail truncation/full rewriting need an external trusted
 head to detect. Anchor and replicate logs according to the actual threat model.

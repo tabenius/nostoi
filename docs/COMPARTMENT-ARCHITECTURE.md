@@ -61,6 +61,12 @@ writer API. Core never depends on either. The root facade keeps
 `nostoi::anchor`/`nostoi::outbox` paths while the implementation sits
 underneath them.
 
+Attestations do not change the compartments: the document, its canonical bytes
+and its binding to a chain head are portable and live in `nostoi-core` with the
+rest of the format work, while the `ssh-keygen -Y sign` driver sits in the facade
+next to the CLI that uses it. A verifier that only needs to check what a document
+claims needs no SSH tooling at all.
+
 `nostoi::Error` still carries the variant set it always had, and it converts
 from both `nostoi-core` and `nostoi-anchor` errors, so `?` and existing match
 arms keep working. Code that constructs or matches anchor variants directly

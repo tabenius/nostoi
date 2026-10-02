@@ -1,0 +1,67 @@
+#!/bin/sh
+# EnvironmentFile is parsed by systemd; never source it as shell code.
+set +x
+set -eu
+
+fail() { printf '%s\n' "nostoi-anchor-runner: $1" >&2; exit 1; }
+required() {
+    [ -n "$2" ] || fail "$1 is required"
+}
+
+[ "$#" -eq 1 ] || fail 'expected publish or verify'
+mode=$1
+case "$mode" in publish|verify) ;; *) fail 'expected publish or verify' ;; esac
+required CHAIN "${CHAIN:-}"
+required ENDPOINT "${ENDPOINT:-}"
+required BUCKET "${BUCKET:-}"
+required REGION "${REGION:-}"
+required CHAIN_ID "${CHAIN_ID:-}"
+case "$CHAIN" in /*) ;; *) fail 'CHAIN must be absolute' ;; esac
+case "$ENDPOINT" in https://?*) ;; *) fail 'ENDPOINT must use HTTPS' ;; esac
+binary=${NOSTOI_ANCHOR_BIN:-/usr/local/bin/nostoi-anchor}
+case "$binary" in /*) ;; *) fail 'NOSTOI_ANCHOR_BIN must be absolute' ;; esac
+
+set -- "$CHAIN" --endpoint "$ENDPOINT" --bucket "$BUCKET" --region "$REGION" --chain-id "$CHAIN_ID"
+case "$mode" in
+    publish)
+        required OUTBOX "${OUTBOX:-}"
+        case "$OUTBOX" in /*) ;; *) fail 'OUTBOX must be absolute' ;; esac
+        [ -z "${TRUSTED_KEY:-}" ] || fail 'TRUSTED_KEY is only valid for verification'
+        set -- "$@" --outbox "$OUTBOX"
+        case "${LOCK:-}" in
+            '') [ -z "${RETAIN_DAYS:-}" ] || fail 'RETAIN_DAYS requires LOCK' ;;
+            compliance)
+                required RETAIN_DAYS "${RETAIN_DAYS:-}"
+                case "$RETAIN_DAYS" in *[!0-9]*|0*) fail 'RETAIN_DAYS must be a positive decimal without leading zeroes' ;; esac
+                set -- "$@" --lock compliance --retain-days "$RETAIN_DAYS"
+                ;;
+            *) fail 'LOCK must be empty or compliance' ;;
+        esac
+        ;;
+    verify)
+        required TRUSTED_KEY "${TRUSTED_KEY:-}"
+        [ -z "${OUTBOX:-}" ] && [ -z "${LOCK:-}" ] && [ -z "${RETAIN_DAYS:-}" ] || fail 'verification forbids OUTBOX, LOCK and RETAIN_DAYS'
+        set -- "$@" --verify --key "$TRUSTED_KEY"
+        ;;
+esac
+
+# LoadCredential files are exposed only to this service. Export in this process
+# for the child, never in ExecStart arguments or journal output. An empty token
+# file represents credentials that do not use an AWS session token.
+if [ -n "${CREDENTIALS_DIRECTORY:-}" ]; then
+    for name in aws-access-key-id aws-secret-access-key aws-session-token; do
+        [ -r "$CREDENTIALS_DIRECTORY/$name" ] || fail "credential file $name is not readable"
+    done
+    AWS_ACCESS_KEY_ID=$(cat "$CREDENTIALS_DIRECTORY/aws-access-key-id")
+    AWS_SECRET_ACCESS_KEY=$(cat "$CREDENTIALS_DIRECTORY/aws-secret-access-key")
+    AWS_SESSION_TOKEN=$(cat "$CREDENTIALS_DIRECTORY/aws-session-token")
+fi
+required AWS_ACCESS_KEY_ID "${AWS_ACCESS_KEY_ID:-}"
+required AWS_SECRET_ACCESS_KEY "${AWS_SECRET_ACCESS_KEY:-}"
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+if [ -n "${AWS_SESSION_TOKEN:-}" ]; then
+    export AWS_SESSION_TOKEN
+else
+    unset AWS_SESSION_TOKEN
+fi
+exec "$binary" "$@"

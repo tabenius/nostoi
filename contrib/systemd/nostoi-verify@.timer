@@ -1,0 +1,12 @@
+[Unit]
+Description=Independent periodic Nostoi checkpoint verification (%i)
+
+[Timer]
+OnCalendar=*-*-* *:07/15:00
+RandomizedDelaySec=2min
+AccuracySec=30s
+Persistent=true
+Unit=nostoi-verify@%i.service
+
+[Install]
+WantedBy=timers.target

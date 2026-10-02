@@ -197,17 +197,17 @@ fn an_edited_document_is_refused() {
     assert!(error.to_string().contains("does not verify"), "{error}");
 }
 
+#[test]
 fn formatting_cannot_break_an_attestation_but_editing_it_still_can() {
     let fixture = fixture!();
     fixture.sign();
     let sidecars = Sidecars::for_chain(&fixture.chain);
     let parsed: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&sidecars.document).unwrap()).unwrap();
-    let canonical = fixture
-        .sign()
-        .attestation
-        .canonical_bytes()
-        .expect("canonical bytes");
+    // The bytes that are actually on disk, and therefore the ones the signature
+    // covers. Signing again would produce a different timestamp and a different
+    // signature, so this must come from the file rather than from a fresh sign.
+    let canonical = std::fs::read(&sidecars.document).unwrap();
 
     // Pretty-printing changes the bytes on disk and not the content. The
     // signature is checked against the canonical bytes of the parsed content, so
@@ -238,9 +238,9 @@ fn formatting_cannot_break_an_attestation_but_editing_it_still_can() {
     );
 
     // CRLF is formatting too.
-    let crlf = String::from_utf8(canonical.clone())
+    let crlf = String::from_utf8(serde_json::to_vec_pretty(&parsed).unwrap())
         .unwrap()
-        .replace("},{", "},\r\n{");
+        .replace('\n', "\r\n");
     std::fs::write(&sidecars.document, crlf.as_bytes()).unwrap();
     assert_eq!(
         attest::verify(&fixture.chain, &fixture.pinned())

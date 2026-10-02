@@ -8,7 +8,7 @@
 //! and verify the file; only a writer that registers the function can append.
 //! The database runs in WAL mode, so Litestream can stream it off the host.
 
-use crate::chain::{Entry, Problem, GENESIS};
+use crate::chain::{self, Entry, Problem, GENESIS};
 use crate::error::{Error, Result};
 use crate::format::{self, EphorEvent, Format};
 use crate::jsonl::{Draft, Loaded};
@@ -96,40 +96,96 @@ fn has_table(conn: &Connection, name: &str) -> Result<bool> {
 
 /// Read a chain from an SQLite file: the Nostoi store or Ephor's events.
 pub fn load(path: &Path, format: Option<Format>) -> Result<Loaded> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let format = match format {
-        Some(format) => format,
-        None if has_table(&conn, "nostoi_records")? => Format::Nostoi,
-        None if has_table(&conn, "governance_events")? => Format::EphorAudit,
-        None => {
-            return Err(Error::Invalid(
-                "no chain here (neither nostoi_records nor governance_events)".into(),
-            ))
-        }
-    };
+    let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let tx = conn.transaction()?;
+    let format = detect_format(&tx, format)?;
     match format {
-        Format::Nostoi => load_nostoi(&conn),
-        Format::EphorAudit => load_ephor(&conn),
+        Format::Nostoi => load_nostoi(&tx),
+        Format::EphorAudit => load_ephor(&tx),
         Format::WeftmarkLedger => Err(Error::Invalid(
             "weftmark-ledger-v1 chains are JSONL files".into(),
         )),
     }
 }
 
+fn detect_format(conn: &Connection, format: Option<Format>) -> Result<Format> {
+    let format = match format {
+        Some(format) => format,
+        None if has_table(conn, "nostoi_records")? => Format::Nostoi,
+        None if has_table(conn, "governance_events")? => Format::EphorAudit,
+        None => {
+            return Err(Error::Invalid(
+                "no chain here (neither nostoi_records nor governance_events)".into(),
+            ))
+        }
+    };
+    Ok(format)
+}
+
+/// Verify one read-only SQLite snapshot without retaining the chain's rows.
+pub fn verify_streaming(
+    path: &Path,
+    format: Option<Format>,
+    checkpoint_seq: Option<u64>,
+) -> Result<chain::StreamingVerification> {
+    let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let tx = conn.transaction()?;
+    let format = detect_format(&tx, format)?;
+    verify_connection(&tx, format, checkpoint_seq)
+}
+
+fn verify_connection(
+    conn: &Connection,
+    format: Format,
+    checkpoint_seq: Option<u64>,
+) -> Result<chain::StreamingVerification> {
+    let mut verifier = chain::Verifier::new(checkpoint_seq);
+    let unreadable = match format {
+        Format::Nostoi => scan_nostoi(conn, |entry, seq, previous, digest| {
+            verifier.push_columns(&entry, Some((seq, previous, digest)));
+        })?,
+        Format::EphorAudit => scan_ephor(conn, |entry| verifier.push(&entry))?,
+        Format::WeftmarkLedger => {
+            return Err(Error::Invalid(
+                "weftmark-ledger-v1 chains are JSONL files".into(),
+            ))
+        }
+    };
+    Ok(verifier.finish(format.name(), unreadable))
+}
+
 fn load_nostoi(conn: &Connection) -> Result<Loaded> {
-    let mut stmt = conn.prepare("SELECT seq, record FROM nostoi_records ORDER BY seq")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
     let mut entries = Vec::new();
+    let unreadable = scan_nostoi(conn, |entry, _, _, _| entries.push(entry))?;
+    Ok(Loaded {
+        format: Format::Nostoi,
+        entries,
+        unreadable,
+    })
+}
+
+fn scan_nostoi(
+    conn: &Connection,
+    mut visit: impl FnMut(Entry, i64, &str, &str),
+) -> Result<Option<Problem>> {
+    let mut stmt =
+        conn.prepare("SELECT seq, record, previous, digest FROM nostoi_records ORDER BY seq")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
     let mut unreadable = None;
     for row in rows {
-        let (seq, text) = row?;
+        let (seq, text, previous, digest) = row?;
         let parsed = serde_json::from_str::<Value>(&text)
             .map_err(|e| e.to_string())
             .and_then(format::nostoi_entry);
         match parsed {
-            Ok(entry) => entries.push(entry),
+            Ok(entry) => visit(entry, seq, &previous, &digest),
             Err(detail) => {
                 unreadable = Some(Problem::Unreadable {
                     at: seq as u64,
@@ -139,48 +195,18 @@ fn load_nostoi(conn: &Connection) -> Result<Loaded> {
             }
         }
     }
-    Ok(Loaded {
-        format: Format::Nostoi,
-        entries,
-        unreadable,
-    })
+    Ok(unreadable)
 }
 
 /// Verify every record in one SQLite snapshot, retaining only the current row.
 fn verified_head(conn: &Connection) -> Result<(u64, String)> {
-    let mut stmt =
-        conn.prepare("SELECT seq, previous, digest, record FROM nostoi_records ORDER BY seq")?;
-    let mut rows = stmt.query([])?;
-    let mut head = (0u64, GENESIS.to_string());
-    while let Some(row) = rows.next()? {
-        let seq: i64 = row.get(0)?;
-        let previous: String = row.get(1)?;
-        let digest: String = row.get(2)?;
-        let text: String = row.get(3)?;
-        let entry = serde_json::from_str::<Value>(&text)
-            .map_err(|e| e.to_string())
-            .and_then(format::nostoi_entry)
-            .map_err(|detail| {
-                Error::Broken(Problem::Unreadable {
-                    at: head.0 + 1,
-                    detail,
-                })
-            })?;
-        if seq < 1 || seq as u64 != head.0 + 1 || entry.seq != seq as u64 {
-            return Err(Error::Broken(Problem::Sequence {
-                seq: entry.seq,
-                expected: head.0 + 1,
-            }));
-        }
-        if previous != head.1 || entry.previous != previous {
-            return Err(Error::Broken(Problem::Link { seq: entry.seq }));
-        }
-        if entry.digest != digest || entry.computed != digest {
-            return Err(Error::Broken(Problem::Digest { seq: entry.seq }));
-        }
-        head = (entry.seq, digest);
+    let report = verify_connection(conn, Format::Nostoi, None)?.report;
+    if let Some(problem) = report.problem {
+        return Err(Error::Broken(problem));
     }
-    Ok(head)
+    Ok(report
+        .head
+        .map_or_else(|| (0, GENESIS.to_string()), |h| (h.seq, h.digest)))
 }
 
 fn strings(text: &str) -> std::result::Result<Vec<String>, String> {
@@ -188,13 +214,22 @@ fn strings(text: &str) -> std::result::Result<Vec<String>, String> {
 }
 
 fn load_ephor(conn: &Connection) -> Result<Loaded> {
+    let mut entries = Vec::new();
+    let unreadable = scan_ephor(conn, |entry| entries.push(entry))?;
+    Ok(Loaded {
+        format: Format::EphorAudit,
+        entries,
+        unreadable,
+    })
+}
+
+fn scan_ephor(conn: &Connection, mut visit: impl FnMut(Entry)) -> Result<Option<Problem>> {
     let mut stmt = conn.prepare(
         "SELECT chain_sequence, id, node_id, aggregate_id, agent_class, action, arguments,
                 outcome, occurred_at_ms, caller_stack, previous_hash, signature
            FROM governance_events ORDER BY chain_sequence",
     )?;
     let mut rows = stmt.query([])?;
-    let mut entries = Vec::new();
     let mut unreadable = None;
     while let Some(row) = rows.next()? {
         let seq: i64 = row.get(0)?;
@@ -216,7 +251,7 @@ fn load_ephor(conn: &Connection) -> Result<Loaded> {
             })
         })();
         match event {
-            Ok(event) => entries.push(event.entry()),
+            Ok(event) => visit(event.entry()),
             Err(detail) => {
                 unreadable = Some(Problem::Unreadable {
                     at: seq as u64,
@@ -226,11 +261,7 @@ fn load_ephor(conn: &Connection) -> Result<Loaded> {
             }
         }
     }
-    Ok(Loaded {
-        format: Format::EphorAudit,
-        entries,
-        unreadable,
-    })
+    Ok(unreadable)
 }
 
 /// Nostoi's append-only SQLite store.
@@ -370,6 +401,30 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streaming_snapshot_excludes_a_concurrent_wal_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.sqlite");
+        let mut writer = super::Store::open_verified(&path).unwrap();
+        writer.append(draft("one")).unwrap();
+        let mut reader =
+            super::Connection::open_with_flags(&path, super::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let tx = reader.transaction().unwrap();
+        // Format detection is the first read and pins the same snapshot that
+        // verification uses, even when a WAL writer commits before the scan.
+        let format = super::detect_format(&tx, None).unwrap();
+        writer.append(draft("two")).unwrap();
+        let result = super::verify_connection(&tx, format, Some(2)).unwrap();
+        assert!(result.report.ok);
+        assert_eq!(result.report.records, 1);
+        assert!(result.checkpoint.is_none());
+        drop(tx);
+        let result = super::verify_streaming(&path, None, Some(2)).unwrap();
+        assert!(result.report.ok);
+        assert_eq!(result.report.records, 2);
+        assert_eq!(result.checkpoint, result.report.head);
+    }
     #[test]
     fn verified_writers_adopt_a_concurrent_head() {
         let dir = tempfile::tempdir().unwrap();

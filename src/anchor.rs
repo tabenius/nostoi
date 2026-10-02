@@ -134,8 +134,8 @@ fn verify_checkpoint(
             "remote chain identity or key does not match the expected checkpoint".into(),
         ));
     }
-    let loaded = crate::open(chain_path, None)?;
-    let report = loaded.verify();
+    let verification = crate::verify_streaming(chain_path, None, Some(anchor.seq))?;
+    let report = verification.report;
     if let Some(problem) = report.problem {
         return Err(Error::AnchorMismatch(format!(
             "local chain does not verify: {problem}"
@@ -155,12 +155,10 @@ fn verify_checkpoint(
             local_head.seq, anchor.seq
         )));
     }
-    let entry = loaded
-        .entries
-        .iter()
-        .find(|entry| entry.seq == anchor.seq)
+    let checkpoint = verification
+        .checkpoint
         .ok_or_else(|| Error::AnchorMismatch("trusted checkpoint position is missing".into()))?;
-    if entry.digest != anchor.digest {
+    if checkpoint.digest != anchor.digest {
         return Err(Error::AnchorMismatch(
             "local history differs from the trusted checkpoint (rewrite or wrong chain)".into(),
         ));
@@ -535,6 +533,52 @@ fn generate_key(chain_id: &str, seq: u64, digest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_verification_rejects_broken_prefix_and_suffix() {
+        for broken_seq in [1, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("audit.jsonl");
+            let mut records = Vec::new();
+            let mut previous = crate::GENESIS.to_owned();
+            for seq in 1..=3 {
+                let record = crate::format::nostoi_record(
+                    seq,
+                    &previous,
+                    "2026-01-01T00:00:00Z",
+                    None,
+                    "test",
+                    None,
+                    serde_json::json!({}),
+                )
+                .unwrap();
+                previous = record["digest"].as_str().unwrap().to_owned();
+                records.push(record);
+            }
+            let anchor = Anchor {
+                v: "nostoi-anchor-v1".into(),
+                chain: "trusted".into(),
+                format: "nostoi-v1".into(),
+                seq: 2,
+                digest: records[1]["digest"].as_str().unwrap().into(),
+                anchored_at: "2026-01-01T00:00:00Z".into(),
+                provider: "s3".into(),
+                key: "heads/test".into(),
+                mode: None,
+                retain_until: None,
+            };
+            records[broken_seq - 1]["kind"] = serde_json::json!("tampered");
+            let text: String = records
+                .iter()
+                .map(|r| format!("{}\n", crate::canonical::to_string(r)))
+                .collect();
+            std::fs::write(&path, text).unwrap();
+            let result = verify_checkpoint(&path, anchor, "heads/test", "trusted");
+            assert!(
+                matches!(result, Err(Error::AnchorMismatch(detail)) if detail.contains(&format!("record {broken_seq} was altered")))
+            );
+        }
+    }
 
     #[test]
     fn broken_chain_is_never_anchored() {

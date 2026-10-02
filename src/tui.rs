@@ -9,6 +9,9 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, 
 use ratatui::Frame;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+#[path = "runtime_status.rs"]
+mod runtime_status;
+const RUNTIME_KEY: char = 's';
 
 /// The browser's state, kept apart from the terminal so it can be tested.
 pub struct App {
@@ -31,6 +34,8 @@ pub struct App {
     /// Whether the detail pane is showing a record or the attestation.
     pane: Pane,
     quit: bool,
+    runtime: String,
+    runtime_scroll: u16,
 }
 
 /// What the detail pane is showing.
@@ -38,6 +43,7 @@ pub struct App {
 enum Pane {
     Record,
     Attestation,
+    Runtime,
 }
 
 impl App {
@@ -58,6 +64,8 @@ impl App {
             attestation_document: None,
             pane: Pane::Record,
             quit: false,
+            runtime: String::new(),
+            runtime_scroll: 0,
         };
         app.reload();
         app
@@ -65,6 +73,7 @@ impl App {
 
     /// Re-read and re-verify the chain; keep the selection where it was.
     pub fn reload(&mut self) {
+        self.runtime = runtime_status::read();
         let selected = self.selected().map(|e| e.seq);
         match open(&self.path, self.format) {
             Ok(loaded) => {
@@ -197,7 +206,30 @@ impl App {
             }
             return;
         }
+        if self.pane == Pane::Runtime {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.runtime_scroll = self.runtime_scroll.saturating_add(1);
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.runtime_scroll = self.runtime_scroll.saturating_sub(1);
+                    return;
+                }
+                _ => {}
+            }
+        }
         match key.code {
+            KeyCode::Char(c) if c == RUNTIME_KEY => {
+                self.pane = if self.pane == Pane::Runtime {
+                    Pane::Record
+                } else {
+                    Pane::Runtime
+                };
+                self.runtime = runtime_status::read();
+                self.runtime_scroll = 0;
+                self.detail = true;
+            }
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
             KeyCode::Down | KeyCode::Char('j') => self.step(1),
@@ -378,6 +410,20 @@ impl App {
     }
 
     fn draw_detail(&self, frame: &mut Frame, area: Rect) {
+        if self.pane == Pane::Runtime {
+            frame.render_widget(
+                Paragraph::new(self.runtime.as_str())
+                    .wrap(Wrap { trim: false })
+                    .scroll((self.runtime_scroll, 0))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Runtime / URLs / human workflows "),
+                    ),
+                area,
+            );
+            return;
+        }
         if self.pane == Pane::Attestation {
             let (title, body) = match &self.attestation_document {
                 Some(read) => (
@@ -433,8 +479,11 @@ impl App {
 
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
         let help = " ↑↓/jk move · g/G ends · b break · / filter · f follow · r reload · \
-                    a attestation · ⏎ detail · q quit";
-        frame.render_widget(Paragraph::new(help).fg(Color::DarkGray), area);
+                     a attestation · ⏎ detail · q quit";
+        frame.render_widget(
+            Paragraph::new(format!("{help}  {RUNTIME_KEY} runtime")).fg(Color::DarkGray),
+            area,
+        );
     }
 }
 

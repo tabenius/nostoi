@@ -1,0 +1,21 @@
+{
+  "schema": "ragbaz.health-contract.v1",
+  "component": "nostoi",
+  "methods": [
+    {
+      "id": "cli-availability",
+      "transport": "argv",
+      "argv": ["nostoi", "--version"],
+      "expected_exit": 0,
+      "timeout_seconds": 2,
+      "meaning": "Executable responds. Nostoi is a CLI/library, not necessarily a running daemon."
+    },
+    {
+      "id": "chain-integrity",
+      "transport": "argv",
+      "argv": ["nostoi", "verify", "CHAIN", "--json"],
+      "requires": ["operator-selected chain and format"],
+      "meaning": "Check report ok and exit code. Broken chain is an integrity failure, not binary absence; sidecars remain signature-unchecked here."
+    }
+  ]
+}

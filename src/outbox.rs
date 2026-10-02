@@ -94,11 +94,11 @@ impl Outbox {
     /// Credentials are supplied fresh by the caller; target changes are rejected.
     pub fn reconcile(&mut self, client: &Client) -> Result<()> {
         self.bind_target(client)?;
-        let requests: Vec<String> = self.conn.prepare(
-            "SELECT request FROM anchor_intents JOIN anchor_outcomes USING(key) WHERE state IN ('pending','unresolved') ORDER BY key"
-        )?.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
-        for request in requests {
-            let prepared = decode(&request)?;
+        let requests: Vec<(String, String)> = self.conn.prepare(
+            "SELECT key, request FROM anchor_intents JOIN anchor_outcomes USING(key) WHERE state IN ('pending','unresolved') ORDER BY key"
+        )?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+        for (key, request) in requests {
+            let prepared = decode(&key, &request)?;
             self.publish(client, &prepared)?;
         }
         Ok(())
@@ -140,7 +140,7 @@ impl Outbox {
             )
             .optional()?;
         let prepared = if let Some(request) = existing {
-            let old = decode(&request)?;
+            let old = decode(&prepared.anchor.key, &request)?;
             if old.anchor.chain != prepared.anchor.chain
                 || old.anchor.format != prepared.anchor.format
                 || old.anchor.seq != prepared.anchor.seq
@@ -173,6 +173,7 @@ impl Outbox {
     }
 
     fn publish(&mut self, client: &Client, prepared: &PreparedAnchor) -> Result<Anchor> {
+        prepared.validate(true)?;
         let result = publish_prepared(client, prepared, true);
         let state = match &result {
             Ok(_) => "confirmed",
@@ -196,9 +197,16 @@ impl Outbox {
     }
 }
 
-fn decode(request: &str) -> Result<PreparedAnchor> {
-    serde_json::from_str(request)
-        .map_err(|e| Error::Invalid(format!("invalid durable intent: {e}")))
+fn decode(key: &str, request: &str) -> Result<PreparedAnchor> {
+    let prepared: PreparedAnchor = serde_json::from_str(request)
+        .map_err(|e| Error::Invalid(format!("invalid durable intent: {e}")))?;
+    prepared.validate(true)?;
+    if prepared.anchor.key != key {
+        return Err(Error::Invalid(
+            "durable intent key differs from its database key".into(),
+        ));
+    }
+    Ok(prepared)
 }
 
 fn same_file(a: &Path, b: &Path) -> Result<bool> {

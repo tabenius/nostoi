@@ -37,6 +37,16 @@ the checkpoint contents and target configuration. SQL triggers prevent normal
 updates/deletes of intents, but are not protection against someone who controls
 the database file.
 
+Deserialized requests are checked before network I/O. The schema, checkpoint
+digest, key, chain identity, provider, lock mode, timestamp, duration and deadline
+must be internally consistent. The persisted payload must equal the exact
+pretty-serialized checkpoint metadata; its original bytes are then sent without
+reconstruction. Outbox requests must remain conditional, and the checkpoint key
+must match the database row key. An inconsistent request fails closed with an
+invalid-intent error and is left available for investigation. These checks do
+not authenticate the database or defeat a malicious complete rewrite of its
+consistent contents.
+
 The outbox is independent of ordinary audit appends: appending records does not
 upload or wait for S3, and an anchor failure does not roll back audit records.
 The outbox must be separate from the source audit database. Opening the same
@@ -53,8 +63,8 @@ its intents to another configured target is rejected.
 | --- | --- | --- |
 | `pending` | Intent committed, no durable result yet | Retry original request |
 | `unresolved` | Upload uncertain, or object identity/retention unconfirmed | Retry and reconcile original request |
-| `rejected` | Definitive upload rejection or invalid request | Current matching head can retry; historical rejected heads require operator review |
-| `confirmed` | Upload/existing bytes and requested Object Lock retention checked, result committed | Matching current head is checked again with the original request |
+| `rejected` | Definitive upload rejection, invalid request, or expired original lock deadline | Current matching head can retry; an expired intent requires a new key/deadline; historical rejected heads require operator review |
+| `confirmed` | Upload/existing bytes and requested Object Lock retention checked at publication time, result committed | Matching current head is checked again with the original request |
 
 Publishing first reconciles all pending/unresolved intents for the bound target,
 then verifies/prepares the current chain head. Recovery stops on the first
@@ -81,8 +91,23 @@ A repeated unchanged head reuses its original timestamp, bytes and retention
 expiry. It does **not** acquire a later retention expiry simply because a
 scheduled job ran again. Changing the lock mode or retention duration for the
 same immutable key is an explicit conflict. Confirmation concerns the original
-deadline, not a rolling retention period; operators must monitor its expiry.
-A new head gets its own new key and deadline.
+deadline, not a rolling retention period. Before any network operation for a
+prepared S3 Object Lock request, an original deadline at or before the current
+UTC time returns `AnchorExpired` (CLI exit 1). The deadline is checked again
+after successful retention readback so a request that expires during network
+operations cannot be confirmed. Returned actual retention must also still be in
+the future. Ordinary non-outbox publishing of a fresh request against an older
+existing object continues to verify actual retention and returns
+`AnchorUnconfirmed` when that retention is insufficient or expired. An old
+`anchored_at` alone does not expire an unlocked request.
+
+An expired original deadline is refused even if an existing remote object might
+have longer actual retention: recovery does not fetch it to salvage an expired
+request or silently renew it. In the outbox, attempted expiry is persisted as
+`rejected`, including for a previously confirmed matching head. Unselected
+`confirmed` rows are historical receipts, not a live statement that their
+retention remains active; there is no background expiry sweep. A new head gets
+its own new key and deadline.
 
 ## Operator procedure
 
@@ -100,6 +125,13 @@ A new head gets its own new key and deadline.
    original CLI invocation. Do not modify their intents.
 4. If an existing object differs, preserve both copies and investigate. Do not
    delete or overwrite it as part of recovery.
+   For `AnchorExpired`, preserve the old intent and publish the checkpoint under
+   a new explicit immutable `--key`, which prepares a new deadline. The first
+   invocation may reject an expired pending intent during reconciliation; after
+   that rejection is committed, repeat the invocation with the new key. Merely
+   marking the expired intent `pending` will produce `AnchorExpired` again and
+   will not change its bytes or deadline. Changing `--retain-days` under its old
+   key is still a conflict. Never edit the old deadline to simulate renewal.
 5. For an intentional destination migration, finish reconciliation against the
    original target first, retain that outbox, and use a new outbox for the new
    target. This is a separate publication; old intents cannot be redirected.

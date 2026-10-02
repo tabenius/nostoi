@@ -414,3 +414,63 @@ fn cli_rejects_outbox_with_verify_before_reading_credentials() {
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(error.contains("cannot be used with"), "{error}");
 }
+
+#[test]
+fn ordinary_prepared_api_preserves_nonconditional_uploads_and_old_unlocked_timestamps() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("audit.jsonl");
+    append(&source);
+    let mut config = options(false);
+    config.only_if_absent = false;
+    let prepared = nostoi::anchor::prepare_anchor(&source, config, Provider::S3).unwrap();
+    let mut value = serde_json::to_value(prepared).unwrap();
+    value["anchor"]["anchored_at"] = serde_json::json!("2000-01-01T00:00:00Z");
+    let anchor: nostoi::anchor::Anchor = serde_json::from_value(value["anchor"].clone()).unwrap();
+    value["body"] = serde_json::to_value(serde_json::to_vec_pretty(&anchor).unwrap()).unwrap();
+    let prepared = serde_json::from_value(value).unwrap();
+    let (client, handle) = server(1, |_, request| {
+        assert!(request.line.starts_with("PUT "));
+        assert!(!request
+            .headers
+            .to_ascii_lowercase()
+            .contains("if-none-match"));
+        assert!(!request
+            .headers
+            .to_ascii_lowercase()
+            .contains("x-amz-object-lock-mode"));
+        assert!(String::from_utf8(request.body)
+            .unwrap()
+            .contains("2000-01-01T00:00:00Z"));
+        ("200 OK", String::new())
+    });
+    nostoi::anchor::publish_prepared(&client, &prepared, false).unwrap();
+    handle.join().unwrap();
+}
+
+#[test]
+fn fresh_ordinary_request_cannot_confirm_existing_object_with_expired_actual_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("audit.jsonl");
+    append(&source);
+    let mut existing = String::new();
+    let (client, handle) = server(3, move |i, request| match i {
+        0 => {
+            let mut old: nostoi::anchor::Anchor = serde_json::from_slice(&request.body).unwrap();
+            old.anchored_at = "2000-01-01T00:00:00Z".into();
+            old.retain_until = Some("2000-01-31T00:00:00Z".into());
+            existing = serde_json::to_string_pretty(&old).unwrap();
+            ("412 Precondition Failed", String::new())
+        }
+        1 => ("200 OK", existing.clone()),
+        2 => {
+            assert!(request.line.contains("?retention"));
+            ("200 OK", "<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>2000-01-31T00:00:00Z</RetainUntilDate></Retention>".into())
+        }
+        _ => unreachable!(),
+    });
+    assert!(matches!(
+        nostoi::anchor::anchor_head(&source, &client, options(true), Provider::S3),
+        Err(Error::AnchorUnconfirmed { .. })
+    ));
+    handle.join().unwrap();
+}

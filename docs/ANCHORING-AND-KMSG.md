@@ -5,11 +5,15 @@
 On Linux:
 
 ```sh
-cargo build --release --features s3,kmsg --bins
+cargo build --release -p nostoi-anchor --features cli,sqlite
+cargo build --release -p nostoi-kmsg --features cli,sqlite
 ```
 
-`nostoi-anchor` needs the `s3` and `cli` features. Reading SQLite additionally
-needs `sqlite` (enabled by default). `kmsg-nostoi` needs `kmsg`, `sqlite` and `cli`.
+Each binary belongs to its own crate. `nostoi-anchor` needs `cli`; reading the
+chain or an outbox from SQLite additionally needs `sqlite` (enabled by
+default). `kmsg-nostoi` needs `cli` and `sqlite`. The `nostoi` CLI, TUI and
+facade stay in the root package and keep their `s3`, `kmsg` and `tui`
+features; see `docs/COMPARTMENT-ARCHITECTURE.md`.
 
 ## Publish and confirm a checkpoint
 

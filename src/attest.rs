@@ -28,10 +28,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use nostoi_core::attestation::{self, Attestation, Attested, Sidecars, DEFAULT_NAMESPACE};
+use nostoi_core::attestation::{
+    self, Attestation, Attested, ReadDocument, Sidecars, DEFAULT_NAMESPACE,
+};
 use nostoi_core::time::now as now_rfc3339;
 use nostoi_core::Format;
-use nostoi_core::Result as CoreResult;
 
 use crate::{Error, Result};
 
@@ -109,6 +110,122 @@ impl Verifier {
     }
 }
 
+/// Whether a private key file is encrypted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyEncryption {
+    /// The key can be used without a passphrase.
+    None,
+    /// The key needs a passphrase, an agent, or a hardware token.
+    Encrypted,
+    /// The file was not in a format we recognise, so this says nothing.
+    Unknown,
+}
+
+/// Inspect a private key file rather than discovering its state from ssh-keygen's
+/// stderr.
+///
+/// Two reasons. The specific one: with no terminal, `ssh-keygen -Y sign` reports
+/// "incorrect passphrase supplied to decrypt private key", which sends people
+/// hunting for a typo in a passphrase that was never wrong. The structural one:
+/// the file says what it is, so there is no reason to run a command to find out
+/// and then interpret its prose.
+pub fn key_encryption(key: &Path) -> KeyEncryption {
+    let Ok(text) = std::fs::read_to_string(key) else {
+        return KeyEncryption::Unknown;
+    };
+    if text.contains("Proc-Type: 4,ENCRYPTED") || text.contains("DEK-Info:") {
+        return KeyEncryption::Encrypted;
+    }
+    // The OpenSSH format base64-encodes "openssh-key-v1\0" then a cipher name.
+    if !text.contains("OPENSSH PRIVATE KEY") {
+        return KeyEncryption::Unknown;
+    }
+    let encoded: String = text
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let Some(blob) = base64_decode(&encoded) else {
+        return KeyEncryption::Unknown;
+    };
+    let magic = b"openssh-key-v1\0";
+    if !blob.starts_with(magic) {
+        return KeyEncryption::Unknown;
+    }
+    // A length-prefixed string follows the magic: 4 bytes of length, then the name.
+    let start = magic.len();
+    if blob.len() < start + 4 {
+        return KeyEncryption::Unknown;
+    }
+    let length = u32::from_be_bytes([
+        blob[start],
+        blob[start + 1],
+        blob[start + 2],
+        blob[start + 3],
+    ]) as usize;
+    let name_start = start + 4;
+    let name_end = name_start + length;
+    if blob.len() < name_end {
+        return KeyEncryption::Unknown;
+    }
+    match &blob[name_start..name_end] {
+        b"none" => KeyEncryption::None,
+        _ => KeyEncryption::Encrypted,
+    }
+}
+
+/// Refuse early, and say what is actually needed.
+///
+/// `is_terminal` on stdin is the honest test: `ssh-keygen` prompts on the
+/// terminal, so without one an encrypted key cannot be used and there is no point
+/// spawning it just to read the complaint.
+fn require_unlocked(key: &Path) -> Result<()> {
+    if key_encryption(key) != KeyEncryption::Encrypted {
+        return Ok(());
+    }
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "{} is passphrase-protected and there is no terminal to type it into, so \
+         ssh-keygen cannot use it. Attesting is a human step by design: run this from a \
+         terminal, load the key into ssh-agent first, or use a key without a passphrase.",
+        key.display()
+    )))
+}
+
+/// Decode standard base64, for reading the OpenSSH key header.
+///
+/// Hand-rolled because the facade deliberately has no base64 dependency: the one
+/// thing it decodes is a key file the operator already has on disk.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut buffer: u32 = 0;
+    let mut bits = 0;
+    for byte in text.bytes() {
+        if byte == b'=' || byte.is_ascii_whitespace() {
+            continue;
+        }
+        buffer = (buffer << 6) | value(byte)? as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// The signing key's fingerprint, as `ssh-keygen` reports it.
 pub fn fingerprint(program: &Path, key: &Path) -> Result<String> {
     let output = run(program, &["-lf", &key.to_string_lossy()])?;
@@ -117,15 +234,35 @@ pub fn fingerprint(program: &Path, key: &Path) -> Result<String> {
 }
 
 /// The `allowed_signers` line this key needs.
+///
+/// Prefers the `.pub` file ssh-keygen writes next to the private key, because
+/// `ssh-keygen -y -f` on an encrypted key asks for the passphrase a second time.
+/// One prompt for one signature.
 pub fn allowed_signers_line(program: &Path, key: &Path, principal: &str) -> Result<String> {
-    let output = run(program, &["-y", "-f", &key.to_string_lossy()])?;
-    let public = output.stdout.trim();
-    if !public.starts_with("ssh-") && !public.starts_with("ecdsa-") && !public.starts_with("sk-") {
+    let public = public_key(program, key)?;
+    Ok(format!("{principal} {public}"))
+}
+
+/// The public half of a key, from `<key>.pub` when it exists.
+fn public_key(program: &Path, key: &Path) -> Result<String> {
+    let mut sidecar = key.as_os_str().to_os_string();
+    sidecar.push(".pub");
+    let sidecar = std::path::PathBuf::from(sidecar);
+    let text = match std::fs::read_to_string(&sidecar) {
+        Ok(text) => text,
+        Err(_) => run(program, &["-y", "-f", &key.to_string_lossy()])?.stdout,
+    };
+    let public = text.trim();
+    if !(public.starts_with("ssh-")
+        || public.starts_with("ecdsa-")
+        || public.starts_with("sk-")
+        || public.starts_with("cert-v01@openssh.com"))
+    {
         return Err(Error::Invalid(format!(
             "{key:?} did not yield a public key"
         )));
     }
-    Ok(format!("{principal} {public}"))
+    Ok(public.to_string())
 }
 
 /// Build an attestation for the chain's current head and sign it.
@@ -140,6 +277,7 @@ pub fn sign(
     anchor_key: Option<String>,
 ) -> Result<Signed> {
     let (head, detected_format) = head_of(chain, format)?;
+    require_unlocked(&signer.key)?;
     let fingerprint = fingerprint(&signer.program, &signer.key)?;
     let now = now_rfc3339();
     let identity = if chain_id.is_empty() {
@@ -161,7 +299,7 @@ pub fn sign(
     let allowed_signers_line =
         allowed_signers_line(&signer.program, &signer.key, &signer.principal)?;
     let sidecars = Sidecars::for_chain(chain);
-    let replaced = read_document(&sidecars.document).ok().flatten();
+    let replaced = load_if_present(&sidecars.document);
     Ok(Signed {
         attestation,
         document,
@@ -195,17 +333,19 @@ fn head_of(chain: &Path, format: Option<Format>) -> Result<(nostoi_core::Head, S
 }
 
 /// Read the attestation sidecars for a chain, without checking any signature.
-pub fn read(chain: &Path) -> Result<Option<(Attestation, Vec<u8>)>> {
+///
+/// The document comes back with its canonical form and whether the file already
+/// matched it, so no caller has to recompute canonicalization just to describe it.
+pub fn read(chain: &Path) -> Result<Option<ReadDocument>> {
     let sidecars = Sidecars::for_chain(chain);
     if let Some(missing) = sidecars.missing_description() {
         return Err(Error::Invalid(format!(
             "this chain has no attestation ({missing})"
         )));
     }
-    let attestation = Attestation::load(&sidecars.document).map_err(Error::from)?;
-    let document =
-        std::fs::read(&sidecars.document).map_err(crate::error::io(&sidecars.document))?;
-    Ok(Some((attestation, document)))
+    attestation::read_document(&sidecars.document)
+        .map(Some)
+        .map_err(Error::from)
 }
 
 /// A short description of a chain's attestation, for the read-only commands.
@@ -216,7 +356,7 @@ pub fn read(chain: &Path) -> Result<Option<(Attestation, Vec<u8>)>> {
 /// whether it still covers the head, but not that it is genuine. See
 /// [`verify`] for that.
 pub fn summary(chain: &Path, head_seq: u64) -> String {
-    let Some((attestation, _)) = present(chain) else {
+    let Some(read) = present(chain) else {
         let sidecars = Sidecars::for_chain(chain);
         return match sidecars.missing_description() {
             Some(missing) => format!(
@@ -226,6 +366,7 @@ pub fn summary(chain: &Path, head_seq: u64) -> String {
             None => format!("no readable attestation beside {}", chain.display()),
         };
     };
+    let attestation = read.attestation;
     let short = attestation
         .fingerprint
         .split_once(':')
@@ -262,22 +403,33 @@ pub fn summary(chain: &Path, head_seq: u64) -> String {
 /// attestation, and it must never fail because one is missing or malformed.
 /// Nothing here checks the signature, so nothing here may claim an attestation is
 /// good; `nostoi verify-attestation` is the command that does that.
-pub fn present(chain: &Path) -> Option<(Attestation, Vec<u8>)> {
-    let (attestation, document) = read(chain).ok()??;
-    Some((attestation, document))
+pub fn present(chain: &Path) -> Option<ReadDocument> {
+    read(chain).ok().flatten()
 }
 
-fn read_document(path: &Path) -> CoreResult<Option<Attestation>> {
+/// The document already at this path, if there is a readable one.
+fn load_if_present(path: &Path) -> Option<Attestation> {
     if !path.is_file() {
-        return Ok(None);
+        return None;
     }
-    Attestation::load(path).map(Some)
+    attestation::read_document(path)
+        .ok()
+        .map(|read| read.attestation)
 }
 
 /// Verify the chain's attestation, failing closed at every step.
+///
+/// The signature is checked against the canonical bytes of the *parsed content*,
+/// never against the bytes that happened to be on disk. That is the whole reason
+/// formatting cannot matter: an indented file says the same thing, canonicalizes
+/// to the same bytes and carries the same signature, while any change to a value
+/// changes those bytes and fails. Formatting is reported, never fatal.
 pub fn verify(chain: &Path, verifier: &Verifier) -> Result<Attested> {
     let sidecars = Sidecars::for_chain(chain);
-    let (attestation, document) = read(chain)?.expect("read checked for the sidecars");
+    let read = read(chain)?.expect("read checked for the sidecars");
+    let attestation = read.attestation;
+    let canonicality = read.document.canonicality;
+    let canonical = read.document.canonical;
     let signature =
         std::fs::read(&sidecars.signature).map_err(crate::error::io(&sidecars.signature))?;
     if signature.is_empty() {
@@ -287,22 +439,13 @@ pub fn verify(chain: &Path, verifier: &Verifier) -> Result<Attested> {
         )));
     }
 
-    // The signature covers exactly these bytes, so they must be the document.
-    if document != attestation.canonical_bytes()? {
-        return Err(Error::Invalid(format!(
-            "{} is not the canonical form of the attestation it contains; \
-             re-sign it rather than editing it",
-            sidecars.document.display()
-        )));
-    }
-
     let reported = verify_bytes(
         &verifier.program,
         &verifier.allowed_signers,
         &verifier.principal,
         &verifier.namespace,
         &signature,
-        &document,
+        canonical.as_bytes(),
     )?;
 
     if reported != attestation.fingerprint {
@@ -318,7 +461,25 @@ pub fn verify(chain: &Path, verifier: &Verifier) -> Result<Attested> {
             )));
         }
     }
-    attestation::check(chain, &attestation, None).map_err(Error::from)
+    let mut checked = attestation::check(chain, &attestation, None).map_err(Error::from)?;
+    checked.canonicality = canonicality;
+    Ok(checked)
+}
+
+/// Rewrite the document in canonical form.
+///
+/// Only ever called after the signature has been checked against the canonical
+/// bytes, which is what makes this lossless: the bytes being replaced are the
+/// bytes the signature already covers.
+pub fn canonicalize(chain: &Path) -> Result<bool> {
+    let sidecars = Sidecars::for_chain(chain);
+    let read = read(chain)?.expect("read checked for the sidecars");
+    if read.document.canonicality.is_canonical() {
+        return Ok(false);
+    }
+    std::fs::write(&sidecars.document, &read.document.canonical)
+        .map_err(crate::error::io(&sidecars.document))?;
+    Ok(true)
 }
 
 /// Sign bytes with `ssh-keygen -Y sign`.
@@ -444,6 +605,9 @@ fn verification_failure(
 /// A passphrase-protected key with no terminal is reported as a wrong passphrase.
 fn explain_signing_failure(error: Error, key: &Path) -> Error {
     let detail = error.to_string();
+    // require_unlocked catches the predictable case. This catches the rest: an
+    // agent or a hardware token that still needs confirmation, or a key file we
+    // could not classify.
     let needs_terminal = detail.contains("incorrect passphrase")
         || detail.contains("ssh_askpass")
         || detail.contains("/dev/tty");

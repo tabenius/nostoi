@@ -368,12 +368,12 @@ impl App {
     fn draw_detail(&self, frame: &mut Frame, area: Rect) {
         if self.pane == Pane::Attestation {
             let (title, body) = match crate::attest::present(&self.path) {
-                Some((attestation, _)) => (
+                Some(read) => (
                     format!(
                         " attestation seq={} · signature NOT checked here ",
-                        attestation.seq
+                        read.attestation.seq
                     ),
-                    serde_json::to_string_pretty(&attestation).unwrap_or_default(),
+                    serde_json::to_string_pretty(&read.attestation).unwrap_or_default(),
                 ),
                 None => (
                     " attestation ".into(),

@@ -161,6 +161,10 @@ enum Command {
         /// ssh-keygen to use
         #[arg(long, default_value = nostoi::attest::DEFAULT_PROGRAM)]
         program: PathBuf,
+        /// Rewrite the document in canonical form, once the signature has been
+        /// checked against it. Only ever touches formatting.
+        #[arg(long)]
+        canonicalize: bool,
         #[arg(long)]
         json: bool,
     },
@@ -389,15 +393,19 @@ fn run(command: Command) -> Result<ExitCode, String> {
             fingerprint,
             namespace,
             program,
+            canonicalize,
             json,
         } => verify_attestation(
             &path,
-            &allowed_signers,
-            &principal,
-            fingerprint.as_deref(),
-            &namespace,
-            &program,
-            json,
+            VerifyOptions {
+                allowed_signers: &allowed_signers,
+                principal: &principal,
+                fingerprint: fingerprint.as_deref(),
+                namespace: &namespace,
+                program: &program,
+                canonicalize,
+                json,
+            },
         ),
         Command::Formats => {
             for format in Format::ALL {
@@ -493,7 +501,8 @@ fn exit(failed: bool, broken: bool) -> ExitCode {
 /// establish that a signature is good.
 fn attestation_json(path: &Path, report: &Report) -> Value {
     match nostoi::attest::present(path) {
-        Some((attestation, _document)) => {
+        Some(read) => {
+            let attestation = read.attestation;
             let head = report.head.as_ref().map(|head| head.seq).unwrap_or(0);
             json!({
                 "present": true,
@@ -508,6 +517,7 @@ fn attestation_json(path: &Path, report: &Report) -> Value {
                 "fingerprint": attestation.fingerprint,
                 "anchor_key": attestation.anchor_key,
                 "covers_head": attestation.seq == head,
+                "canonical_form": read.document.canonicality.is_canonical(),
             })
         }
         None => json!({
@@ -618,16 +628,29 @@ fn attest(
     Ok(ExitCode::SUCCESS)
 }
 
-/// `nostoi verify-attestation`: signature, pinned key and chain, failing closed.
-fn verify_attestation(
-    path: &Path,
-    allowed_signers: &Path,
-    principal: &str,
-    fingerprint: Option<&str>,
-    namespace: &str,
-    program: &Path,
+/// The options `verify-attestation` takes, gathered so the call site reads as
+/// named arguments rather than eight positional ones.
+struct VerifyOptions<'a> {
+    allowed_signers: &'a Path,
+    principal: &'a str,
+    fingerprint: Option<&'a str>,
+    namespace: &'a str,
+    program: &'a Path,
+    canonicalize: bool,
     json: bool,
-) -> Result<ExitCode, String> {
+}
+
+/// `nostoi verify-attestation`: signature, pinned key and chain, failing closed.
+fn verify_attestation(path: &Path, options: VerifyOptions) -> Result<ExitCode, String> {
+    let VerifyOptions {
+        allowed_signers,
+        principal,
+        fingerprint,
+        namespace,
+        program,
+        canonicalize,
+        json,
+    } = options;
     let mut verifier = nostoi::attest::Verifier::new(allowed_signers, principal);
     verifier.namespace = namespace.to_string();
     verifier.program = program.to_path_buf();
@@ -635,6 +658,17 @@ fn verify_attestation(
 
     match nostoi::attest::verify(path, &verifier) {
         Ok(checked) => {
+            // Repair once, before printing, so a write never hides inside a
+            // serialization and the report describes what it just did.
+            let repaired = match canonicalize && !checked.canonicality.is_canonical() {
+                true => Some(nostoi::attest::canonicalize(path).map_err(|e| e.to_string())?),
+                false => None,
+            };
+            let signed_bytes = checked
+                .attestation
+                .canonical_bytes()
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok());
             if json {
                 println!(
                     "{}",
@@ -656,6 +690,9 @@ fn verify_attestation(
                         "digest": checked.attestation.digest,
                         "head": checked.head,
                         "anchor_key": checked.attestation.anchor_key,
+                        "canonical_form": checked.canonicality.is_canonical(),
+                        "canonicalized": repaired,
+                        "signed_bytes": signed_bytes,
                     })
                 );
             } else {
@@ -681,6 +718,30 @@ fn verify_attestation(
                 }
                 if let Some(key) = &checked.attestation.anchor_key {
                     println!("  also anchored at {key}");
+                }
+                // Formatting is never a security failure, so it is a note rather
+                // than an error, and repairable.
+                if !checked.canonicality.is_canonical() {
+                    println!(
+                        "  note: the document is formatted, not canonical; the signature \
+                         covers the same content either way"
+                    );
+                    match repaired {
+                        Some(true) => {
+                            println!("  rewrote it in canonical form; the signature still applies")
+                        }
+                        Some(false) => println!("  already canonical"),
+                        None => println!(
+                            "  fix with: nostoi verify-attestation {} --canonicalize",
+                            path.display()
+                        ),
+                    }
+                }
+                // Print what was actually verified, so it can be diffed against
+                // what the operator believes they signed.
+                match &signed_bytes {
+                    Some(bytes) => println!("\n  signed bytes:\n{bytes}"),
+                    None => println!("\n  signed bytes: <could not be recomputed>"),
                 }
             }
             // A stale attestation is a pass with a caveat, not a failure.

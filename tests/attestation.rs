@@ -6,7 +6,7 @@
 //! failing mysteriously.
 
 use nostoi::attest::{self, Signer, Verifier};
-use nostoi::attestation::{self, Coverage, Sidecars};
+use nostoi::attestation::{self, Canonicality, Coverage, Sidecars};
 use nostoi::Draft;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -197,24 +197,73 @@ fn an_edited_document_is_refused() {
     assert!(error.to_string().contains("does not verify"), "{error}");
 }
 
-#[test]
-fn a_document_that_is_not_canonical_is_refused_before_the_signature() {
+fn formatting_cannot_break_an_attestation_but_editing_it_still_can() {
     let fixture = fixture!();
     fixture.sign();
     let sidecars = Sidecars::for_chain(&fixture.chain);
-
-    // Pretty-printing does not change what the document says, but it does change
-    // the bytes the signature covers, so it must not be silently accepted.
     let parsed: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&sidecars.document).unwrap()).unwrap();
+    let canonical = fixture
+        .sign()
+        .attestation
+        .canonical_bytes()
+        .expect("canonical bytes");
+
+    // Pretty-printing changes the bytes on disk and not the content. The
+    // signature is checked against the canonical bytes of the parsed content, so
+    // it still applies, and the difference is reported rather than fatal.
     std::fs::write(
         &sidecars.document,
         serde_json::to_vec_pretty(&parsed).unwrap(),
     )
     .unwrap();
 
+    let checked = attest::verify(&fixture.chain, &fixture.pinned()).unwrap();
+    assert_eq!(checked.canonicality, Canonicality::Reformatted);
+    assert!(checked.coverage.is_current());
+    assert_eq!(checked.attestation.canonical_bytes().unwrap(), canonical);
+
+    // Repairing touches formatting only, and the signature still applies.
+    assert!(attest::canonicalize(&fixture.chain).unwrap(), "repaired");
+    assert_eq!(std::fs::read(&sidecars.document).unwrap(), canonical);
+    assert!(
+        !attest::canonicalize(&fixture.chain).unwrap(),
+        "already canonical"
+    );
+    assert_eq!(
+        attest::verify(&fixture.chain, &fixture.pinned())
+            .unwrap()
+            .canonicality,
+        Canonicality::Canonical
+    );
+
+    // CRLF is formatting too.
+    let crlf = String::from_utf8(canonical.clone())
+        .unwrap()
+        .replace("},{", "},\r\n{");
+    std::fs::write(&sidecars.document, crlf.as_bytes()).unwrap();
+    assert_eq!(
+        attest::verify(&fixture.chain, &fixture.pinned())
+            .unwrap()
+            .canonicality,
+        Canonicality::Reformatted
+    );
+    attest::canonicalize(&fixture.chain).unwrap();
+
+    // A changed *value* in a reformatted file is still refused. That is the
+    // property that matters, and the reason content is compared canonically.
+    let mut altered = parsed;
+    altered["seq"] = serde_json::json!(2);
+    std::fs::write(
+        &sidecars.document,
+        serde_json::to_vec_pretty(&altered).unwrap(),
+    )
+    .unwrap();
     let error = attest::verify(&fixture.chain, &fixture.pinned()).unwrap_err();
-    assert!(error.to_string().contains("canonical"), "{error}");
+    assert!(
+        error.to_string().contains("does not verify"),
+        "a reformatted document with a changed value must still fail: {error}"
+    );
 }
 
 #[test]
@@ -312,9 +361,9 @@ fn a_truncated_chain_fails_the_attestation() {
     assert!(attest::verify(&fixture.chain, &fixture.pinned()).is_err());
     // The document itself is still fine, which is the point: only the chain
     // binding can tell that something is missing.
-    let (document, _) = attest::read(&fixture.chain).unwrap().unwrap();
-    assert!(document.validate().is_ok());
-    assert!(attestation::check(&fixture.chain, &document, None).is_err());
+    let read = attest::read(&fixture.chain).unwrap().unwrap();
+    assert!(read.attestation.validate().is_ok());
+    assert!(attestation::check(&fixture.chain, &read.attestation, None).is_err());
 }
 
 #[test]

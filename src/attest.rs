@@ -28,9 +28,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use nostoi_core::attestation::{
-    self, Attestation, Attested, ReadDocument, Sidecars, DEFAULT_NAMESPACE,
-};
+use nostoi_core::attestation::{self, Attestation, Attested, Sidecars, DEFAULT_NAMESPACE};
+
+pub use nostoi_core::attestation::{Canonicality, ReadDocument};
 use nostoi_core::time::now as now_rfc3339;
 use nostoi_core::Format;
 
@@ -356,17 +356,28 @@ pub fn read(chain: &Path) -> Result<Option<ReadDocument>> {
 /// whether it still covers the head, but not that it is genuine. See
 /// [`verify`] for that.
 pub fn summary(chain: &Path, head_seq: u64) -> String {
-    let Some(read) = present(chain) else {
-        let sidecars = Sidecars::for_chain(chain);
-        return match sidecars.missing_description() {
-            Some(missing) => format!(
-                "no attestation ({missing}); sign one with: nostoi attest {} --principal you@host",
-                chain.display()
-            ),
-            None => format!("no readable attestation beside {}", chain.display()),
-        };
-    };
-    let attestation = read.attestation;
+    match present(chain) {
+        Some(read) => describe(&read.attestation, head_seq, chain),
+        None => {
+            let sidecars = Sidecars::for_chain(chain);
+            match sidecars.missing_description() {
+                Some(missing) => format!(
+                    "no attestation ({missing}); sign one with: \
+                     nostoi attest {} --principal you@host",
+                    chain.display()
+                ),
+                None => format!("no readable attestation beside {}", chain.display()),
+            }
+        }
+    }
+}
+
+/// One line about an attestation that has already been read.
+///
+/// Split from [`summary`] so a caller that has the document in hand does not read
+/// it again, which is what the browser does on every reload and must not do on
+/// every frame.
+pub fn describe(attestation: &Attestation, head_seq: u64, chain: &Path) -> String {
     let short = attestation
         .fingerprint
         .split_once(':')

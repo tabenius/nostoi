@@ -77,3 +77,14 @@ jobs:
           for crate in nostoi nostoi-anchor nostoi-kmsg; do
             cargo package --list --locked -p "$crate"
           done
+      - name: No private key is ever packaged
+        run: |
+          # The attestation suite commits a throwaway key so its fingerprint can
+          # be a known answer. Cargo ignores `exclude` when `include` is set, so
+          # this is the check that the narrowing in Cargo.toml keeps holding.
+          for crate in nostoi nostoi-core nostoi-anchor nostoi-kmsg; do
+            if cargo package --list --locked -p "$crate" | grep -q 'id_ed25519'; then
+              echo "::error::$crate would publish the test private key"
+              exit 1
+            fi
+          done

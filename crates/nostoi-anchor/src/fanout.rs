@@ -53,6 +53,14 @@ pub struct Target {
     /// Use path-style addressing; forced on for R2.
     #[serde(default)]
     pub path_style: bool,
+    /// Which locking model this destination offers.
+    ///
+    /// Detected from the endpoint host by default. Set it when detection cannot
+    /// see the truth: a bucket behind a custom domain or a private R2 endpoint
+    /// is served as an ordinary S3 host, and asking for an object lock there
+    /// would send headers the service silently ignores.
+    #[serde(default)]
+    pub provider: Option<Provider>,
     /// `governance` or `compliance`. Omit for providers without object lock
     /// (R2), where retention comes from a bucket lock configured out of band.
     #[serde(default, deserialize_with = "lock_from_config")]
@@ -105,9 +113,11 @@ fn default_retain_days() -> i64 {
 }
 
 impl Target {
-    /// Which locking model this endpoint offers, detected from the host.
+    /// Which locking model this destination offers: the configured one, or the
+    /// one detected from the endpoint host.
     pub fn provider(&self) -> Provider {
-        Provider::detect(&self.endpoint)
+        self.provider
+            .unwrap_or_else(|| Provider::detect(&self.endpoint))
     }
 
     /// The client for this destination.

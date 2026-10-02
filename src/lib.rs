@@ -38,11 +38,18 @@
 //! *Nostoi* (Νόστοι, "homecomings") are the lost epic poems of the Greek heroes'
 //! journeys home: records that should have survived and did not.
 
+#[cfg(feature = "s3")]
+pub mod anchor;
 pub mod canonical;
 pub mod chain;
 mod error;
 pub mod format;
 pub mod jsonl;
+#[cfg(all(feature = "kmsg", target_os = "linux"))]
+pub mod kmsg;
+pub mod portable;
+#[cfg(feature = "s3")]
+pub mod s3;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod time;

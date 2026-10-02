@@ -1,0 +1,22 @@
+package nostoi:audit@0.1.0;
+
+/// JSON text preserves integers larger than JavaScript's safe integer range.
+/// The host owns storage, locking and clocks. No filesystem is exposed.
+interface chains {
+    record draft {
+        at: string,
+        actor: option<string>,
+        kind: string,
+        subject: option<string>,
+        body-json: string,
+    }
+    canonical-json: func(json: string) -> result<string, string>;
+    /// Broken chains return a JSON report with ok=false, not an API error.
+    verify-jsonl: func(jsonl: string, format: option<string>) -> result<string, string>;
+    /// Returns the entire extended chain. Refuses to extend broken chains.
+    append-jsonl: func(jsonl: string, entry: draft) -> result<string, string>;
+}
+
+world audit {
+    export chains;
+}

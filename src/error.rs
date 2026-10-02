@@ -10,6 +10,10 @@ pub enum Error {
     #[cfg(feature = "sqlite")]
     #[error("{0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// An S3/R2 anchor request failed.
+    #[cfg(feature = "s3")]
+    #[error("s3: {0}")]
+    S3(String),
     #[error("{0}")]
     Invalid(String),
     /// Refused to extend a chain that does not verify.

@@ -1,0 +1,715 @@
+//! A small S3 client, enough to anchor a chain head.
+//!
+//! Nostoi deliberately does not take the AWS SDK as a dependency: this crate
+//! keeps its tree small, and the whole surface an anchor needs is one signed
+//! `PutObject` (plus `GetObjectRetention` to confirm the lock). So the request
+//! is built and signed here, using [Signature Version 4][sigv4], and sent with
+//! [`ureq`].
+//!
+//! [sigv4]: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv4.html
+//!
+//! The same code talks to AWS S3 and to Cloudflare R2. The one place they
+//! differ matters for anchoring:
+//!
+//! * **AWS S3 Object Lock** is set per object, with `x-amz-object-lock-mode`
+//!   and `x-amz-object-lock-retain-until-date`. AWS requires a checksum header
+//!   alongside a retention period, so `x-amz-sdk-checksum-algorithm: SHA256`
+//!   and `x-amz-checksum-sha256` are sent with it. In `COMPLIANCE` mode no
+//!   user, not even the account root, can overwrite or delete the object or
+//!   shorten its retention.
+//! * **Cloudflare R2 does not support Object Lock** (the S3 API compatibility
+//!   table marks `x-amz-object-lock-*` unsupported on `PutObject`, and
+//!   `x-amz-bucket-object-lock-enabled: true` is rejected). R2 instead has
+//!   *bucket locks*: prefix rules with an age/date/indefinite condition, set
+//!   through the Cloudflare API, that apply to new and existing objects and
+//!   cannot be overridden by the S3 token.
+//!
+//! So an anchor to R2 stores an immutable, uniquely named object under a
+//! prefix, and the retention is enforced by the bucket lock rule on that
+//! prefix — configured out of band, not by this client. [`Provider`] records
+//! which of the two applies so the caller can fail rather than silently write
+//! unless it is told locking is handled.
+
+use std::time::Duration;
+
+use base64::Engine as _;
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
+use time::format_description::well_known::Rfc3339;
+use time::macros::format_description;
+use time::{OffsetDateTime, UtcOffset};
+
+use crate::error::{Error, Result};
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Which object-locking model the target offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provider {
+    /// AWS S3: per-object Object Lock via `PutObject` headers.
+    S3,
+    /// Cloudflare R2: no object lock; a bucket lock rule on the prefix.
+    R2,
+}
+
+impl Provider {
+    /// Guess from the endpoint host. R2 endpoints are
+    /// `<account>.r2.cloudflarestorage.com`.
+    pub fn detect(endpoint: &str) -> Provider {
+        let host = endpoint
+            .split_once("://")
+            .map_or(endpoint, |(_, rest)| rest)
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("");
+        if host.ends_with(".r2.cloudflarestorage.com") {
+            Provider::R2
+        } else {
+            Provider::S3
+        }
+    }
+}
+
+/// Object Lock retention mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockMode {
+    /// Can be bypassed by a caller with `s3:BypassGovernanceRetention`.
+    Governance,
+    /// Cannot be bypassed by anyone, including the account root.
+    Compliance,
+}
+
+impl LockMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            LockMode::Governance => "GOVERNANCE",
+            LockMode::Compliance => "COMPLIANCE",
+        }
+    }
+}
+
+/// A requested object lock.
+#[derive(Clone, Debug)]
+pub struct ObjectLock {
+    pub mode: LockMode,
+    pub retain_until: OffsetDateTime,
+}
+
+/// An S3 access key and secret, with an optional session token.
+#[derive(Clone)]
+pub struct Credentials {
+    pub access_key: String,
+    pub secret_key: String,
+    pub session_token: Option<String>,
+}
+
+impl Credentials {
+    /// Read the standard AWS environment variables:
+    /// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`.
+    pub fn from_env() -> Result<Self> {
+        let access_key = std::env::var("AWS_ACCESS_KEY_ID")
+            .map_err(|_| Error::S3("AWS_ACCESS_KEY_ID is not set".into()))?;
+        let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+            .map_err(|_| Error::S3("AWS_SECRET_ACCESS_KEY is not set".into()))?;
+        Ok(Self {
+            access_key,
+            secret_key,
+            session_token: std::env::var("AWS_SESSION_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty()),
+        })
+    }
+}
+
+/// A configured S3/R2 client.
+pub struct Client {
+    scheme: String,
+    /// Endpoint authority, host plus `:port` when the URL carries one.
+    host: String,
+    bucket: String,
+    region: String,
+    path_style: bool,
+    credentials: Credentials,
+    agent: ureq::Agent,
+}
+
+/// What to send with a `PutObject`.
+pub struct PutOptions {
+    pub content_type: String,
+    /// Object Lock headers (AWS S3 only; callers must not set these on R2).
+    pub lock: Option<ObjectLock>,
+    /// Refuse to overwrite an existing key with `If-None-Match: *`.
+    pub only_if_absent: bool,
+}
+
+/// The result of a successful `PutObject`.
+pub struct PutResult {
+    pub etag: Option<String>,
+    /// A conditional upload found an existing object; caller must verify it.
+    pub existed: bool,
+}
+
+/// An object's retention, as read back from S3.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Retention {
+    pub mode: String,
+    pub retain_until: String,
+}
+
+impl Client {
+    /// Build a client for `endpoint` (for example
+    /// `https://<account>.r2.cloudflarestorage.com` or
+    /// `https://s3.us-west-2.amazonaws.com`).
+    pub fn new(
+        endpoint: &str,
+        bucket: &str,
+        region: &str,
+        path_style: bool,
+        credentials: Credentials,
+    ) -> Result<Self> {
+        let (scheme, host) = split_endpoint(endpoint)?;
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .build()
+            .new_agent();
+        Ok(Self {
+            scheme,
+            host,
+            bucket: bucket.to_string(),
+            region: region.to_string(),
+            path_style,
+            credentials,
+            agent,
+        })
+    }
+
+    /// Upload `body` to `key`, optionally under an Object Lock.
+    pub fn put_object(&self, key: &str, body: &[u8], options: &PutOptions) -> Result<PutResult> {
+        let mut headers = vec![("content-type".to_string(), options.content_type.clone())];
+        if options.only_if_absent {
+            headers.push(("if-none-match".to_string(), "*".to_string()));
+        }
+        if let Some(lock) = &options.lock {
+            let retain = lock
+                .retain_until
+                .to_offset(UtcOffset::UTC)
+                .format(&Rfc3339)
+                .map_err(|error| Error::S3(format!("retain-until: {error}")))?;
+            // AWS requires a checksum when a retention period is set.
+            let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
+            headers.push((
+                "x-amz-object-lock-mode".to_string(),
+                lock.mode.as_str().to_string(),
+            ));
+            headers.push(("x-amz-object-lock-retain-until-date".to_string(), retain));
+            headers.push((
+                "x-amz-sdk-checksum-algorithm".to_string(),
+                "SHA256".to_string(),
+            ));
+            headers.push(("x-amz-checksum-sha256".to_string(), checksum));
+        }
+        let response = self.send("PUT", key, "", "", headers, body)?;
+        // If-None-Match: * and key exists -> 412 Precondition Failed
+        if options.only_if_absent && response.status == 412 {
+            return Ok(PutResult {
+                etag: None,
+                existed: true,
+            });
+        }
+        if !(200..=299).contains(&response.status) {
+            return Err(Error::S3(format!(
+                "PutObject returned {}: {}",
+                response.status, response.body
+            )));
+        }
+        Ok(PutResult {
+            etag: response.header("etag"),
+            existed: false,
+        })
+    }
+
+    /// Read an anchor object for conditional-upload reconciliation.
+    pub fn get_object(&self, key: &str) -> Result<String> {
+        let response = self.send("GET", key, "", "", vec![], &[])?;
+        if response.status != 200 {
+            return Err(Error::S3(format!("GetObject returned {}", response.status)));
+        }
+        Ok(response.body)
+    }
+
+    /// Read back an object's Object Lock retention, or `None` if the object has
+    /// none or does not exist. AWS S3 only; R2 does not implement this.
+    pub fn get_object_retention(&self, key: &str) -> Result<Option<Retention>> {
+        let response = self.send("GET", key, "retention", "retention=", vec![], &[])?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        if response.status != 200 {
+            return Err(Error::S3(format!(
+                "GetObjectRetention returned {}: {}",
+                response.status, response.body
+            )));
+        }
+        Ok(parse_retention(&response.body))
+    }
+
+    /// Sign and send one request.
+    fn send(
+        &self,
+        method: &str,
+        key: &str,
+        raw_query: &str,
+        canonical_query: &str,
+        mut headers: Vec<(String, String)>,
+        body: &[u8],
+    ) -> Result<Response> {
+        let (url, host, canonical_uri) = self.target(key, raw_query);
+        let payload_hash = sha256_hex(body);
+        let now = OffsetDateTime::now_utc();
+        let amz_date = format_amz_date(&now)?;
+        let date = format_amz_day(&now)?;
+
+        headers.push(("host".to_string(), host.clone()));
+        headers.push(("x-amz-content-sha256".to_string(), payload_hash.clone()));
+        headers.push(("x-amz-date".to_string(), amz_date.clone()));
+        if let Some(token) = &self.credentials.session_token {
+            headers.push(("x-amz-security-token".to_string(), token.clone()));
+        }
+
+        let (authorization, signed_headers) = sign(SigningInput {
+            credentials: &self.credentials,
+            region: &self.region,
+            service: "s3",
+            amz_date: &amz_date,
+            date: &date,
+            method,
+            canonical_uri: &canonical_uri,
+            canonical_query,
+            headers: &headers,
+            payload_hash: &payload_hash,
+        });
+
+        // ureq sets Host from the URL; signing it is enough.
+        let send_headers: Vec<(&str, &str)> = signed_headers
+            .iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("host"))
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+
+        let retryable = method == "GET"
+            || headers
+                .iter()
+                .any(|(name, value)| name == "if-none-match" && value == "*");
+        let mut attempt = 0;
+        let response = loop {
+            let response = match method {
+                "PUT" => {
+                    let mut request = self.agent.put(&url);
+                    for (name, value) in &send_headers {
+                        request = request.header(*name, *value);
+                    }
+                    request.header("Authorization", &authorization).send(body)
+                }
+                "GET" => {
+                    let mut request = self.agent.get(&url);
+                    for (name, value) in &send_headers {
+                        request = request.header(*name, *value);
+                    }
+                    request.header("Authorization", &authorization).call()
+                }
+                "HEAD" => {
+                    let mut request = self.agent.head(&url);
+                    for (name, value) in &send_headers {
+                        request = request.header(*name, *value);
+                    }
+                    request.header("Authorization", &authorization).call()
+                }
+                other => return Err(Error::S3(format!("unsupported method {other}"))),
+            };
+            let transient = match &response {
+                Ok(response) => matches!(response.status().as_u16(), 429 | 500 | 502 | 503 | 504),
+                Err(_) => true,
+            };
+            if retryable && transient && attempt < 2 {
+                std::thread::sleep(Duration::from_millis(100 << attempt));
+                attempt += 1;
+                continue;
+            }
+            break response;
+        };
+
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let mut collected = Vec::new();
+                for (name, value) in response.headers() {
+                    collected.push((
+                        name.as_str().to_string(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    ));
+                }
+                let body = response
+                    .into_body()
+                    .read_to_string()
+                    .map_err(|error| Error::S3(error.to_string()))?;
+                Ok(Response {
+                    status,
+                    body,
+                    headers: collected,
+                })
+            }
+            Err(ureq::Error::StatusCode(status)) => Ok(Response {
+                status,
+                body: String::new(),
+                headers: Vec::new(),
+            }),
+            Err(error) => Err(Error::S3(error.to_string())),
+        }
+    }
+
+    /// The URL, the `Host` header value, and the canonical URI for `key`.
+    fn target(&self, key: &str, raw_query: &str) -> (String, String, String) {
+        let encoded = encode_path(key);
+        let (host, canonical_uri) = if self.path_style {
+            (self.host.clone(), format!("/{}/{}", self.bucket, encoded))
+        } else {
+            (
+                format!("{}.{}", self.bucket, self.host),
+                format!("/{}", encoded),
+            )
+        };
+        let mut url = format!("{}://{}{}", self.scheme, host, canonical_uri);
+        if !raw_query.is_empty() {
+            url.push('?');
+            url.push_str(raw_query);
+        }
+        (url, host, canonical_uri)
+    }
+}
+
+/// The result of a raw request: status, body and headers.
+struct Response {
+    status: u16,
+    body: String,
+    headers: Vec<(String, String)>,
+}
+
+impl Response {
+    fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    }
+}
+
+/// Everything needed to sign one request.
+struct SigningInput<'a> {
+    credentials: &'a Credentials,
+    region: &'a str,
+    service: &'a str,
+    amz_date: &'a str,
+    date: &'a str,
+    method: &'a str,
+    canonical_uri: &'a str,
+    canonical_query: &'a str,
+    headers: &'a [(String, String)],
+    payload_hash: &'a str,
+}
+
+/// Sign a request, returning the `Authorization` value and the headers to send.
+///
+/// Split out from [`Client::send`] so the signing can be tested on its own.
+fn sign(input: SigningInput<'_>) -> (String, Vec<(String, String)>) {
+    let (canonical_headers, signed_header_names) = canonical_headers(input.headers);
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        input.method,
+        input.canonical_uri,
+        input.canonical_query,
+        canonical_headers,
+        signed_header_names,
+        input.payload_hash,
+    );
+    let scope = format!(
+        "{}/{}/{}/aws4_request",
+        input.date, input.region, input.service
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        input.amz_date,
+        scope,
+        sha256_hex(canonical_request.as_bytes()),
+    );
+    let key = signing_key(
+        &input.credentials.secret_key,
+        input.date,
+        input.region,
+        input.service,
+    );
+    let signature = hex::encode(hmac(&key, string_to_sign.as_bytes()));
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+        input.credentials.access_key, scope, signed_header_names, signature,
+    );
+    (authorization, input.headers.to_vec())
+}
+
+/// Canonical headers (lowercased, sorted, trimmed) and the signed-header list.
+fn canonical_headers(headers: &[(String, String)]) -> (String, String) {
+    let mut sorted: Vec<(String, String)> = headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.to_ascii_lowercase(),
+                value.split_whitespace().collect::<Vec<_>>().join(" "),
+            )
+        })
+        .collect();
+    sorted.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut block = String::new();
+    let mut names = Vec::with_capacity(sorted.len());
+    for (name, value) in &sorted {
+        block.push_str(name);
+        block.push(':');
+        block.push_str(value);
+        block.push('\n');
+        names.push(name.clone());
+    }
+    (block, names.join(";"))
+}
+
+/// The SigV4 signing key: HMAC chain over date, region, service and terminator.
+fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+    let initial = format!("AWS4{secret}");
+    let key = hmac(initial.as_bytes(), date.as_bytes());
+    let key = hmac(&key, region.as_bytes());
+    let key = hmac(&key, service.as_bytes());
+    hmac(&key, b"aws4_request")
+}
+
+fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    hex::encode(Sha256::digest(data))
+}
+
+fn format_amz_date(now: &OffsetDateTime) -> Result<String> {
+    let format = format_description!("[year][month][day]T[hour][minute][second]Z");
+    now.to_offset(UtcOffset::UTC)
+        .format(&format)
+        .map_err(|error| Error::S3(format!("amz-date: {error}")))
+}
+
+fn format_amz_day(now: &OffsetDateTime) -> Result<String> {
+    let format = format_description!("[year][month][day]");
+    now.to_offset(UtcOffset::UTC)
+        .format(&format)
+        .map_err(|error| Error::S3(format!("date: {error}")))
+}
+
+/// Split `https://host:port/...` into `("https", "host:port")`.
+fn split_endpoint(endpoint: &str) -> Result<(String, String)> {
+    let (scheme, rest) = endpoint
+        .split_once("://")
+        .ok_or_else(|| Error::S3(format!("endpoint has no scheme: {endpoint}")))?;
+    if scheme != "https" && scheme != "http" {
+        return Err(Error::S3(format!("unsupported scheme: {scheme}")));
+    }
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.is_empty() {
+        return Err(Error::S3(format!("endpoint has no host: {endpoint}")));
+    }
+    Ok((scheme.to_string(), authority.to_string()))
+}
+
+/// Percent-encode a key as an S3 path, keeping `/` separators.
+fn encode_path(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    for byte in key.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// Pull `Mode` and `RetainUntilDate` out of a `GetObjectRetention` response.
+fn parse_retention(xml: &str) -> Option<Retention> {
+    Some(Retention {
+        mode: element(xml, "Mode")?,
+        retain_until: element(xml, "RetainUntilDate")?,
+    })
+}
+
+fn element(xml: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn example_credentials() -> Credentials {
+        Credentials {
+            access_key: "AKIDEXAMPLE".into(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
+            session_token: None,
+        }
+    }
+
+    #[test]
+    fn canonical_headers_sort_and_lowercase() {
+        let headers = vec![
+            ("X-Amz-Date".to_string(), " 20150830T123600Z ".to_string()),
+            ("Host".to_string(), "iam.amazonaws.com".to_string()),
+            (
+                "Content-Type".to_string(),
+                "application/x-www-form-urlencoded; charset=utf-8".to_string(),
+            ),
+        ];
+        let (block, names) = canonical_headers(&headers);
+        assert_eq!(
+            block,
+            "content-type:application/x-www-form-urlencoded; charset=utf-8\n\
+             host:iam.amazonaws.com\n\
+             x-amz-date:20150830T123600Z\n"
+        );
+        assert_eq!(names, "content-type;host;x-amz-date");
+    }
+
+    #[test]
+    fn signing_key_matches_the_aws_worked_example() {
+        // From "Examples of the complete Version 4 signing process", the
+        // derived signing key for the documented secret is a well-known value.
+        let key = signing_key(
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            "20150830",
+            "us-east-1",
+            "iam",
+        );
+        assert_eq!(
+            hex::encode(key),
+            "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
+        );
+    }
+
+    #[test]
+    fn signature_matches_the_aws_worked_example() {
+        // The complete worked example: GET https://iam.amazonaws.com/ with the
+        // documented date, headers and empty payload.
+        let credentials = example_credentials();
+        let headers = vec![
+            (
+                "content-type".to_string(),
+                "application/x-www-form-urlencoded; charset=utf-8".to_string(),
+            ),
+            ("host".to_string(), "iam.amazonaws.com".to_string()),
+            ("x-amz-date".to_string(), "20150830T123600Z".to_string()),
+        ];
+        let (authorization, _) = sign(SigningInput {
+            credentials: &credentials,
+            region: "us-east-1",
+            service: "iam",
+            amz_date: "20150830T123600Z",
+            date: "20150830",
+            method: "GET",
+            canonical_uri: "/",
+            canonical_query: "Action=ListUsers&Version=2010-05-08",
+            headers: &headers,
+            payload_hash: &sha256_hex(b""),
+        });
+        assert_eq!(
+            authorization,
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, \
+             SignedHeaders=content-type;host;x-amz-date, \
+             Signature=5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7"
+        );
+    }
+
+    #[test]
+    fn path_style_and_virtual_hosted_targets() {
+        let mut client = Client::new(
+            "https://account.r2.cloudflarestorage.com",
+            "bucket",
+            "auto",
+            true,
+            example_credentials(),
+        )
+        .unwrap();
+        let (url, host, uri) = client.target("anchors/a/1.json", "");
+        assert_eq!(
+            url,
+            "https://account.r2.cloudflarestorage.com/bucket/anchors/a/1.json"
+        );
+        assert_eq!(host, "account.r2.cloudflarestorage.com");
+        assert_eq!(uri, "/bucket/anchors/a/1.json");
+
+        client.path_style = false;
+        let (url, host, uri) = client.target("anchors/a/1.json", "");
+        assert_eq!(
+            url,
+            "https://bucket.account.r2.cloudflarestorage.com/anchors/a/1.json"
+        );
+        assert_eq!(host, "bucket.account.r2.cloudflarestorage.com");
+        assert_eq!(uri, "/anchors/a/1.json");
+    }
+
+    #[test]
+    fn retention_xml_is_parsed() {
+        let xml = "<?xml version=\"1.0\"?><Retention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                   <Mode>COMPLIANCE</Mode><RetainUntilDate>2027-01-01T00:00:00.000Z</RetainUntilDate>\
+                   </Retention>";
+        assert_eq!(
+            parse_retention(xml),
+            Some(Retention {
+                mode: "COMPLIANCE".into(),
+                retain_until: "2027-01-01T00:00:00.000Z".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn endpoint_splitting() {
+        assert_eq!(
+            split_endpoint("https://account.r2.cloudflarestorage.com").unwrap(),
+            (
+                "https".to_string(),
+                "account.r2.cloudflarestorage.com".to_string()
+            )
+        );
+        assert_eq!(
+            split_endpoint("http://127.0.0.1:9000/base").unwrap(),
+            ("http".to_string(), "127.0.0.1:9000".to_string())
+        );
+        assert!(split_endpoint("account.r2.cloudflarestorage.com").is_err());
+    }
+
+    #[test]
+    fn provider_detection() {
+        assert_eq!(
+            Provider::detect("https://abc.r2.cloudflarestorage.com"),
+            Provider::R2
+        );
+        assert_eq!(
+            Provider::detect("https://s3.us-west-2.amazonaws.com"),
+            Provider::S3
+        );
+    }
+}

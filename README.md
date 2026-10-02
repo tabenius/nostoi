@@ -6,9 +6,9 @@ Tamper-evident audit chains, one tool for all of them: a Rust library, a CLI
 and a TUI to **verify**, **append to**, **stream** and **browse** them.
 
 A chain is a sequence of records where each record carries the digest of the
-record before it and a digest of its own content. Change, remove, reorder or
-insert anything and verification names the first record that no longer fits;
-everything before it is intact.
+record before it and a digest of its own content. Verification identifies the
+first inconsistent record. Detecting removal of the tail or a fully recomputed
+history requires a previously trusted head retained outside the chain.
 
 Nostoi reads the chains the RAGBAZ projects already keep, and gives the rest a
 common format:
@@ -71,6 +71,13 @@ assert!(report.ok);
 Features: `sqlite` (the SQLite stores), `cli`, `tui`; all on by default.
 `default-features = false` leaves the pure verifier: canonical JSON, the three
 digests, JSONL.
+
+## Python and WebAssembly
+
+Native Python bindings (PyO3), a versioned WIT component, and generated
+JavaScript/TypeScript bindings are available in this checkout. See
+[build instructions and examples](docs/INTEROPERABILITY.md) and
+[release preparation](docs/RELEASING.md). Registry publication is pending.
 
 ## The `nostoi-v1` format
 

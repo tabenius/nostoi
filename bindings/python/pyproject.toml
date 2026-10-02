@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "nostoi"
+version = "0.1.0"
+description = "Tamper-evident audit chains, powered by Rust"
+requires-python = ">=3.11"
+license = "MIT OR Apache-2.0"
+
+[project.urls]
+Repository = "https://github.com/tabenius/nostoi"
+
+[tool.maturin]
+python-source = "python"
+module-name = "nostoi._native"

@@ -194,7 +194,7 @@ fn the_sidecars_are_written_next_to_the_chain_and_read_back() {
 #[test]
 fn canonical_bytes_are_ascii_whatever_the_content() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, head) = chain(dir.path(), 1);
+    let (_path, head) = chain(dir.path(), 1);
     // A chain identity with a non-ASCII character, in NFC.
     let attestation = Attestation::new(
         "produktion/kerné",
@@ -229,7 +229,7 @@ fn canonical_bytes_are_ascii_whatever_the_content() {
 #[test]
 fn the_two_unicode_normalizations_are_refused_rather_than_confused() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, head) = chain(dir.path(), 1);
+    let (_path, head) = chain(dir.path(), 1);
 
     // NFC and NFD look identical, are canonically equivalent, and hash
     // differently. Silently rewriting one into the other would mean the signed
@@ -265,15 +265,13 @@ fn the_two_unicode_normalizations_are_refused_rather_than_confused() {
 #[test]
 fn encoding_problems_are_named_rather_than_reported_as_invalid_json() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, head) = chain(dir.path(), 1);
+    let (_path, head) = chain(dir.path(), 1);
     let attestation = attest(&head, "kernel");
     let document = dir.path().join("doc.json");
     let sidecars = Sidecars {
         document: document.clone(),
         signature: dir.path().join("doc.json.sig"),
     };
-    let _ = path;
-
     // A byte-order mark is not JSON, and "expected value" does not say so.
     std::fs::write(&sidecars.document, b"\xEF\xBB\xBF{}").unwrap();
     let error = read_document(&sidecars.document).unwrap_err();

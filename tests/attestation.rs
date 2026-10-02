@@ -342,22 +342,23 @@ fn formatting_cannot_break_an_attestation_but_editing_it_still_can() {
     .unwrap();
 
     let checked = attest::verify(&fixture.chain, &fixture.pinned()).unwrap();
-    assert_eq!(checked.canonicality, Canonicality::Reformatted);
+    assert_eq!(checked.document.canonicality, Canonicality::Reformatted);
     assert!(checked.coverage.is_current());
     assert_eq!(checked.attestation.canonical_bytes().unwrap(), canonical);
 
     // Repairing touches formatting only, and the signature still applies.
-    assert!(attest::canonicalize(&fixture.chain).unwrap(), "repaired");
-    assert_eq!(std::fs::read(&sidecars.document).unwrap(), canonical);
     assert!(
-        !attest::canonicalize(&fixture.chain).unwrap(),
-        "already canonical"
+        attest::canonicalize(&fixture.chain, &checked.document).unwrap(),
+        "repaired"
     );
+    assert_eq!(std::fs::read(&sidecars.document).unwrap(), canonical);
     assert_eq!(
         attest::verify(&fixture.chain, &fixture.pinned())
             .unwrap()
+            .document
             .canonicality,
-        Canonicality::Canonical
+        Canonicality::Canonical,
+        "an already canonical document needs no repair"
     );
 
     // CRLF is formatting too.
@@ -365,14 +366,32 @@ fn formatting_cannot_break_an_attestation_but_editing_it_still_can() {
         .unwrap()
         .replace('\n', "\r\n");
     std::fs::write(&sidecars.document, crlf.as_bytes()).unwrap();
+    let crlf_checked = attest::verify(&fixture.chain, &fixture.pinned()).unwrap();
     assert_eq!(
-        attest::verify(&fixture.chain, &fixture.pinned())
-            .unwrap()
-            .canonicality,
+        crlf_checked.document.canonicality,
         Canonicality::Reformatted
     );
-    attest::canonicalize(&fixture.chain).unwrap();
+    attest::canonicalize(&fixture.chain, &crlf_checked.document).unwrap();
 
+    // A repair refuses to write over a file that changed since it was verified,
+    // rather than discarding whatever replaced it. The verified document has to
+    // be one that needs repairing, or there is nothing to overwrite.
+    std::fs::write(
+        &sidecars.document,
+        serde_json::to_vec_pretty(&parsed).unwrap(),
+    )
+    .unwrap();
+    let stale = attest::verify(&fixture.chain, &fixture.pinned()).unwrap();
+    assert_eq!(stale.document.canonicality, Canonicality::Reformatted);
+    let tampered = String::from_utf8(canonical.clone())
+        .unwrap()
+        .replace("\"nostoi-v1\"", "\"nostoi-v1 \"");
+    std::fs::write(&sidecars.document, tampered.as_bytes()).unwrap();
+    let error = attest::canonicalize(&fixture.chain, &stale.document).unwrap_err();
+    assert!(error.to_string().contains("changed since"), "{error}");
+    std::fs::write(&sidecars.document, &canonical).unwrap();
+
+    // A changed *value* in a reformatted file is still refused.
     // A changed *value* in a reformatted file is still refused. That is the
     // property that matters, and the reason content is compared canonically.
     let mut altered = parsed;

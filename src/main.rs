@@ -682,8 +682,11 @@ fn verify_attestation(path: &Path, options: VerifyOptions) -> Result<ExitCode, S
         Ok(checked) => {
             // Repair once, before printing, so a write never hides inside a
             // serialization and the report describes what it just did.
-            let repaired = match canonicalize && !checked.canonicality.is_canonical() {
-                true => Some(nostoi::attest::canonicalize(path).map_err(|e| e.to_string())?),
+            let repaired = match canonicalize && !checked.document.canonicality.is_canonical() {
+                true => Some(
+                    nostoi::attest::canonicalize(path, &checked.document)
+                        .map_err(|e| e.to_string())?,
+                ),
                 false => None,
             };
             let signed_bytes = checked
@@ -712,7 +715,7 @@ fn verify_attestation(path: &Path, options: VerifyOptions) -> Result<ExitCode, S
                         "digest": checked.attestation.digest,
                         "head": checked.head,
                         "anchor_key": checked.attestation.anchor_key,
-                        "canonical_form": checked.canonicality.is_canonical(),
+                        "canonical_form": checked.document.canonicality.is_canonical(),
                         "canonicalized": repaired,
                         "signed_bytes": signed_bytes,
                     })
@@ -743,7 +746,7 @@ fn verify_attestation(path: &Path, options: VerifyOptions) -> Result<ExitCode, S
                 }
                 // Formatting is never a security failure, so it is a note rather
                 // than an error, and repairable.
-                if !checked.canonicality.is_canonical() {
+                if !checked.document.canonicality.is_canonical() {
                     println!(
                         "  note: the document is formatted, not canonical; the signature \
                          covers the same content either way"

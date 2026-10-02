@@ -137,6 +137,10 @@ pub enum Coverage {
     Truncated,
     /// The chain does not verify at the attested position: rewritten history.
     Rewritten,
+    /// The chain has no records at all, so there is nothing an attestation could
+    /// cover. Distinct from `Truncated`, which means the chain is shorter than the
+    /// attested position but has records.
+    Empty,
 }
 
 impl Coverage {
@@ -318,7 +322,7 @@ impl Attestation {
     /// over an intact prefix is honoured even when the chain has grown since.
     pub fn coverage(&self, verification: &StreamingVerification) -> Coverage {
         let Some(head) = &verification.report.head else {
-            return Coverage::Rewritten;
+            return Coverage::Empty;
         };
         let Some(checkpoint) = &verification.checkpoint else {
             return Coverage::Rewritten;
@@ -532,9 +536,13 @@ pub struct Attested {
     pub coverage: Coverage,
     /// The chain head this was checked against.
     pub head: Head,
-    /// Whether the document on disk is already in canonical form. Reported, never
-    /// fatal: a reformatted file is signed, it is just untidy.
-    pub canonicality: Canonicality,
+    /// The document that was verified, and whether the bytes on disk are already
+    /// canonical. Formatting is reported, never fatal: a reformatted file is
+    /// signed, it is just untidy.
+    ///
+    /// Carrying the document rather than only a `Canonicality` is what lets a
+    /// repair confirm it is still looking at the same bytes it checked.
+    pub document: Document,
 }
 
 impl Attested {
@@ -569,6 +577,12 @@ pub fn check(
         )));
     }
     let coverage = attestation.coverage(&verification);
+    if coverage == Coverage::Empty {
+        return Err(Error::Invalid(format!(
+            "the chain has no records, so it cannot carry an attestation of seq {}",
+            attestation.seq
+        )));
+    }
     if coverage == Coverage::Rewritten {
         // Prefer the verifier's own diagnosis of where the chain stops fitting.
         return Err(Error::Broken(
@@ -589,7 +603,11 @@ pub fn check(
         attestation: attestation.clone(),
         coverage,
         head,
-        canonicality: Canonicality::Canonical,
+        document: Document {
+            on_disk: Vec::new(),
+            canonical: canonical_bytes(attestation)?,
+            canonicality: Canonicality::Canonical,
+        },
     })
 }
 

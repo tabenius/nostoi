@@ -439,8 +439,7 @@ pub fn verify(chain: &Path, verifier: &Verifier) -> Result<Attested> {
     let sidecars = Sidecars::for_chain(chain);
     let read = read(chain)?.expect("read checked for the sidecars");
     let attestation = read.attestation;
-    let canonicality = read.document.canonicality;
-    let canonical = read.document.canonical;
+    let canonical = read.document.canonical.clone();
     let signature =
         read_bounded(&sidecars.signature, MAX_SIGNATURE_BYTES).map_err(Error::Invalid)?;
     if signature.is_empty() {
@@ -473,22 +472,34 @@ pub fn verify(chain: &Path, verifier: &Verifier) -> Result<Attested> {
         }
     }
     let mut checked = attestation::check(chain, &attestation, None).map_err(Error::from)?;
-    checked.canonicality = canonicality;
+    checked.document = read.document;
     Ok(checked)
 }
 
-/// Rewrite the document in canonical form.
+/// Rewrite the document in canonical form, if it is not already.
 ///
-/// Only ever called after the signature has been checked against the canonical
-/// bytes, which is what makes this lossless: the bytes being replaced are the
-/// bytes the signature already covers.
-pub fn canonicalize(chain: &Path) -> Result<bool> {
+/// Takes the document that was verified rather than reading its own, which does
+/// two things. It makes the coupling explicit instead of conventional: the bytes
+/// being replaced are provably the bytes the signature already covers. And it
+/// closes a lost-update window — between verifying and repairing, the file could
+/// have changed, and writing the older canonical form would silently discard
+/// whatever replaced it. So the file is re-read and compared first, and a change
+/// is an error rather than an overwrite.
+pub fn canonicalize(chain: &Path, verified: &nostoi_core::attestation::Document) -> Result<bool> {
     let sidecars = Sidecars::for_chain(chain);
-    let read = read(chain)?.expect("read checked for the sidecars");
-    if read.document.canonicality.is_canonical() {
+    if verified.canonicality.is_canonical() {
         return Ok(false);
     }
-    std::fs::write(&sidecars.document, &read.document.canonical)
+    let current =
+        std::fs::read(&sidecars.document).map_err(crate::error::io(&sidecars.document))?;
+    if current != verified.on_disk {
+        return Err(Error::Invalid(format!(
+            "{} changed since it was verified, so it was not rewritten; run \
+             verify-attestation again",
+            sidecars.document.display()
+        )));
+    }
+    std::fs::write(&sidecars.document, &verified.canonical)
         .map_err(crate::error::io(&sidecars.document))?;
     Ok(true)
 }

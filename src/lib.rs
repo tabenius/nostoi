@@ -71,6 +71,19 @@ pub mod sqlite {
 pub mod time {
     pub use nostoi_core::time::*;
 }
+/// The browser's binding table: the only place in the crate that names a key.
+#[cfg(feature = "tui")]
+mod bindings;
+/// The ragbaz token files, vendored and generated. Never edited here, and the
+/// whole generated surface is kept even where this crate uses only part of it.
+/// Its lints are allowed rather than fixed, for the same reason: the file is a
+/// projection of `tokens.toml`, not code this crate owns.
+#[cfg(feature = "tui")]
+#[allow(dead_code, clippy::needless_range_loop)]
+mod design;
+/// The token ladder bound to ratatui: the only place a colour is built.
+#[cfg(feature = "tui")]
+mod theme;
 #[cfg(feature = "tui")]
 pub mod tui;
 

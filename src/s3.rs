@@ -228,7 +228,12 @@ impl Client {
             ));
             headers.push(("x-amz-checksum-sha256".to_string(), checksum));
         }
-        let response = self.send("PUT", key, "", "", headers, body)?;
+        let response = self
+            .send("PUT", key, "", "", headers, body)
+            .map_err(|error| Error::UploadUncertain {
+                key: key.into(),
+                detail: error.to_string(),
+            })?;
         // If-None-Match: * and key exists -> 412 Precondition Failed
         if options.only_if_absent && response.status == 412 {
             return Ok(PutResult {
@@ -237,6 +242,15 @@ impl Client {
             });
         }
         if !(200..=299).contains(&response.status) {
+            if response.uncertain || matches!(response.status, 500 | 502 | 503 | 504) {
+                return Err(Error::UploadUncertain {
+                    key: key.into(),
+                    detail: format!(
+                        "PutObject returned {} after an ambiguous attempt",
+                        response.status
+                    ),
+                });
+            }
             return Err(Error::S3(format!(
                 "PutObject returned {}: {}",
                 response.status, response.body
@@ -290,6 +304,7 @@ impl Client {
                 .iter()
                 .any(|(name, value)| name == "if-none-match" && value == "*");
         let mut attempt = 0;
+        let mut uncertain = false;
         let response = loop {
             let (authorization, signed_headers) = self.sign_request(
                 method,
@@ -333,6 +348,14 @@ impl Client {
                 Ok(response) => matches!(response.status().as_u16(), 429 | 500 | 502 | 503 | 504),
                 Err(_) => true,
             };
+            if method == "PUT"
+                && (response.is_err()
+                    || response
+                        .as_ref()
+                        .is_ok_and(|r| matches!(r.status().as_u16(), 500 | 502 | 503 | 504)))
+            {
+                uncertain = true;
+            }
             if retryable && transient && attempt < 2 {
                 std::thread::sleep(Duration::from_millis(100 << attempt));
                 attempt += 1;
@@ -359,12 +382,14 @@ impl Client {
                     status,
                     body,
                     headers: collected,
+                    uncertain,
                 })
             }
             Err(ureq::Error::StatusCode(status)) => Ok(Response {
                 status,
                 body: String::new(),
                 headers: Vec::new(),
+                uncertain,
             }),
             Err(error) => Err(Error::S3(error.to_string())),
         }
@@ -430,6 +455,7 @@ struct Response {
     status: u16,
     body: String,
     headers: Vec<(String, String)>,
+    uncertain: bool,
 }
 
 impl Response {

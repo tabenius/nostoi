@@ -94,6 +94,12 @@ where
             };
             let request = read_request(&mut stream);
             let (status, body) = respond(index, &request);
+            // An empty status deliberately drops the connection after reading
+            // the upload, simulating storage succeeding but its receipt being lost.
+            if status.is_empty() {
+                requests.push(request);
+                continue;
+            }
             write!(
                 stream,
                 "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -201,6 +207,130 @@ fn conditional_412_reconciles_identical_head_and_returns_existing_anchor() {
 }
 
 #[test]
+fn committed_upload_with_lost_receipt_is_reconciled_without_overwrite() {
+    let mut existing = String::new();
+    let (client, server) = server(3, move |index, request| match index {
+        0 => {
+            assert_put(request, false);
+            existing = String::from_utf8(request.body.clone()).unwrap();
+            ("", String::new())
+        }
+        1 => {
+            assert_put(request, false);
+            assert_eq!(request.body, existing.as_bytes());
+            ("412 Precondition Failed", String::new())
+        }
+        _ => {
+            assert_eq!(request.line, format!("GET {OBJECT} HTTP/1.1"));
+            ("200 OK", existing.clone())
+        }
+    });
+    let result = call_anchor(&client, None);
+    let requests = server.join().unwrap();
+    let anchor = result.unwrap();
+    let uploaded: Anchor = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(anchor.digest, uploaded.digest);
+    assert_eq!(anchor.anchored_at, uploaded.anchored_at);
+}
+
+#[test]
+fn permission_denied_upload_is_not_retried() {
+    let (client, server) = server(1, |_, request| {
+        assert_put(request, false);
+        (
+            "403 Forbidden",
+            "<Error><Code>AccessDenied</Code></Error>".into(),
+        )
+    });
+    let result = call_anchor(&client, None);
+    server.join().unwrap();
+    assert!(matches!(result, Err(Error::S3(message)) if message.contains("403")));
+}
+
+#[test]
+fn locked_upload_with_lost_receipt_reconciles_and_verifies_retention() {
+    let mut stored = String::new();
+    let mut retention = String::new();
+    let (client, server) = server(4, move |index, request| match index {
+        0 => {
+            let anchor = assert_put(request, true);
+            retention = format!("<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>{}</RetainUntilDate></Retention>", anchor.retain_until.unwrap());
+            stored = String::from_utf8(request.body.clone()).unwrap();
+            ("", String::new())
+        }
+        1 => {
+            assert_eq!(request.body, stored.as_bytes());
+            ("412 Precondition Failed", String::new())
+        }
+        2 => ("200 OK", stored.clone()),
+        _ => {
+            assert_eq!(request.line, format!("GET {OBJECT}?retention HTTP/1.1"));
+            ("200 OK", retention.clone())
+        }
+    });
+    let result = call_anchor(&client, Some(LockMode::Compliance));
+    server.join().unwrap();
+    assert_eq!(result.unwrap().mode.as_deref(), Some("COMPLIANCE"));
+}
+
+#[test]
+fn exhausted_upload_receipts_are_reconciled_by_reading_the_locked_object() {
+    let mut stored = String::new();
+    let mut retention = String::new();
+    let (client, server) = server(5, move |index, request| match index {
+        0..=2 => {
+            let anchor = assert_put(request, true);
+            if index == 0 {
+                stored = String::from_utf8(request.body.clone()).unwrap();
+                retention = format!("<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>{}</RetainUntilDate></Retention>", anchor.retain_until.unwrap());
+            } else {
+                assert_eq!(request.body, stored.as_bytes());
+            }
+            ("", String::new())
+        }
+        3 => ("200 OK", stored.clone()),
+        _ => ("200 OK", retention.clone()),
+    });
+    let result = call_anchor(&client, Some(LockMode::Compliance));
+    server.join().unwrap();
+    assert!(result.is_ok(), "{result:?}");
+}
+
+#[test]
+fn exhausted_uploads_with_no_readable_object_report_unknown_outcome() {
+    let (client, server) = server(4, |index, request| {
+        if index < 3 {
+            assert_put(request, true);
+            ("", String::new())
+        } else {
+            ("404 Not Found", String::new())
+        }
+    });
+    let result = call_anchor(&client, Some(LockMode::Compliance));
+    server.join().unwrap();
+    assert!(
+        matches!(result, Err(Error::UploadUncertain { ref key, .. }) if key == "heads/test.json")
+    );
+}
+
+#[test]
+fn exhausted_retention_requests_report_stored_but_unconfirmed() {
+    let (client, server) = server(4, |index, request| {
+        if index == 0 {
+            assert_put(request, true);
+            ("200 OK", String::new())
+        } else {
+            ("503 Service Unavailable", String::new())
+        }
+    });
+    let result = call_anchor(&client, Some(LockMode::Compliance));
+    server.join().unwrap();
+    assert!(
+        matches!(result, Err(Error::AnchorUnconfirmed { ref key, .. }) if key == "heads/test.json")
+    );
+}
+
+#[test]
 fn conditional_412_rejects_mismatched_existing_anchor() {
     for field in ["v", "chain", "format", "seq", "digest", "key"] {
         let mut existing = String::new();
@@ -223,7 +353,7 @@ fn conditional_412_rejects_mismatched_existing_anchor() {
         let result = call_anchor(&client, None);
         server.join().unwrap();
         assert!(
-            matches!(result, Err(Error::S3(ref message)) if message.contains("different chain or head")),
+            matches!(result, Err(Error::AnchorUnconfirmed { ref detail, .. }) if detail.contains("different chain or head")),
             "mismatch in {field} was not rejected: {result:?}"
         );
     }
@@ -270,7 +400,7 @@ fn absent_retention_is_rejected() {
     for status in ["404 Not Found", "200 OK"] {
         let result = retention_case(status, "", 0);
         assert!(
-            matches!(result, Err(Error::S3(ref message)) if message.contains("retention was not returned")),
+            matches!(result, Err(Error::AnchorUnconfirmed { ref detail, .. }) if detail.contains("retention was not returned")),
             "absent retention ({status}) was not rejected: {result:?}"
         );
     }
@@ -280,7 +410,7 @@ fn absent_retention_is_rejected() {
 fn incorrect_retention_mode_is_rejected() {
     let result = retention_case("200 OK", "GOVERNANCE", 86400);
     assert!(
-        matches!(result, Err(Error::S3(ref message)) if message.contains("retention does not meet the request")),
+        matches!(result, Err(Error::AnchorUnconfirmed { ref detail, .. }) if detail.contains("retention does not meet the request")),
         "incorrect retention mode was not rejected: {result:?}"
     );
 }
@@ -289,7 +419,7 @@ fn incorrect_retention_mode_is_rejected() {
 fn shorter_retention_is_rejected() {
     let result = retention_case("200 OK", "COMPLIANCE", -1);
     assert!(
-        matches!(result, Err(Error::S3(ref message)) if message.contains("retention does not meet the request")),
+        matches!(result, Err(Error::AnchorUnconfirmed { ref detail, .. }) if detail.contains("retention does not meet the request")),
         "shorter retention was not rejected: {result:?}"
     );
 }
@@ -304,4 +434,154 @@ fn verified_retention_at_or_beyond_requested_deadline_succeeds() {
             OffsetDateTime::parse(anchor.retain_until.as_ref().unwrap(), &Rfc3339).unwrap();
         assert_eq!(retain_until - anchored_at, time::Duration::days(30));
     }
+}
+
+#[test]
+fn remote_checkpoint_detects_truncation_rewrite_and_identity_mismatch() {
+    for case in [
+        "extended",
+        "truncated",
+        "empty",
+        "rewritten",
+        "identity",
+        "format",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let append = |value| {
+            nostoi::append(
+                &path,
+                Draft {
+                    actor: None,
+                    kind: "test",
+                    subject: None,
+                    body: serde_json::json!({"value":value}),
+                    at: Some("2026-01-01T00:00:00Z".into()),
+                },
+            )
+            .unwrap()
+        };
+        append(1);
+        let prefix = std::fs::read(&path).unwrap();
+        let head = append(2);
+        let mut checkpoint = Anchor {
+            v: "nostoi-anchor-v1".into(),
+            chain: "trusted-chain".into(),
+            format: "nostoi-v1".into(),
+            seq: head.seq,
+            digest: head.digest,
+            anchored_at: "2026-01-01T00:00:00Z".into(),
+            provider: "s3".into(),
+            key: "heads/test.json".into(),
+            mode: None,
+            retain_until: None,
+        };
+        match case {
+            "extended" => {
+                append(3);
+            }
+            "truncated" => std::fs::write(&path, prefix).unwrap(),
+            "empty" => std::fs::write(&path, []).unwrap(),
+            "rewritten" => {
+                std::fs::remove_file(&path).unwrap();
+                append(10);
+                append(20);
+                assert!(nostoi::verify(&path, None).unwrap().ok);
+            }
+            "identity" => checkpoint.chain = "other-chain".into(),
+            "format" => checkpoint.format = "other-format".into(),
+            _ => unreachable!(),
+        }
+        let remote = serde_json::to_string(&checkpoint).unwrap();
+        let (client, server) = server(1, move |_, request| {
+            assert_eq!(request.line, format!("GET {OBJECT} HTTP/1.1"));
+            ("200 OK", remote.clone())
+        });
+        let result =
+            nostoi::anchor::verify_anchor(&path, &client, "heads/test.json", "trusted-chain");
+        server.join().unwrap();
+        if case == "extended" {
+            let result = result.unwrap();
+            assert_eq!(result.anchor.seq, 2);
+            assert_eq!(result.local_head.seq, 3);
+            assert_eq!(result.verified_records, 3);
+        } else {
+            assert!(
+                matches!(result, Err(Error::AnchorMismatch(_))),
+                "{case}: {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "cli")]
+fn verify_cli_fetches_checkpoint_without_uploading() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.sqlite");
+    let head = nostoi::append(
+        &path,
+        Draft {
+            actor: None,
+            kind: "test",
+            subject: None,
+            body: serde_json::json!({}),
+            at: None,
+        },
+    )
+    .unwrap();
+    let remote =
+        serde_json::json!({"v":"nostoi-anchor-v1", "chain":"cli-chain", "format":"nostoi-v1",
+        "seq":head.seq, "digest":head.digest, "anchored_at":"2026-01-01T00:00:00Z", "provider":"s3",
+        "key":"heads/test.json", "mode":null, "retain_until":null})
+        .to_string();
+    // A separately bound server exposes its endpoint through the signed client
+    // request target; use a dedicated listener for the command-line boundary.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + TIMEOUT;
+        let mut stream = loop {
+            if let Ok((stream, _)) = listener.accept() {
+                break stream;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        };
+        let request = read_request(&mut stream);
+        assert_eq!(request.line, format!("GET {OBJECT} HTTP/1.1"));
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{remote}",
+            remote.len()
+        )
+        .unwrap();
+    });
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_nostoi-anchor"))
+        .args([
+            "--verify",
+            "--endpoint",
+            &endpoint,
+            "--bucket",
+            "bucket",
+            "--path-style",
+            "--key",
+            "heads/test.json",
+            "--chain-id",
+            "cli-chain",
+        ])
+        .arg(&path)
+        .env("AWS_ACCESS_KEY_ID", "test")
+        .env("AWS_SECRET_ACCESS_KEY", "test-secret")
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["verified_records"], 1);
 }

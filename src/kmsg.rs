@@ -241,16 +241,28 @@ impl Reader {
         std::mem::take(&mut self.lost)
     }
 
+    /// An overrun was observed and no subsequent sequence has resolved it yet.
+    pub fn has_pending_overrun(&self) -> bool {
+        self.overrun_pending
+    }
+
     /// Read the next event.
     ///
     /// `EPIPE` becomes [`Event::Overrun`]: the buffer overwrote records while
     /// this fd was open. `EAGAIN` becomes [`Event::Empty`].
     pub fn next_event(&mut self) -> Result<Event> {
+        self.next_event_with(read_at)
+    }
+
+    fn next_event_with(
+        &mut self,
+        mut read: impl FnMut(&mut File, &mut [u8]) -> std::io::Result<usize>,
+    ) -> Result<Event> {
         if let Some(record) = self.pending.pop_front() {
             return Ok(self.emit(record));
         }
         let count = loop {
-            match read_at(&mut self.file, &mut self.buffer) {
+            match read(&mut self.file, &mut self.buffer) {
                 Ok(count) => break count,
                 // /dev/kmsg returns EINVAL (not a partial record) when the
                 // destination cannot hold the record. Retry with a bounded buffer.
@@ -315,6 +327,91 @@ fn read_at(file: &mut File, buffer: &mut [u8]) -> std::io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn injected_overrun_survives_empty_read_until_next_record() {
+        let mut reader = Reader::open_path("/dev/null").unwrap();
+        reader.last_seq = Some(10);
+        assert!(matches!(
+            reader
+                .next_event_with(|_, _| Err(std::io::Error::from_raw_os_error(libc::EPIPE)))
+                .unwrap(),
+            Event::Overrun
+        ));
+        assert!(reader.overrun_pending);
+        assert!(matches!(
+            reader
+                .next_event_with(|_, _| Err(std::io::Error::from_raw_os_error(libc::EAGAIN)))
+                .unwrap(),
+            Event::Empty
+        ));
+        assert!(reader.overrun_pending);
+        assert!(matches!(
+            reader
+                .next_event_with(|_, buffer| {
+                    let bytes = b"6,50,1,-;after overrun\n";
+                    buffer[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                })
+                .unwrap(),
+            Event::Record(_)
+        ));
+        assert_eq!(reader.take_lost(), 39);
+        assert!(!reader.overrun_pending);
+    }
+
+    #[test]
+    fn small_buffer_grows_without_consuming_record() {
+        let mut reader = Reader::open_path("/dev/null").unwrap();
+        let mut attempts = 0;
+        let event = reader
+            .next_event_with(|_, buffer| {
+                attempts += 1;
+                if buffer.len() < 128 * 1024 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                }
+                let bytes = b"6,1,1,-;large record\n";
+                buffer[..bytes.len()].copy_from_slice(bytes);
+                Ok(bytes.len())
+            })
+            .unwrap();
+        assert!(matches!(event, Event::Record(_)));
+        assert_eq!(attempts, 2);
+        assert_eq!(reader.buffer.len(), 128 * 1024);
+    }
+
+    #[test]
+    fn invalid_read_is_bounded_by_buffer_ceiling() {
+        let mut reader = Reader::open_path("/dev/null").unwrap();
+        let mut attempts = 0;
+        let result = reader.next_event_with(|_, _| {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+        });
+        assert!(
+            matches!(result, Err(Error::Io(error)) if error.raw_os_error() == Some(libc::EINVAL))
+        );
+        assert_eq!(reader.buffer.len(), 1024 * 1024);
+        assert_eq!(attempts, 5);
+    }
+
+    #[test]
+    fn interrupted_read_retries_before_returning_empty() {
+        let mut reader = Reader::open_path("/dev/null").unwrap();
+        let mut attempts = 0;
+        let result = reader
+            .next_event_with(|_, _| {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(if attempts == 1 {
+                    libc::EINTR
+                } else {
+                    libc::EAGAIN
+                }))
+            })
+            .unwrap();
+        assert!(matches!(result, Event::Empty));
+        assert_eq!(attempts, 2);
+    }
 
     #[test]
     fn overrun_gap_is_counted_once() {

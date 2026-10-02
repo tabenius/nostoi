@@ -14,6 +14,10 @@ use std::process::ExitCode;
 struct Args {
     /// Path to the chain to anchor (JSONL or SQLite).
     chain: PathBuf,
+    /// Verify the local chain against an existing trusted remote checkpoint.
+    /// Requires --key and --chain-id; does not upload an object.
+    #[arg(long, conflicts_with = "lock")]
+    verify: bool,
     /// S3 endpoint, e.g. https://s3.us-west-2.amazonaws.com or https://<account>.r2.cloudflarestorage.com
     #[arg(long)]
     endpoint: String,
@@ -54,7 +58,11 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("nostoi-anchor: {error}");
-            ExitCode::FAILURE
+            match error {
+                Error::UploadUncertain { .. } => ExitCode::from(2),
+                Error::AnchorUnconfirmed { .. } => ExitCode::from(3),
+                _ => ExitCode::FAILURE,
+            }
         }
     }
 }
@@ -70,6 +78,16 @@ fn run() -> Result<(), Error> {
         args.path_style || provider == Provider::R2,
         credentials,
     )?;
+
+    if args.verify {
+        let result =
+            nostoi::anchor::verify_anchor(&args.chain, &client, &args.key, &args.chain_id)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).map_err(|e| Error::S3(e.to_string()))?
+        );
+        return Ok(());
+    }
 
     let lock_mode = args
         .lock

@@ -24,6 +24,13 @@ jobs:
         run: cargo test --workspace --all-features --locked
       - name: Scheduling helper syntax and credential separation
         run: sh -n contrib/systemd/nostoi-anchor-runner && python3 contrib/systemd/test_anchor_runner.py
+      - name: Attestations need ssh-keygen
+        run: |
+          command -v ssh-keygen
+          # The attestation tests sign for real with a throwaway key, so they skip
+          # rather than fail when the tool is absent; make that visible.
+          cargo test --locked -p nostoi --test attestation -- --nocapture 2>&1 |
+            tee /dev/stderr | grep -q "test result: ok" 
       - name: Benchmark fixture safety
         run: cargo test --no-default-features --features sqlite --example large_chain --locked
       - name: The verifier alone builds (no default features)

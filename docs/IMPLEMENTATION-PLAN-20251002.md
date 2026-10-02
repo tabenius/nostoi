@@ -76,6 +76,38 @@ linear scan; it does not establish production throughput or peak memory.
 
 Remaining queue:
 
+### Parallel implementation batch completed — 2026-10-02
+
+- `codex/dependency-remediation`: upgraded PyO3 to 0.29.3 and replaced the
+  transitive unmaintained `decompress` extractor through weval 0.5.0. npm and
+  RustSec audits report zero vulnerabilities. Native Python tests passed on
+  Python 3.11 and 3.14; the actual component build and JS extraction security
+  regressions passed. Details: `docs/DEPENDENCY-REMEDIATION.md`.
+- `codex/durable-anchor-outbox`: separate SQLite WAL/FULL-sync immutable intents,
+  stable target identity, exact original bytes/deadlines, and durable outcomes.
+  Reconciliation survives lost receipts and failed outcome commits. Inconsistent
+  saved intents fail before network I/O, and expired S3 retention requires an
+  explicit new key. Details: `docs/DURABLE-ANCHOR-OUTBOX.md`.
+- `codex/anchor-scheduling`: independent publisher/verifier identities,
+  LoadCredential-based secret handling, fifteen-minute timers and nonsecret
+  config examples. No units were installed or enabled.
+  Details: `docs/ANCHOR-SCHEDULING.md`.
+- Integrated validation: 83 runtime Rust tests plus one doctest pass across the
+  locked workspace; strict workspace Clippy, minimal feature builds and formatting
+  pass. Nine shell-helper regressions pass, as do six npm extraction cases and
+  component tests. The helper also runs against the actual outbox-enabled binary
+  in an offline HTTP test, with a test-only local HTTPS-to-HTTP adapter; production
+  certificate verification is unchanged. Source remains untouched, the intent is
+  readable before PUT, repeated requests preserve bytes, and the verification
+  credential is distinct. Unit syntax verification reports only the expected
+  missing deployment helper at `/usr/local/libexec/nostoi-anchor-runner`.
+  CI now runs the locked all-feature workspace and helper tests. The source
+  package includes the benchmark, helper and templates; publish dry-run and
+  all-feature tests from the extracted package both pass (no crate uploaded).
+
+GitHub's Dependabot alert state can lag the lockfile update until the default
+branch is pushed and rescanned; no alerts were manually dismissed.
+
 The next implementation pass completes locked-upload and exhausted-retry
 reconciliation, typed unknown/unconfirmed outcomes, explicit remote-checkpoint
 verification (including truncation and fully rehashed rewrites), and boot-aware

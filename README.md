@@ -138,6 +138,13 @@ is available through `kmsg-nostoi` with the `kmsg` feature. See
 locking, recovery, verification and shutdown behavior. Cryptographically signed
 head anchors remain on the roadmap.
 
+For recurring operation, `nostoi-anchor --outbox PATH` persists the exact request
+before upload and recovers it after a crash. See
+[durable anchor recovery](docs/DURABLE-ANCHOR-OUTBOX.md) and the repo-only
+[publisher/verifier scheduling templates](docs/ANCHOR-SCHEDULING.md). Publishing
+and verification use separate credentials and an independently selected trusted
+checkpoint key.
+
 ## Status
 
 `0.1`: the formats, both stores, the CLI and the TUI, with tests (canonical

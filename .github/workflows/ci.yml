@@ -17,13 +17,15 @@ jobs:
         with:
           components: clippy, rustfmt
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Test (with the Python conformance checks)
-        run: cargo test
+        run: cargo test --workspace --all-features --locked
+      - name: Scheduling helper syntax and credential separation
+        run: sh -n contrib/systemd/nostoi-anchor-runner && python3 contrib/systemd/test_anchor_runner.py
       - name: The verifier alone builds (no default features)
-        run: cargo build --no-default-features --lib
+        run: cargo build --no-default-features --lib --locked
   interoperability:
     runs-on: ubuntu-latest
     steps:

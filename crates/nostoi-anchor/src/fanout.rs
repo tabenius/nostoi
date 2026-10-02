@@ -438,40 +438,107 @@ fn chain_of(config: &Fanout, chain_path: &Path) -> String {
 /// Read one destination's credentials.
 ///
 /// With no credentials directory the process environment is used, which is what
-/// a single-destination run does today. With one, the systemd `Credentials=`
-/// layout is read: `aws-access-key-id`, `aws-secret-access-key` and an optional
-/// `aws-session-token`, from the destination's own subdirectory when it has one.
+/// a single-destination run does today. With one, two layouts are accepted:
+///
+/// * `<dir>/<sub>/aws-access-key-id`, for an operator who exposes a prepared
+///   directory;
+/// * `<dir>/<sub>-aws-access-key-id`, which is what systemd's `LoadCredential=`
+///   can produce, since a credential ID has to be a plain filename.
+///
+/// A destination that names a `credentials` subdirectory never falls back to the
+/// unprefixed files: that would silently hand it the credential belonging to
+/// some other destination, or a shared one, which is the thing per-destination
+/// credentials exist to prevent. Either way the secrets arrive as files only
+/// this service can read, never in arguments.
 pub fn credentials_for(target: &Target, credentials_dir: Option<&Path>) -> Result<Credentials> {
     let Some(root) = credentials_dir else {
         return Credentials::from_env();
     };
-    let dir = match &target.credentials {
-        Some(sub) => root.join(sub),
-        None => root.to_path_buf(),
+    let unreadable = |detail: String| {
+        Error::Invalid(format!(
+            "{detail}; looked for {}",
+            layouts(root, target).join(", ")
+        ))
     };
-    let access_key = read_credential(&dir, "aws-access-key-id")?;
-    let secret_key = read_credential(&dir, "aws-secret-access-key")?;
-    Ok(Credentials {
-        access_key,
-        secret_key,
-        session_token: read_credential(&dir, "aws-session-token").ok(),
-    })
+
+    // A directory per destination.
+    if let Some(sub) = &target.credentials {
+        let dir = root.join(sub);
+        if dir.is_dir() {
+            return Ok(Credentials {
+                access_key: read_credential(&dir, "aws-access-key-id").map_err(|detail| {
+                    unreadable(format!("credential for {:?}: {detail}", target.name))
+                })?,
+                secret_key: read_credential(&dir, "aws-secret-access-key").map_err(|detail| {
+                    unreadable(format!("credential for {:?}: {detail}", target.name))
+                })?,
+                session_token: read_credential(&dir, "aws-session-token").ok(),
+            });
+        }
+    }
+
+    // Flat files, prefixed with this destination's name. A destination that did
+    // not name a subdirectory may also use the unprefixed files, which is how a
+    // single-destination unit loads one credential set.
+    let prefix = target
+        .credentials
+        .clone()
+        .unwrap_or_else(|| target.name.clone());
+    for prefix in if target.credentials.is_some() {
+        vec![prefix]
+    } else {
+        vec![prefix, String::new()]
+    } {
+        let name = |file: &str| {
+            if prefix.is_empty() {
+                file.to_string()
+            } else {
+                format!("{prefix}-{file}")
+            }
+        };
+        if let (Ok(access_key), Ok(secret_key)) = (
+            read_credential(root, &name("aws-access-key-id")),
+            read_credential(root, &name("aws-secret-access-key")),
+        ) {
+            return Ok(Credentials {
+                access_key,
+                secret_key,
+                session_token: read_credential(root, &name("aws-session-token")).ok(),
+            });
+        }
+    }
+
+    Err(unreadable(format!(
+        "no credential for destination {:?}",
+        target.name
+    )))
 }
 
-fn read_credential(dir: &Path, name: &str) -> Result<String> {
+/// The paths that would have supplied this destination's credential.
+fn layouts(root: &Path, target: &Target) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(sub) = &target.credentials {
+        paths.push(format!("{}/{sub}/aws-access-key-id", root.display()));
+        paths.push(format!("{}/{sub}-aws-access-key-id", root.display()));
+    } else {
+        paths.push(format!(
+            "{}/{}-aws-access-key-id",
+            root.display(),
+            target.name
+        ));
+        paths.push(format!("{}/aws-access-key-id", root.display()));
+    }
+    paths
+}
+
+/// Read one credential file, trimming the newline a text file ends with.
+fn read_credential(dir: &Path, name: &str) -> std::result::Result<String, String> {
     let path = dir.join(name);
-    let value = std::fs::read_to_string(&path).map_err(|error| {
-        Error::Invalid(format!(
-            "no credential for this destination: cannot read {} ({error})",
-            path.display()
-        ))
-    })?;
+    let value = std::fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {} ({error})", path.display()))?;
     let value = value.trim_end_matches(['\n', '\r']).to_string();
     if value.is_empty() {
-        return Err(Error::Invalid(format!(
-            "credential {} is empty",
-            path.display()
-        )));
+        return Err(format!("credential {} is empty", path.display()));
     }
     Ok(value)
 }

@@ -623,6 +623,115 @@ fn the_provider_is_detected_per_destination_or_stated_explicitly() {
 }
 
 #[test]
+fn credentials_are_read_from_a_directory_or_from_flat_systemd_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain(dir.path(), 1);
+    let store = Store::start(Behaviour::Store);
+
+    // systemd credential IDs must be plain filenames, so a unit cannot hand the
+    // process per-destination subdirectories. Both layouts have to work.
+    for (layout, prepare) in [
+        (
+            "directories",
+            Box::new(|root: &Path, name: &str| {
+                let directory = root.join(name);
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(directory.join("aws-access-key-id"), format!("{name}-key")).unwrap();
+                std::fs::write(
+                    directory.join("aws-secret-access-key"),
+                    format!("{name}-secret"),
+                )
+                .unwrap();
+                std::fs::write(directory.join("aws-session-token"), format!("{name}-token"))
+                    .unwrap();
+            }) as Box<dyn Fn(&Path, &str)>,
+        ),
+        (
+            "flat",
+            Box::new(|root: &Path, name: &str| {
+                for file in [
+                    "aws-access-key-id",
+                    "aws-secret-access-key",
+                    "aws-session-token",
+                ] {
+                    std::fs::write(
+                        root.join(format!("{name}-{file}")),
+                        format!("{name}-{file}"),
+                    )
+                    .unwrap();
+                }
+            }),
+        ),
+    ] {
+        let credentials = dir.path().join(format!("cred-{layout}"));
+        std::fs::create_dir_all(&credentials).unwrap();
+        prepare(&credentials, "aws");
+        prepare(&credentials, "b2");
+
+        let config = fanout_of(vec![target("aws", &store), target("b2", &store)]);
+        let results = fanout::publish(&chain, &config, Some(&credentials), None).unwrap();
+        for name in ["aws", "b2"] {
+            assert_eq!(
+                state_of(&results, name).state,
+                PublishState::Confirmed,
+                "{layout} layout, {name}: {results:#?}"
+            );
+        }
+    }
+
+    // The message must name the file it wanted, so the failure is actionable.
+    let empty = dir.path().join("cred-missing");
+    std::fs::create_dir_all(&empty).unwrap();
+    let config = fanout_of(vec![target("aws", &store)]);
+    let results = fanout::publish(&chain, &config, Some(&empty), None).unwrap();
+    let detail = state_of(&results, "aws")
+        .detail
+        .as_deref()
+        .unwrap_or_default();
+    assert!(detail.contains("aws-access-key-id"), "{detail}");
+
+    // A destination that names its own credentials must never quietly receive
+    // another destination's, or a shared one.
+    let shared = dir.path().join("cred-shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    for file in ["aws-access-key-id", "aws-secret-access-key"] {
+        std::fs::write(shared.join(file), "shared").unwrap();
+    }
+    let results = fanout::publish(
+        &chain,
+        &fanout_of(vec![target("b2", &store)]),
+        Some(&shared),
+        None,
+    )
+    .unwrap();
+    assert_eq!(state_of(&results, "b2").state, PublishState::Rejected);
+    assert!(
+        state_of(&results, "b2")
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("b2-aws-access-key-id"),
+        "the message should say which file it wanted: {:?}",
+        state_of(&results, "b2").detail
+    );
+
+    // A destination that names none may use the shared files. It gets a fresh
+    // store, because re-anchoring a key that already holds this checkpoint asks
+    // for a later retention deadline than the one stored.
+    let fresh = Store::start(Behaviour::Store);
+    let mut shared_target = target("plain", &fresh);
+    shared_target.credentials = None;
+    let results =
+        fanout::publish(&chain, &fanout_of(vec![shared_target]), Some(&shared), None).unwrap();
+    assert_eq!(
+        state_of(&results, "plain").state,
+        PublishState::Confirmed,
+        "{:?}",
+        state_of(&results, "plain")
+    );
+}
+
+#[test]
 fn verification_refuses_to_choose_its_own_trusted_key() {
     let dir = tempfile::tempdir().unwrap();
     let chain = chain(dir.path(), 1);

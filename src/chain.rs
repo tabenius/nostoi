@@ -109,43 +109,102 @@ pub struct Head {
     pub digest: String,
 }
 
+/// Full-chain verification plus an optional verified checkpoint position.
+/// A checkpoint is only evidence of an intact prefix; callers must also check
+/// `report.ok` before trusting the entire chain, including its suffix.
+#[derive(Clone, Debug, Serialize)]
+pub struct StreamingVerification {
+    pub report: Report,
+    pub checkpoint: Option<Head>,
+}
+
+/// Incremental verification state. Entries are borrowed, never retained.
+pub(crate) struct Verifier {
+    records: u64,
+    head: Option<Head>,
+    problem: Option<Problem>,
+    checkpoint_seq: Option<u64>,
+    checkpoint: Option<Head>,
+}
+
+impl Verifier {
+    pub(crate) fn new(checkpoint_seq: Option<u64>) -> Self {
+        Self {
+            records: 0,
+            head: None,
+            problem: None,
+            checkpoint_seq,
+            checkpoint: None,
+        }
+    }
+
+    pub(crate) fn push(&mut self, entry: &Entry) {
+        self.push_columns(entry, None);
+    }
+
+    /// Native SQLite duplicates chain fields in columns. Check both views in
+    /// the same sequence/link/digest order as ordinary chain verification.
+    pub(crate) fn push_columns(&mut self, entry: &Entry, columns: Option<(i64, &str, &str)>) {
+        self.records += 1;
+        if self.problem.is_some() {
+            return;
+        }
+        let expected = self.records;
+        let previous = self.head.as_ref().map_or(GENESIS, |h| h.digest.as_str());
+        self.problem = if entry.seq != expected
+            || columns.is_some_and(|(seq, _, _)| seq < 1 || seq as u64 != entry.seq)
+        {
+            Some(Problem::Sequence {
+                seq: entry.seq,
+                expected,
+            })
+        } else if entry.previous != previous
+            || columns.is_some_and(|(_, link, _)| link != entry.previous)
+        {
+            Some(Problem::Link { seq: entry.seq })
+        } else if entry.digest != entry.computed
+            || columns.is_some_and(|(_, _, digest)| digest != entry.digest)
+        {
+            Some(Problem::Digest { seq: entry.seq })
+        } else {
+            None
+        };
+        if self.problem.is_none() {
+            let head = Head {
+                seq: entry.seq,
+                digest: entry.digest.clone(),
+            };
+            if self.checkpoint_seq == Some(entry.seq) {
+                self.checkpoint = Some(head.clone());
+            }
+            self.head = Some(head);
+        }
+    }
+
+    pub(crate) fn finish(self, format: &str, unreadable: Option<Problem>) -> StreamingVerification {
+        let problem = self.problem.or(unreadable);
+        StreamingVerification {
+            report: Report {
+                format: format.to_string(),
+                records: self.records,
+                verified: self.head.as_ref().map_or(0, |h| h.seq),
+                ok: problem.is_none(),
+                head: self.head,
+                problem,
+            },
+            checkpoint: self.checkpoint,
+        }
+    }
+}
+
 /// Check that `entries` form an unbroken chain from the genesis digest.
 /// `unreadable` is a read error met after the last entry, if any.
 pub fn verify(format: &str, entries: &[Entry], unreadable: Option<Problem>) -> Report {
-    let mut previous = GENESIS.to_string();
-    let mut head = None;
-    let mut problem = None;
-    for (index, entry) in entries.iter().enumerate() {
-        let expected = index as u64 + 1;
-        if entry.seq != expected {
-            problem = Some(Problem::Sequence {
-                seq: entry.seq,
-                expected,
-            });
-        } else if entry.previous != previous {
-            problem = Some(Problem::Link { seq: entry.seq });
-        } else if entry.digest != entry.computed {
-            problem = Some(Problem::Digest { seq: entry.seq });
-        }
-        if problem.is_some() {
-            break;
-        }
-        previous = entry.digest.clone();
-        head = Some(Head {
-            seq: entry.seq,
-            digest: entry.digest.clone(),
-        });
+    let mut verifier = Verifier::new(None);
+    for entry in entries {
+        verifier.push(entry);
     }
-    let problem = problem.or(unreadable);
-    let verified = head.as_ref().map_or(0, |h| h.seq);
-    Report {
-        format: format.to_string(),
-        records: entries.len() as u64,
-        verified,
-        ok: problem.is_none(),
-        head,
-        problem,
-    }
+    verifier.finish(format, unreadable).report
 }
 
 #[cfg(test)]

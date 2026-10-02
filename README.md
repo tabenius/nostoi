@@ -145,6 +145,13 @@ before upload and recovers it after a crash. See
 and verification use separate credentials and an independently selected trusted
 checkpoint key.
 
+Full-chain and remote-checkpoint verification now stream records rather than
+retaining the entire history. See [streaming verification](docs/STREAMING-VERIFICATION.md),
+[bounded S3 diagnostics](docs/S3-DIAGNOSTICS.md), and
+[large-chain measurements](docs/LARGE-CHAIN-BENCHMARKS.md). A proposed next-step
+[compartment architecture](docs/COMPARTMENT-ARCHITECTURE.md) describes process
+privileges and a staged crate split while preserving the current API.
+
 ## Status
 
 `0.1`: the formats, both stores, the CLI and the TUI, with tests (canonical

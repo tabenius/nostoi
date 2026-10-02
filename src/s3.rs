@@ -30,6 +30,7 @@
 //! which of the two applies so the caller can fail rather than silently write
 //! unless it is told locking is handled.
 
+use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -254,15 +255,12 @@ impl Client {
                 return Err(Error::UploadUncertain {
                     key: key.into(),
                     detail: format!(
-                        "PutObject returned {} after an ambiguous attempt",
-                        response.status
+                        "{}; after an ambiguous attempt",
+                        self.failure("PutObject", &response)
                     ),
                 });
             }
-            return Err(Error::S3(format!(
-                "PutObject returned {}: {}",
-                response.status, response.body
-            )));
+            return Err(Error::S3(self.failure("PutObject", &response)));
         }
         Ok(PutResult {
             etag: response.header("etag"),
@@ -274,7 +272,7 @@ impl Client {
     pub fn get_object(&self, key: &str) -> Result<String> {
         let response = self.send("GET", key, "", "", vec![], &[])?;
         if response.status != 200 {
-            return Err(Error::S3(format!("GetObject returned {}", response.status)));
+            return Err(Error::S3(self.failure("GetObject", &response)));
         }
         Ok(response.body)
     }
@@ -287,10 +285,7 @@ impl Client {
             return Ok(None);
         }
         if response.status != 200 {
-            return Err(Error::S3(format!(
-                "GetObjectRetention returned {}: {}",
-                response.status, response.body
-            )));
+            return Err(Error::S3(self.failure("GetObjectRetention", &response)));
         }
         Ok(parse_retention(&response.body))
     }
@@ -313,7 +308,7 @@ impl Client {
                 .any(|(name, value)| name == "if-none-match" && value == "*");
         let mut attempt = 0;
         let mut uncertain = false;
-        let response = loop {
+        let (response, signed_time) = loop {
             let (authorization, signed_headers) = self.sign_request(
                 method,
                 &host,
@@ -369,7 +364,11 @@ impl Client {
                 attempt += 1;
                 continue;
             }
-            break response;
+            let signed_time = signed_headers
+                .iter()
+                .find(|(name, _)| name == "x-amz-date")
+                .and_then(|(_, value)| parse_signed_time(value));
+            break (response, signed_time);
         };
 
         match response {
@@ -382,15 +381,26 @@ impl Client {
                         value.to_str().unwrap_or_default().to_string(),
                     ));
                 }
-                let body = response
-                    .into_body()
-                    .read_to_string()
-                    .map_err(|error| Error::S3(error.to_string()))?;
+                let body = if (200..=299).contains(&status) {
+                    response.into_body().read_to_string()
+                        .map_err(|_| Error::S3("response body could not be read".into()))?
+                } else {
+                    // Error bodies are untrusted, potentially reflective and arbitrarily large.
+                    let mut bytes = Vec::new();
+                    let read = response.into_body().as_reader().take(16 * 1024 + 1)
+                        .read_to_end(&mut bytes);
+                    if read.is_ok() && bytes.len() <= 16 * 1024 {
+                        String::from_utf8(bytes).unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                };
                 Ok(Response {
                     status,
                     body,
                     headers: collected,
                     uncertain,
+                    signed_time,
                 })
             }
             Err(ureq::Error::StatusCode(status)) => Ok(Response {
@@ -398,9 +408,126 @@ impl Client {
                 body: String::new(),
                 headers: Vec::new(),
                 uncertain,
+                signed_time,
             }),
-            Err(error) => Err(Error::S3(error.to_string())),
+            Err(_) => Err(Error::S3("transport failed; no definitive HTTP response (check connectivity, endpoint and TLS)".into())),
         }
+    }
+
+    fn failure(&self, operation: &str, response: &Response) -> String {
+        let field = |name| error_field(&response.body, name);
+        // Only recognized codes are rendered: even a syntactically valid Code can echo secrets.
+        let code = field("Code").unwrap_or_default();
+        let hint = match code.as_str() {
+            "RequestTimeTooSkewed" | "RequestExpired" => "synchronize the host clock and check its UTC time",
+            "SignatureDoesNotMatch" => "check signing credentials, endpoint, region and signed headers; also synchronize the host clock",
+            "ExpiredToken" | "InvalidToken" => "refresh the session credentials/token",
+            "AccessDenied" => "check credentials, bucket policy and required permissions",
+            "NoSuchKey" => "check the object key and destination bucket",
+            "NoSuchBucket" => "check the destination bucket and endpoint",
+            "AuthorizationHeaderMalformed" | "PermanentRedirect" | "IncorrectEndpoint" | "IllegalLocationConstraintException" => "check the bucket region and endpoint (R2 uses region auto)",
+            "SlowDown" | "ServiceUnavailable" | "InternalError" => "service temporarily unavailable; retry later",
+            _ => match response.status {
+                301 | 307 => "check the bucket region and endpoint",
+                401 | 403 => "check credentials and required permissions",
+                404 => "check the object key and destination bucket",
+                429 | 500 | 502 | 503 | 504 => "service temporarily unavailable; retry later",
+                _ => "check the endpoint and request configuration",
+            },
+        };
+        let recognized = matches!(
+            code.as_str(),
+            "RequestTimeTooSkewed"
+                | "RequestExpired"
+                | "SignatureDoesNotMatch"
+                | "ExpiredToken"
+                | "InvalidToken"
+                | "AccessDenied"
+                | "NoSuchKey"
+                | "NoSuchBucket"
+                | "AuthorizationHeaderMalformed"
+                | "PermanentRedirect"
+                | "IncorrectEndpoint"
+                | "IllegalLocationConstraintException"
+                | "SlowDown"
+                | "ServiceUnavailable"
+                | "InternalError"
+        );
+        let mut detail = format!("{operation} returned {}", response.status);
+        if recognized && !self.contains_credential(&code) {
+            detail.push_str(&format!("; code={code}"));
+        }
+        for (label, value) in [
+            (
+                "request-id",
+                response
+                    .header("x-amz-request-id")
+                    .or_else(|| field("RequestId")),
+            ),
+            (
+                "host-id",
+                response.header("x-amz-id-2").or_else(|| field("HostId")),
+            ),
+            (
+                "bucket-region",
+                response
+                    .header("x-amz-bucket-region")
+                    .or_else(|| field("Region")),
+            ),
+        ] {
+            if let Some(value) = value.filter(|v| self.safe_metadata(v)) {
+                detail.push_str(&format!("; {label}={value}"));
+            }
+        }
+        // RequestTime is only corroboration; never use a remote echo as the local clock.
+        let request_matches = field("RequestTime").is_none_or(|value| {
+            parse_server_time(&value).or_else(|| parse_signed_time(&value)) == response.signed_time
+        });
+        let server = field("ServerTime")
+            .and_then(|v| parse_server_time(&v))
+            .or_else(|| {
+                response.header("date").and_then(|v| {
+                    OffsetDateTime::parse(&v, &time::format_description::well_known::Rfc2822).ok()
+                })
+            });
+        if let (Some(server), Some(signed)) = (server, response.signed_time) {
+            if request_matches {
+                let seconds = signed.unix_timestamp() - server.unix_timestamp();
+                let direction = if seconds < 0 {
+                    "behind"
+                } else if seconds > 0 {
+                    "ahead"
+                } else {
+                    "aligned"
+                };
+                detail.push_str(&format!("; estimated clock skew: {} seconds {direction} of server (approximate, server-reported); synchronize the host clock", seconds.unsigned_abs()));
+            }
+        }
+        detail.push_str(&format!("; {hint}"));
+        detail
+    }
+
+    fn safe_metadata(&self, value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.+/=".contains(&b))
+            && !self.contains_credential(value)
+            && !["authorization", "credential", "signature", "security-token"]
+                .iter()
+                .any(|word| value.to_ascii_lowercase().contains(word))
+    }
+
+    fn contains_credential(&self, value: &str) -> bool {
+        [
+            Some(self.credentials.access_key.as_str()),
+            Some(self.credentials.secret_key.as_str()),
+            self.credentials.session_token.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|secret| !secret.is_empty() && value.contains(secret))
     }
 
     /// Build fresh signing headers for one send attempt.
@@ -464,6 +591,83 @@ struct Response {
     body: String,
     headers: Vec<(String, String)>,
     uncertain: bool,
+    signed_time: Option<OffsetDateTime>,
+}
+
+fn parse_signed_time(value: &str) -> Option<OffsetDateTime> {
+    time::PrimitiveDateTime::parse(
+        value,
+        format_description!("[year][month][day]T[hour][minute][second]Z"),
+    )
+    .ok()
+    .map(|v| v.assume_utc())
+}
+
+fn parse_server_time(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value, &Rfc3339).ok()
+}
+
+/// Deliberately narrow XML recognizer: direct text children of Error, including
+/// namespace prefixes. No entities, DTDs, CDATA or nested reflective content.
+/// Unsupported/malformed documents simply provide no diagnostic fields.
+fn error_field(xml: &str, wanted: &str) -> Option<String> {
+    if xml.len() > 16 * 1024 {
+        return None;
+    }
+    let mut stack: Vec<&str> = Vec::new();
+    let mut rest = xml;
+    let mut found = None;
+    let mut text = "";
+    let mut root_seen = false;
+    while let Some(start) = rest.find('<') {
+        let preceding = &rest[..start];
+        if stack.len() == 2 && stack[1].rsplit(':').next() == Some(wanted) {
+            text = preceding.trim();
+        } else if stack.len() != 2 && !preceding.trim().is_empty() {
+            return None;
+        }
+        rest = &rest[start..];
+        if rest.starts_with("<?xml ") && stack.is_empty() {
+            rest = &rest[rest.find("?>")? + 2..];
+            continue;
+        }
+        let end = rest.find('>')?;
+        let tag = &rest[1..end];
+        if let Some(close) = tag.strip_prefix('/') {
+            let open = stack.pop()?;
+            if close != open {
+                return None;
+            }
+            if stack.len() == 1 && open.rsplit(':').next() == Some(wanted) {
+                if found.is_some() || text.contains('&') || text.len() > 128 {
+                    return None;
+                }
+                found = Some(text.to_string());
+            }
+        } else {
+            let name = tag.split_whitespace().next()?;
+            if !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_:.-".contains(&b))
+                || stack.len() >= 2
+            {
+                return None;
+            }
+            if stack.is_empty() {
+                if root_seen || name.rsplit(':').next() != Some("Error") {
+                    return None;
+                }
+                root_seen = true;
+            }
+            stack.push(name);
+        }
+        rest = &rest[end + 1..];
+    }
+    if stack.is_empty() && rest.trim().is_empty() {
+        found
+    } else {
+        None
+    }
 }
 
 impl Response {

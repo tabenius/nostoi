@@ -81,18 +81,33 @@ impl Outbox {
         options: AnchorOptions,
         provider: Provider,
     ) -> Result<Anchor> {
+        let prepared = prepare_anchor(source, options, provider)?;
+        self.publish_prepared(source, client, prepared)
+    }
+
+    /// Commit and publish a request that was prepared elsewhere, so a fan-out can
+    /// verify the chain once and still give every destination its own durable,
+    /// independently recoverable outbox.
+    ///
+    /// Reconciles first: an intent left pending by an earlier crash is retried
+    /// with its original bytes before a new one is committed.
+    pub fn publish_prepared(
+        &mut self,
+        source: &Path,
+        client: &Client,
+        prepared: PreparedAnchor,
+    ) -> Result<Anchor> {
         if std::fs::canonicalize(source).map_err(crate::error::io(source))? != self.source {
             return Err(Error::Invalid(
                 "outbox belongs to a different source".into(),
             ));
         }
-        if !options.only_if_absent {
+        if !prepared.only_if_absent {
             return Err(Error::Invalid(
                 "durable anchors require conditional, write-once uploads".into(),
             ));
         }
         self.reconcile(client)?;
-        let prepared = prepare_anchor(source, options, provider)?;
         let prepared = self.store(prepared)?;
         self.publish(client, &prepared)
     }

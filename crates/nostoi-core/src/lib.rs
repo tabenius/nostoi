@@ -1,56 +1,54 @@
-//! Compatibility facade over the portable core and optional network/ingestion crates.
+//! # Nostoi core
 //!
-//! Existing `nostoi::` paths remain stable. New code should depend on
-//! `nostoi-core`, `nostoi-anchor`, or `nostoi-kmsg` directly when it belongs to
-//! one of those compartments.
+//! Tamper-evident audit chains, one library for all of them: verify them,
+//! append to them, stream them and browse them.
+//!
+//! A chain is a sequence of records where each record carries the digest of
+//! the one before it and a digest of its own content. Change, remove or
+//! reorder any record and verification names the first one that no longer
+//! fits; everything before it is intact.
+//!
+//! Nostoi reads three formats (see [`format`]):
+//!
+//! - `nostoi-v1`, its own, as JSON Lines or an append-only SQLite store;
+//! - `weftmark-ledger-v1`, WeftMark's `ledger.jsonl`;
+//! - `ephor-audit-v1`, Ephor's `governance_events`.
+//!
+//! and writes `nostoi-v1`, whose digest any language can compute: SHA-256 of
+//! the record's canonical JSON without its `digest`, where canonical JSON is
+//! Python's `json.dumps(record, sort_keys=True, separators=(",", ":"))`.
+//!
+//! ```no_run
+//! use nostoi_core::{append, verify, Draft};
+//! use serde_json::json;
+//!
+//! let path = std::path::Path::new("audit.jsonl");
+//! append(path, Draft {
+//!     actor: Some("agent:claude"),
+//!     kind: "tool.call",
+//!     subject: Some("cs-42"),
+//!     body: json!({"tool": "weft_handoff_create"}),
+//!     at: None,
+//! })?;
+//! let report = verify(path, None)?;
+//! assert!(report.ok);
+//! # Ok::<(), nostoi_core::Error>(())
+//! ```
+//!
+//! *Nostoi* (Νόστοι, "homecomings") are the lost epic poems of the Greek heroes'
+//! journeys home: records that should have survived and did not.
 
-#[cfg(feature = "s3")]
-pub mod anchor {
-    pub use nostoi_anchor::anchor::*;
-    pub use nostoi_anchor::{Error, Result};
-    #[cfg(feature = "sqlite")]
-    pub mod outbox {
-        pub use nostoi_anchor::outbox::*;
-    }
-}
-
-pub mod canonical {
-    pub use nostoi_core::canonical::*;
-}
-pub mod chain {
-    pub use nostoi_core::chain::*;
-}
+pub mod canonical;
+pub mod chain;
 mod error;
-pub mod format {
-    pub use nostoi_core::format::*;
-}
-pub mod jsonl {
-    pub use nostoi_core::jsonl::*;
-}
-#[cfg(all(feature = "kmsg", target_os = "linux"))]
-pub mod kmsg {
-    pub use nostoi_kmsg::*;
-}
-pub mod portable {
-    pub use nostoi_core::portable::*;
-}
-#[cfg(feature = "s3")]
-pub mod s3 {
-    pub use nostoi_anchor::s3::*;
-}
+pub mod format;
+pub mod jsonl;
+pub mod portable;
 #[cfg(feature = "sqlite")]
-pub mod schema {
-    pub use nostoi_core::schema::*;
-}
+pub mod schema;
 #[cfg(feature = "sqlite")]
-pub mod sqlite {
-    pub use nostoi_core::sqlite::*;
-}
-pub mod time {
-    pub use nostoi_core::time::*;
-}
-#[cfg(feature = "tui")]
-pub mod tui;
+pub mod sqlite;
+pub mod time;
 
 pub use chain::{Entry, Head, Problem, Report, StreamingVerification, GENESIS};
 pub use error::{Error, Result};
@@ -64,9 +62,9 @@ use std::path::Path;
 pub fn open(path: &Path, format: Option<Format>) -> Result<Loaded> {
     #[cfg(feature = "sqlite")]
     if sqlite::is_sqlite(path) {
-        return sqlite::load(path, format).map_err(Error::from);
+        return sqlite::load(path, format);
     }
-    jsonl::load(path, format).map_err(Error::from)
+    jsonl::load(path, format)
 }
 
 /// Verify the entire chain at `path` with record memory bounded by its largest
@@ -88,14 +86,13 @@ pub fn verify_streaming(
 ) -> Result<StreamingVerification> {
     #[cfg(feature = "sqlite")]
     if sqlite::is_sqlite(path) {
-        return sqlite::verify_streaming(path, format, checkpoint_seq).map_err(Error::from);
+        return sqlite::verify_streaming(path, format, checkpoint_seq);
     }
     jsonl::verify_reader(
         std::fs::File::open(path).map_err(error::io(path))?,
         format,
         checkpoint_seq,
     )
-    .map_err(Error::from)
 }
 
 /// Append a `nostoi-v1` record to the chain at `path`, creating it if needed:
@@ -109,10 +106,8 @@ pub fn append(path: &Path, draft: Draft<'_>) -> Result<Entry> {
             Some("sqlite" | "sqlite3" | "db")
         );
         if sqlite::is_sqlite(path) || (!path.exists() && sqlite_name) {
-            return sqlite::Store::open(path)
-                .and_then(|mut store| store.append(draft))
-                .map_err(Error::from);
+            return sqlite::Store::open(path)?.append(draft);
         }
     }
-    jsonl::append(path, draft).map_err(Error::from)
+    jsonl::append(path, draft)
 }

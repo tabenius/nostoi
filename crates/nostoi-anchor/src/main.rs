@@ -1,8 +1,8 @@
 //! Command-line tool to anchor a Nostoi chain head to S3/R2.
 use clap::Parser;
-use nostoi::anchor::{AnchorOptions, LockMode};
-use nostoi::s3::{Client, Credentials, Provider};
-use nostoi::Error;
+use nostoi_anchor::anchor::{AnchorOptions, LockMode};
+use nostoi_anchor::s3::{Client, Credentials, Provider};
+use nostoi_anchor::Error;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -85,7 +85,7 @@ fn run() -> Result<(), Error> {
 
     if args.verify {
         let result =
-            nostoi::anchor::verify_anchor(&args.chain, &client, &args.key, &args.chain_id)?;
+            nostoi_anchor::anchor::verify_anchor(&args.chain, &client, &args.key, &args.chain_id)?;
         println!(
             "{}",
             serde_json::to_string_pretty(&result).map_err(|e| Error::S3(e.to_string()))?
@@ -116,17 +116,17 @@ fn run() -> Result<(), Error> {
 
     #[cfg(feature = "sqlite")]
     let anchor = if let Some(path) = args.outbox {
-        nostoi::outbox::Outbox::open(&path, &args.chain)?.anchor_head(
+        nostoi_anchor::outbox::Outbox::open(&path, &args.chain)?.anchor_head(
             &args.chain,
             &client,
             options,
             provider,
         )?
     } else {
-        nostoi::anchor::anchor_head(&args.chain, &client, options, provider)?
+        nostoi_anchor::anchor::anchor_head(&args.chain, &client, options, provider)?
     };
     #[cfg(not(feature = "sqlite"))]
-    let anchor = nostoi::anchor::anchor_head(&args.chain, &client, options, provider)?;
+    let anchor = nostoi_anchor::anchor::anchor_head(&args.chain, &client, options, provider)?;
     if args.json {
         println!(
             "{}",

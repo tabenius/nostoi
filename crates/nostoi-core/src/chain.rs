@@ -1,4 +1,4 @@
-//! The common shape of every chain Nostoi reads, and its verification.
+//! The common shape of every chain Nostoi reads, and its core verification.
 //!
 //! Each format maps its records onto [`Entry`]: a position (`seq`), the digest
 //! it claims for its predecessor (`previous`), the digest it claims for itself

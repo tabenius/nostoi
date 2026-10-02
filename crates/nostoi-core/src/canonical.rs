@@ -1,4 +1,4 @@
-//! Canonical JSON: the bytes Python's
+//! Core canonical JSON: the bytes Python's
 //! `json.dumps(value, sort_keys=True, separators=(",", ":"))` produces.
 //!
 //! This is the encoding WeftMark's ledger hashes, and the one `nostoi-v1`

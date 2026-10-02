@@ -3,10 +3,7 @@ use nostoi_core::Problem;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Core(#[from] nostoi_core::Error),
-    #[cfg(feature = "s3")]
-    #[error(transparent)]
-    Anchor(#[from] nostoi_anchor::Error),
+    Core(nostoi_core::Error),
     #[error("{path}: {source}")]
     Io {
         path: String,
@@ -15,39 +12,53 @@ pub enum Error {
     #[cfg(feature = "sqlite")]
     #[error("{0}")]
     Sqlite(#[from] rusqlite::Error),
-    /// An S3/R2 anchor request failed.
-    #[cfg(feature = "s3")]
     #[error("s3: {0}")]
     S3(String),
-    /// A PUT may have reached storage, but no definitive receipt was obtained.
-    #[cfg(feature = "s3")]
     #[error("s3: upload outcome unknown for {key}: {detail}")]
     UploadUncertain { key: String, detail: String },
-    /// Object data was stored/found but its identity or retention is unconfirmed.
-    #[cfg(feature = "s3")]
     #[error("s3: object {key} may already be stored; verification failed: {detail}")]
     AnchorUnconfirmed { key: String, detail: String },
-    #[cfg(feature = "s3")]
     #[error("s3: original anchor retention has expired for {key} at {retain_until}; publish a new immutable key")]
     AnchorExpired { key: String, retain_until: String },
-    #[cfg(feature = "s3")]
     #[error("external anchor verification failed: {0}")]
     AnchorMismatch(String),
     #[error("{0}")]
     Invalid(String),
-    /// Refused to extend a chain that does not verify.
-    #[error("the chain is broken, so nothing was appended: {0}")]
-    Broken(Problem),
     #[error("unsupported schema for {component}: found {found:?}, supported {supported}")]
     UnsupportedSchema {
         component: &'static str,
         found: String,
         supported: String,
     },
+    #[error("the chain is broken, so nothing was appended: {0}")]
+    Broken(Problem),
+}
+
+impl From<nostoi_core::Error> for Error {
+    fn from(error: nostoi_core::Error) -> Self {
+        match error {
+            nostoi_core::Error::Io { path, source } => Self::Io { path, source },
+            nostoi_core::Error::Invalid(detail) => Self::Invalid(detail),
+            nostoi_core::Error::Broken(problem) => Self::Broken(problem),
+            nostoi_core::Error::UnsupportedSchema {
+                component,
+                found,
+                supported,
+            } => Self::UnsupportedSchema {
+                component,
+                found,
+                supported,
+            },
+            #[cfg(feature = "sqlite")]
+            nostoi_core::Error::Sqlite(error) => Self::Sqlite(error),
+            // Core SQLite may be feature-unified by another workspace member.
+            #[allow(unreachable_patterns)]
+            other => Self::Core(other),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-
 pub(crate) fn io(path: &std::path::Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
     move |source| Error::Io {
         path: path.display().to_string(),

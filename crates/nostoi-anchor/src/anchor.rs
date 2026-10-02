@@ -1,4 +1,4 @@
-//! Anchor a chain head to S3-compatible storage.
+//! Network compartment: anchor a chain head to S3-compatible storage.
 //!
 //! An anchor writes the last verified head of a Nostoi chain to a write-once
 //! object. That external copy lets you detect tail truncation or a fully
@@ -86,7 +86,7 @@ pub struct Anchor {
 #[derive(Clone, Debug, Serialize)]
 pub struct VerifiedAnchor {
     pub anchor: Anchor,
-    pub local_head: crate::Head,
+    pub local_head: nostoi_core::Head,
     pub verified_records: u64,
 }
 
@@ -136,7 +136,7 @@ fn verify_checkpoint(
             "remote chain identity or key does not match the expected checkpoint".into(),
         ));
     }
-    let verification = crate::verify_streaming(chain_path, None, Some(anchor.seq))?;
+    let verification = nostoi_core::verify_streaming(chain_path, None, Some(anchor.seq))?;
     let report = verification.report;
     if let Some(problem) = report.problem {
         return Err(Error::AnchorMismatch(format!(
@@ -230,7 +230,7 @@ impl PreparedAnchor {
                 .digest
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || !crate::format::Format::ALL
+            || !nostoi_core::format::Format::ALL
                 .iter()
                 .any(|format| format.name() == anchor.format)
         {
@@ -320,7 +320,7 @@ pub fn prepare_anchor(
     options: AnchorOptions,
     provider: Provider,
 ) -> Result<PreparedAnchor> {
-    let report = crate::verify(chain_path, None)?;
+    let report = nostoi_core::verify(chain_path, None)?;
     if let Some(problem) = report.problem {
         return Err(Error::Broken(problem));
     }
@@ -563,9 +563,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("audit.jsonl");
             let mut records = Vec::new();
-            let mut previous = crate::GENESIS.to_owned();
+            let mut previous = nostoi_core::GENESIS.to_owned();
             for seq in 1..=3 {
-                let record = crate::format::nostoi_record(
+                let record = nostoi_core::format::nostoi_record(
                     seq,
                     &previous,
                     "2026-01-01T00:00:00Z",
@@ -593,7 +593,7 @@ mod tests {
             records[broken_seq - 1]["kind"] = serde_json::json!("tampered");
             let text: String = records
                 .iter()
-                .map(|r| format!("{}\n", crate::canonical::to_string(r)))
+                .map(|r| format!("{}\n", nostoi_core::canonical::to_string(r)))
                 .collect();
             std::fs::write(&path, text).unwrap();
             let result = verify_checkpoint(&path, anchor, "heads/test", "trusted");
@@ -607,9 +607,9 @@ mod tests {
     fn broken_chain_is_never_anchored() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
-        crate::append(
+        nostoi_core::append(
             &path,
-            crate::Draft {
+            nostoi_core::Draft {
                 actor: None,
                 kind: "test",
                 subject: None,

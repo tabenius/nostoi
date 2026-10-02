@@ -12,7 +12,7 @@ readme = "README.md"
 include = ["/src/**", "/tests/**", "/docs/**", "/examples/**", "/contrib/python/nostoi.py", "/contrib/systemd/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE-*", "/assets/logo.svg"]
 
 [workspace]
-members = ["bindings/python", "bindings/component"]
+members = ["bindings/python", "bindings/component", "crates/nostoi-core", "crates/nostoi-anchor", "crates/nostoi-kmsg"]
 default-members = ["."]
 resolver = "2"
 
@@ -25,16 +25,6 @@ name = "nostoi"
 path = "src/main.rs"
 required-features = ["cli"]
 
-[[bin]]
-name = "kmsg-nostoi"
-path = "src/bin/kmsg-nostoi.rs"
-required-features = ["kmsg", "sqlite", "cli"]
-
-[[bin]]
-name = "nostoi-anchor"
-path = "src/bin/nostoi-anchor.rs"
-required-features = ["s3", "cli"]
-
 [[example]]
 name = "scale"
 required-features = ["sqlite"]
@@ -45,33 +35,22 @@ required-features = ["sqlite"]
 
 [features]
 default = ["cli", "tui", "sqlite"]
-# SQLite stores: the native append-only store and Ephor's kagp-audit-v1 table.
-sqlite = ["dep:rusqlite"]
+sqlite = ["dep:rusqlite", "nostoi-core/sqlite", "nostoi-anchor?/sqlite", "nostoi-kmsg?/sqlite"]
 cli = ["dep:clap"]
 tui = ["cli", "dep:ratatui", "dep:crossterm"]
-# Read the Linux kernel ring buffer at /dev/kmsg (Linux only).
-kmsg = ["dep:libc", "dep:signal-hook"]
-# Anchor chain heads to S3-compatible storage (AWS S3, Cloudflare R2).
-s3 = ["dep:ureq", "dep:hmac", "dep:base64"]
+kmsg = ["dep:nostoi-kmsg"]
+s3 = ["dep:nostoi-anchor"]
 
 [dependencies]
-# arbitrary_precision keeps every number exactly as written, so a record
-# re-encodes to the very bytes its producer hashed (Python floats, big ints).
-serde_json = { version = "1", features = ["arbitrary_precision"] }
-serde = { version = "1", features = ["derive"] }
-sha2 = "0.10"
-hex = "0.4"
-thiserror = "2"
-time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+nostoi-core = { version = "0.1.0", path = "crates/nostoi-core", default-features = false }
+nostoi-anchor = { version = "0.1.0", path = "crates/nostoi-anchor", default-features = false, optional = true }
+nostoi-kmsg = { version = "0.1.0", path = "crates/nostoi-kmsg", default-features = false, optional = true }
 rusqlite = { version = "0.40", features = ["bundled", "functions"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.29", optional = true }
-libc = { version = "0.2", optional = true }
-signal-hook = { version = "0.3", optional = true }
-ureq = { version = "3", optional = true }
-hmac = { version = "0.12", optional = true }
-base64 = { version = "0.22", optional = true }
+thiserror = "2"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 
 [dev-dependencies]
 tempfile = "3"

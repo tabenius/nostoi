@@ -1,12 +1,9 @@
-use pyo3::exceptions::{PyOSError, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::path::PathBuf;
 
-fn error(e: nostoi::Error) -> PyErr {
-    match e {
-        nostoi::Error::Io { .. } => PyOSError::new_err(e.to_string()),
-        _ => PyValueError::new_err(e.to_string()),
-    }
+fn error(e: impl std::fmt::Display) -> PyErr {
+    PyValueError::new_err(e.to_string())
 }
 
 #[pyfunction]

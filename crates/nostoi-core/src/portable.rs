@@ -1,4 +1,4 @@
-//! Host-independent operations shared by Python and WIT components.
+//! Core host-independent operations shared by Python and WIT components.
 //!
 //! JSON is exchanged as text so JavaScript cannot silently round 64-bit
 //! integers. Hosts own persistence, locking and clocks. Appending returns a

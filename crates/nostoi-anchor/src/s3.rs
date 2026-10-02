@@ -1,4 +1,4 @@
-//! A small S3 client, enough to anchor a chain head.
+//! Network compartment's small S3 client, enough to anchor a chain head.
 //!
 //! Nostoi deliberately does not take the AWS SDK as a dependency: this crate
 //! keeps its tree small, and the whole surface an anchor needs is one signed

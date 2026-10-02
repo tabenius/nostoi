@@ -1,0 +1,37 @@
+# systemd unit template for kmsg-nostoi
+# Example instance: kmsg-nostoi@kernel.service
+# This file is NOT installed by the crate; copy it to /etc/systemd/system/ first.
+[Unit]
+Description=Nostoi /dev/kmsg writer (%i)
+Documentation=https://github.com/tabenius/nostoi
+After=systemd-journald.service
+Wants=systemd-journald.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=nostoi-%i
+UMask=0077
+ExecStart=/usr/local/bin/kmsg-nostoi --poll-ms 250 --actor host:kmsg /var/lib/nostoi-%i/kernel.sqlite
+SyslogIdentifier=kmsg-nostoi-%i
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=5
+# Append-only chain; do not allow the service to overwrite files it didn't create.
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/dev/kmsg /proc/sys
+# StateDirectory is writable even with ProtectSystem=strict.
+# Requires read permission on /dev/kmsg; check local distro permissions.
+NoNewPrivileges=yes
+AmbientCapabilities=
+CapabilityBoundingSet=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+PrivateTmp=yes
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target

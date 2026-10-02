@@ -146,6 +146,43 @@ fn load_nostoi(conn: &Connection) -> Result<Loaded> {
     })
 }
 
+/// Verify every record in one SQLite snapshot, retaining only the current row.
+fn verified_head(conn: &Connection) -> Result<(u64, String)> {
+    let mut stmt =
+        conn.prepare("SELECT seq, previous, digest, record FROM nostoi_records ORDER BY seq")?;
+    let mut rows = stmt.query([])?;
+    let mut head = (0u64, GENESIS.to_string());
+    while let Some(row) = rows.next()? {
+        let seq: i64 = row.get(0)?;
+        let previous: String = row.get(1)?;
+        let digest: String = row.get(2)?;
+        let text: String = row.get(3)?;
+        let entry = serde_json::from_str::<Value>(&text)
+            .map_err(|e| e.to_string())
+            .and_then(format::nostoi_entry)
+            .map_err(|detail| {
+                Error::Broken(Problem::Unreadable {
+                    at: head.0 + 1,
+                    detail,
+                })
+            })?;
+        if seq < 1 || seq as u64 != head.0 + 1 || entry.seq != seq as u64 {
+            return Err(Error::Broken(Problem::Sequence {
+                seq: entry.seq,
+                expected: head.0 + 1,
+            }));
+        }
+        if previous != head.1 || entry.previous != previous {
+            return Err(Error::Broken(Problem::Link { seq: entry.seq }));
+        }
+        if entry.digest != digest || entry.computed != digest {
+            return Err(Error::Broken(Problem::Digest { seq: entry.seq }));
+        }
+        head = (entry.seq, digest);
+    }
+    Ok(head)
+}
+
 fn strings(text: &str) -> std::result::Result<Vec<String>, String> {
     serde_json::from_str(text).map_err(|e| format!("not a JSON array of strings: {e}"))
 }
@@ -199,6 +236,9 @@ fn load_ephor(conn: &Connection) -> Result<Loaded> {
 /// Nostoi's append-only SQLite store.
 pub struct Store {
     conn: Connection,
+    /// The verified head, when this store was opened with [`Store::open_verified`].
+    /// Cached so append is O(log n) instead of re-reading the table.
+    head: Option<(u64, String)>,
 }
 
 impl Store {
@@ -210,24 +250,67 @@ impl Store {
         conn.pragma_update(None, "synchronous", "FULL")?;
         register(&conn)?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn })
+        Ok(Self { conn, head: None })
     }
 
-    /// Append a `nostoi-v1` record. The store re-verifies the chain first and
-    /// refuses to extend a broken one; the triggers check the new row again.
+    /// Open the store and verify the whole chain once, keeping the head.
+    ///
+    /// This is the store to use for a long-running writer. [`Store::append`]
+    /// then costs O(log n) per record — the trigger checks the new row against
+    /// the real head by index lookup — instead of re-reading and re-verifying
+    /// every record on every append, which is O(n) per record and therefore
+    /// quadratic over the chain's life.
+    ///
+    /// The chain is verified once, here, rather than once per append: the
+    /// trigger cannot notice a record altered *below* the head, so a writer
+    /// must not extend a chain it has not checked. Doing that check once at open
+    /// is the right place for it.
+    pub fn open_verified(path: &Path) -> Result<Self> {
+        let mut store = Self::open(path)?;
+        store.head = Some(verified_head(&store.conn)?);
+        Ok(store)
+    }
+
+    /// The cached head `(seq, digest)`, or `None` for a store opened without
+    /// verification.
+    pub fn head(&self) -> Option<(u64, &str)> {
+        self.head
+            .as_ref()
+            .map(|(seq, digest)| (*seq, digest.as_str()))
+    }
+
+    /// Append a `nostoi-v1` record. The store refuses to extend a broken chain;
+    /// the triggers check the new row again.
+    ///
+    /// On a store opened with [`Store::open_verified`] the cached head is used,
+    /// so this is O(log n). On one opened with [`Store::open`] the chain is
+    /// re-verified on every call, which is O(n) per record: correct, but slow
+    /// enough to matter for a sustained writer.
     pub fn append(&mut self, draft: Draft<'_>) -> Result<Entry> {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let loaded = load_nostoi(&tx)?;
-        let report = loaded.verify();
-        if let Some(problem) = report.problem {
-            return Err(Error::Broken(problem));
-        }
-        let (seq, previous) = match &report.head {
-            Some(head) => (head.seq + 1, head.digest.clone()),
-            None => (1, GENESIS.to_string()),
+        let current: Option<(u64, String)> = tx
+            .query_row(
+                "SELECT seq, digest FROM nostoi_records ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
+            )
+            .optional()?;
+        let current = current.unwrap_or((0, GENESIS.to_string()));
+        // Another writer advancing the head is not a broken chain. Re-verify
+        // before adopting it, while BEGIN IMMEDIATE excludes concurrent writes.
+        let head = if self.head.as_ref() == Some(&current) {
+            current
+        } else {
+            verified_head(&tx)?
         };
+        let seq = head
+            .0
+            .checked_add(1)
+            .filter(|seq| *seq <= i64::MAX as u64)
+            .ok_or_else(|| Error::Invalid("SQLite chain sequence exhausted".into()))?;
+        let previous = head.1;
         let at = draft.at.unwrap_or_else(crate::time::now);
         let record = format::nostoi_record(
             seq,
@@ -240,7 +323,7 @@ impl Store {
         )
         .map_err(Error::Invalid)?;
         let entry = format::nostoi_entry(record.clone()).map_err(Error::Invalid)?;
-        tx.execute(
+        match tx.execute(
             "INSERT INTO nostoi_records (seq, previous, digest, record) VALUES (?1, ?2, ?3, ?4)",
             params![
                 seq as i64,
@@ -248,8 +331,29 @@ impl Store {
                 entry.digest,
                 crate::canonical::to_string(&record)
             ],
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(info, msg)) => {
+                let text = format!("{:?} {:?}", info.code, msg.as_deref().unwrap_or(""));
+                if text.contains("nostoi")
+                    || text.contains("chain")
+                    || text.contains("head")
+                    || text.contains("previous")
+                    || text.contains("constraint")
+                {
+                    let loaded = load_nostoi(&tx)?;
+                    if let Some(p) = loaded.verify().problem {
+                        return Err(Error::Broken(p));
+                    }
+                }
+                return Err(rusqlite::Error::SqliteFailure(info, msg).into());
+            }
+            Err(e) => return Err(e.into()),
+        }
         tx.commit()?;
+        if self.head.is_some() {
+            self.head = Some((seq, entry.digest.clone()));
+        }
         Ok(entry)
     }
 
@@ -266,6 +370,27 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn verified_writers_adopt_a_concurrent_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.sqlite");
+        let mut first = super::Store::open_verified(&path).unwrap();
+        let mut second = super::Store::open_verified(&path).unwrap();
+        for seq in 1..=3 {
+            let writer = if seq == 2 { &mut second } else { &mut first };
+            let entry = writer
+                .append(crate::Draft {
+                    actor: None,
+                    kind: "test",
+                    subject: None,
+                    body: serde_json::json!({}),
+                    at: None,
+                })
+                .unwrap();
+            assert_eq!(entry.seq, seq);
+        }
+        assert!(first.load().unwrap().verify().ok);
+    }
     use super::*;
     use serde_json::json;
 

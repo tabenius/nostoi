@@ -5,8 +5,8 @@
 //! `ssh-keygen` on the host; when it is missing the tests say so instead of
 //! failing mysteriously.
 
-use nostoi::attest::{self, Signer, Verifier};
-use nostoi::attestation::{self, Canonicality, Coverage, Sidecars};
+use nostoi::attest::{self, KeyEncryption, Signer, Verifier};
+use nostoi::attestation::{self, Attestation, Canonicality, Coverage, Sidecars};
 use nostoi::Draft;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -131,6 +131,11 @@ impl Fixture {
         let mut verifier = Verifier::new(&self.allowed_signers, PRINCIPAL);
         verifier.program = ssh_keygen().expect("ssh-keygen");
         verifier
+    }
+
+    /// The attestation currently on disk, without checking its signature.
+    fn read_attestation(&self) -> Attestation {
+        attest::read(&self.chain).unwrap().unwrap().attestation
     }
 
     fn pinned(&self) -> Verifier {
@@ -608,6 +613,147 @@ fn a_passphrase_protected_key_is_explained_not_reported_as_a_wrong_passphrase() 
         said.contains("interactive terminal") || said.contains("ssh-agent"),
         "the failure must name the real cause, not repeat ssh-keygen's wording: {said}"
     );
+}
+
+#[test]
+fn key_encryption_is_read_from_the_file_before_anything_is_run() {
+    let Some(program) = ssh_keygen() else { return };
+    let dir = tempfile::tempdir().unwrap();
+
+    // Unencrypted: detected without running ssh-keygen, so the answer is
+    // available even where the tool cannot prompt.
+    let plain = usable_key(dir.path());
+    assert_eq!(attest::key_encryption(&plain), KeyEncryption::None);
+
+    // Traditional PEM with a DEK-Info header.
+    let pem = dir.path().join("traditional.pem");
+    std::fs::write(
+        &pem,
+        "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\nabc\n-----END RSA PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    assert_eq!(attest::key_encryption(&pem), KeyEncryption::Encrypted);
+
+    // A file we do not recognise says so rather than guessing.
+    let unknown = dir.path().join("notes.txt");
+    std::fs::write(&unknown, "not a key at all\n").unwrap();
+    assert_eq!(attest::key_encryption(&unknown), KeyEncryption::Unknown);
+    assert_eq!(
+        attest::key_encryption(&dir.path().join("absent")),
+        KeyEncryption::Unknown
+    );
+
+    // And the pre-flight refuses before ssh-keygen can complain about a
+    // passphrase that was never mistyped.
+    let chain = chain(dir.path(), 1);
+    let locked = dir.path().join("id_locked");
+    std::process::Command::new(&program)
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "a-passphrase",
+            "-C",
+            "locked@host",
+            "-f",
+            &locked.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(attest::key_encryption(&locked), KeyEncryption::Encrypted);
+
+    let mut signer = Signer::new(&locked, "locked@host");
+    signer.program = program;
+    let error = attest::sign(&chain, "kernel", None, &signer, None).unwrap_err();
+    let said = error.to_string();
+    assert!(said.contains("no terminal"), "{said}");
+    // The pre-flight message, not ssh-keygen's "incorrect passphrase".
+    assert!(!said.contains("incorrect passphrase"), "{said}");
+    assert!(
+        !said.contains("@@@@"),
+        "the banner is not a message: {said}"
+    );
+}
+
+#[test]
+fn an_encrypted_key_is_only_asked_for_once() {
+    let Some(program) = ssh_keygen() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("id_locked");
+    std::process::Command::new(&program)
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "a-passphrase",
+            "-C",
+            "locked@host",
+            "-f",
+            &locked.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    // ssh-keygen writes the .pub beside the private key even for an encrypted
+    // one, so the allowed_signers line can be built without a second prompt.
+    let sidecar = locked.with_file_name("id_locked.pub");
+    assert!(
+        sidecar.is_file(),
+        "ssh-keygen should have written {}",
+        sidecar.display()
+    );
+    let line = attest::allowed_signers_line(&program, &locked, "locked@host").unwrap();
+    assert!(line.starts_with("locked@host ssh-ed25519 "), "{line}");
+}
+
+#[test]
+fn display_output_is_never_read_back_or_compared() {
+    let fixture = fixture!();
+    fixture.sign();
+
+    // Everything shown to a human is rendered from the parsed document, so there
+    // is no path by which what someone saw can become what was checked. This test
+    // pins that by mangling every rendering and confirming verification is
+    // unmoved: if any of these were compared, or re-read, it would fail.
+    let sidecars = Sidecars::for_chain(&fixture.chain);
+    let canonical = std::fs::read(&sidecars.document).unwrap();
+
+    for rendered in [
+        serde_json::to_string_pretty(&fixture.read_attestation()).unwrap(),
+        format!("{}\n\n", String::from_utf8_lossy(&canonical)),
+        canonical
+            .iter()
+            .rev()
+            .map(|b| *b as char)
+            .collect::<String>(),
+        canonical
+            .iter()
+            .map(|b| char::from(b.to_ascii_uppercase()))
+            .collect::<String>(),
+    ] {
+        assert_ne!(rendered, String::from_utf8_lossy(&canonical));
+        // The canonical bytes are a function of the content alone, so a rendering
+        // cannot change them.
+        assert_eq!(
+            fixture.read_attestation().canonical_bytes().unwrap(),
+            canonical
+        );
+        let checked = attest::verify(&fixture.chain, &fixture.pinned()).unwrap();
+        assert_eq!(checked.attestation.canonical_bytes().unwrap(), canonical);
+        assert!(checked.covers_head());
+    }
+
+    // And nothing in the read-only reporting path writes to the chain or its
+    // sidecars.
+    let before = std::fs::read(&sidecars.document).unwrap();
+    let summary = nostoi::attest::summary(&fixture.chain, checked_head(&fixture.chain));
+    assert!(summary.contains("attested by"), "{summary}");
+    assert_eq!(std::fs::read(&sidecars.document).unwrap(), before);
+}
+
+fn checked_head(chain: &Path) -> u64 {
+    nostoi::verify(chain, None).unwrap().head.unwrap().seq
 }
 
 #[test]

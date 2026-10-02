@@ -162,6 +162,14 @@ pub struct Retention {
 }
 
 impl Client {
+    /// Non-secret identity of the destination, including addressing semantics.
+    pub fn target_identity(&self) -> String {
+        serde_json::json!({
+            "endpoint": format!("{}://{}", self.scheme, self.host),
+            "bucket": self.bucket, "region": self.region, "path_style": self.path_style,
+        })
+        .to_string()
+    }
     /// Build a client for `endpoint` (for example
     /// `https://<account>.r2.cloudflarestorage.com` or
     /// `https://s3.us-west-2.amazonaws.com`).
@@ -585,6 +593,11 @@ fn split_endpoint(endpoint: &str) -> Result<(String, String)> {
         return Err(Error::S3(format!("unsupported scheme: {scheme}")));
     }
     let authority = rest.split('/').next().unwrap_or("");
+    if authority.contains(['@', '?', '#']) || authority.chars().any(char::is_control) {
+        return Err(Error::S3(
+            "endpoint authority must not contain credentials, query or fragment".into(),
+        ));
+    }
     if authority.is_empty() {
         return Err(Error::S3(format!("endpoint has no host: {endpoint}")));
     }

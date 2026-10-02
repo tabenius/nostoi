@@ -76,6 +76,20 @@ linear scan; it does not establish production throughput or peak memory.
 
 Remaining queue:
 
+### Schema-versioning prerequisite — 2026-10-02
+
+Audit and outbox databases now have distinct application IDs, independent
+revision-1 counters and creation/migration metadata. Supported legacy adoption
+is transactional and validates historical DDL before stamping. Read-only
+verification recognizes compatible legacy data without mutation. Newer/wrong
+identities and inconsistent metadata are refused before persistent changes.
+Prepared envelopes and kmsg payloads have independent v1 tags with explicit
+legacy decoding and future-version refusal. Existing records, digests, saved
+request strings, upload bytes and retention deadlines are preserved. The
+read-only metadata command and full contract are documented in
+`docs/SCHEMA-VERSIONING.md`. These identities must survive the proposed crate
+split; schema migration is not a license to rewrite immutable evidence.
+
 ### Streaming, diagnostics and measurement batch — 2026-10-02
 
 The three parallel branches are integrated: `codex/streaming-checkpoints`,

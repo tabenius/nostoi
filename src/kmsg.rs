@@ -40,6 +40,8 @@
 //! further unescaping to be chained.
 
 use std::fs::File;
+
+pub const KMSG_PAYLOAD_V1: &str = "nostoi-kmsg-v1";
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;

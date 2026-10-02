@@ -31,6 +31,8 @@ use time::{Duration, OffsetDateTime, UtcOffset};
 use crate::error::{Error, Result};
 use crate::s3::{Client, LockMode as S3LockMode, ObjectLock, Provider, PutOptions};
 
+pub const PREPARED_ANCHOR_V1: &str = "nostoi-prepared-anchor-v1";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LockMode {
     Governance,
@@ -185,6 +187,13 @@ pub fn anchor_head(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedAnchor {
+    /// Missing only in historical persisted envelopes; those bytes are not rewritten.
+    #[serde(
+        default,
+        deserialize_with = "prepared_version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) v: Option<String>,
     pub(crate) anchor: Anchor,
     pub(crate) body: Vec<u8>,
     pub(crate) only_if_absent: bool,
@@ -192,10 +201,23 @@ pub struct PreparedAnchor {
     pub(crate) retain_days: i64,
 }
 
+fn prepared_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
+}
+
 impl PreparedAnchor {
     /// Check internal consistency before trusting a deserialized request.
     /// This detects inconsistent intents, not a complete malicious rewrite.
     pub(crate) fn validate(&self, durable: bool) -> Result<()> {
+        if self.v.as_deref().is_some_and(|v| v != PREPARED_ANCHOR_V1) {
+            return Err(Error::UnsupportedSchema {
+                component: "prepared anchor request",
+                found: self.v.as_deref().unwrap().chars().take(128).collect(),
+                supported: PREPARED_ANCHOR_V1.into(),
+            });
+        }
         let invalid = |detail: &str| Error::Invalid(format!("invalid prepared anchor: {detail}"));
         let anchor = &self.anchor;
         if durable && !self.only_if_absent {
@@ -378,6 +400,7 @@ pub fn prepare_anchor(
     let body = serde_json::to_vec_pretty(&anchor)
         .map_err(|error| Error::S3(format!("serialize anchor: {error}")))?;
     Ok(PreparedAnchor {
+        v: Some(PREPARED_ANCHOR_V1.into()),
         anchor,
         body,
         only_if_absent: options.only_if_absent,

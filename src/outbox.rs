@@ -29,25 +29,28 @@ impl Outbox {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA synchronous=FULL;")?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let foreign: i64 = tx.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT IN ('outbox_meta','anchor_intents','anchor_outcomes') AND name NOT LIKE 'sqlite_%'",
-            [], |r| r.get(0),
-        )?;
-        if foreign != 0 {
-            return Err(Error::Invalid(
-                "outbox must be a dedicated database, not an audit or foreign database".into(),
-            ));
-        }
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS outbox_meta (id INTEGER PRIMARY KEY CHECK(id=1), source TEXT NOT NULL, target TEXT);
-             CREATE TABLE IF NOT EXISTS anchor_intents (key TEXT PRIMARY KEY, request TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS anchor_outcomes (key TEXT PRIMARY KEY REFERENCES anchor_intents(key), state TEXT NOT NULL CHECK(state IN ('pending','unresolved','rejected','confirmed')));
-             CREATE TRIGGER IF NOT EXISTS immutable_intents_update BEFORE UPDATE ON anchor_intents BEGIN SELECT RAISE(ABORT, 'immutable anchor intent'); END;
-             CREATE TRIGGER IF NOT EXISTS immutable_intents_delete BEFORE DELETE ON anchor_intents BEGIN SELECT RAISE(ABORT, 'immutable anchor intent'); END;"
-        )?;
+        crate::schema::check(&tx, crate::schema::Component::Outbox, true)?;
         let source_name = source
             .to_str()
             .ok_or_else(|| Error::Invalid("source path must be UTF-8".into()))?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='outbox_meta')",
+            [],
+            |r| r.get(0),
+        )?;
+        if exists {
+            let original: Option<String> = tx
+                .query_row("SELECT source FROM outbox_meta WHERE id=1", [], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            if original.as_deref() != Some(source_name) {
+                return Err(Error::Invalid(
+                    "outbox belongs to a different or unknown source audit file".into(),
+                ));
+            }
+        }
+        crate::schema::initialize(&tx, crate::schema::Component::Outbox)?;
         tx.execute(
             "INSERT OR IGNORE INTO outbox_meta(id,source) VALUES(1,?1)",
             [source_name],

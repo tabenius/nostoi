@@ -275,6 +275,7 @@ impl Writer {
     }
 
     fn append(&mut self, kind: &str, mut body: Value, print: bool) -> Result<(), Error> {
+        body["schema"] = json!(kmsg::KMSG_PAYLOAD_V1);
         body["boot_id"] = json!(self.boot_id);
         body["source"] = json!(self.source);
         let draft = Draft {
@@ -314,6 +315,20 @@ impl Writer {
                 let record: Value =
                     serde_json::from_str(&text).map_err(|e| Error::Invalid(e.to_string()))?;
                 let body = &record["body"];
+                if let Some(version) = body.get("schema") {
+                    if version.as_str() != Some(kmsg::KMSG_PAYLOAD_V1) {
+                        return Err(Error::UnsupportedSchema {
+                            component: "kmsg checkpoint payload",
+                            found: version
+                                .as_str()
+                                .unwrap_or("<non-string>")
+                                .chars()
+                                .take(128)
+                                .collect(),
+                            supported: kmsg::KMSG_PAYLOAD_V1.into(),
+                        });
+                    }
+                }
                 Ok(Checkpoint {
                     boot_id: body["boot_id"].as_str().map(str::to_owned),
                     source: body["source"].as_str().map(str::to_owned),

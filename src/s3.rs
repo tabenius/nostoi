@@ -30,6 +30,7 @@
 //! which of the two applies so the caller can fail rather than silently write
 //! unless it is told locking is handled.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -134,6 +135,7 @@ pub struct Client {
     path_style: bool,
     credentials: Credentials,
     agent: ureq::Agent,
+    signing_clock: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
 }
 
 /// What to send with a `PutObject`.
@@ -185,7 +187,20 @@ impl Client {
             path_style,
             credentials,
             agent,
+            signing_clock: Arc::new(OffsetDateTime::now_utc),
         })
+    }
+
+    /// Set the clock used for Signature Version 4 timestamps.
+    ///
+    /// Defaults to [`OffsetDateTime::now_utc`]. The clock is called once for
+    /// each send attempt, including retries, and its value is normalized to UTC.
+    pub fn with_signing_clock<F>(mut self, clock: F) -> Self
+    where
+        F: Fn() -> OffsetDateTime + Send + Sync + 'static,
+    {
+        self.signing_clock = Arc::new(clock);
+        self
     }
 
     /// Upload `body` to `key`, optionally under an Object Lock.
@@ -265,48 +280,31 @@ impl Client {
         key: &str,
         raw_query: &str,
         canonical_query: &str,
-        mut headers: Vec<(String, String)>,
+        headers: Vec<(String, String)>,
         body: &[u8],
     ) -> Result<Response> {
         let (url, host, canonical_uri) = self.target(key, raw_query);
         let payload_hash = sha256_hex(body);
-        let now = OffsetDateTime::now_utc();
-        let amz_date = format_amz_date(&now)?;
-        let date = format_amz_day(&now)?;
-
-        headers.push(("host".to_string(), host.clone()));
-        headers.push(("x-amz-content-sha256".to_string(), payload_hash.clone()));
-        headers.push(("x-amz-date".to_string(), amz_date.clone()));
-        if let Some(token) = &self.credentials.session_token {
-            headers.push(("x-amz-security-token".to_string(), token.clone()));
-        }
-
-        let (authorization, signed_headers) = sign(SigningInput {
-            credentials: &self.credentials,
-            region: &self.region,
-            service: "s3",
-            amz_date: &amz_date,
-            date: &date,
-            method,
-            canonical_uri: &canonical_uri,
-            canonical_query,
-            headers: &headers,
-            payload_hash: &payload_hash,
-        });
-
-        // ureq sets Host from the URL; signing it is enough.
-        let send_headers: Vec<(&str, &str)> = signed_headers
-            .iter()
-            .filter(|(name, _)| !name.eq_ignore_ascii_case("host"))
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect();
-
         let retryable = method == "GET"
             || headers
                 .iter()
                 .any(|(name, value)| name == "if-none-match" && value == "*");
         let mut attempt = 0;
         let response = loop {
+            let (authorization, signed_headers) = self.sign_request(
+                method,
+                &host,
+                &canonical_uri,
+                canonical_query,
+                &payload_hash,
+                headers.clone(),
+            )?;
+            // ureq sets Host from the URL; signing it is enough.
+            let send_headers: Vec<(&str, &str)> = signed_headers
+                .iter()
+                .filter(|(name, _)| !name.eq_ignore_ascii_case("host"))
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
             let response = match method {
                 "PUT" => {
                     let mut request = self.agent.put(&url);
@@ -370,6 +368,41 @@ impl Client {
             }),
             Err(error) => Err(Error::S3(error.to_string())),
         }
+    }
+
+    /// Build fresh signing headers for one send attempt.
+    fn sign_request(
+        &self,
+        method: &str,
+        host: &str,
+        canonical_uri: &str,
+        canonical_query: &str,
+        payload_hash: &str,
+        mut headers: Vec<(String, String)>,
+    ) -> Result<(String, Vec<(String, String)>)> {
+        let now = (self.signing_clock)();
+        let amz_date = format_amz_date(&now)?;
+        let date = format_amz_day(&now)?;
+
+        headers.push(("host".to_string(), host.to_string()));
+        headers.push(("x-amz-content-sha256".to_string(), payload_hash.to_string()));
+        headers.push(("x-amz-date".to_string(), amz_date.clone()));
+        if let Some(token) = &self.credentials.session_token {
+            headers.push(("x-amz-security-token".to_string(), token.clone()));
+        }
+
+        Ok(sign(SigningInput {
+            credentials: &self.credentials,
+            region: &self.region,
+            service: "s3",
+            amz_date: &amz_date,
+            date: &date,
+            method,
+            canonical_uri,
+            canonical_query,
+            headers: &headers,
+            payload_hash,
+        }))
     }
 
     /// The URL, the `Host` header value, and the canonical URI for `key`.
@@ -571,6 +604,149 @@ mod tests {
             access_key: "AKIDEXAMPLE".into(),
             secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
             session_token: None,
+        }
+    }
+
+    #[test]
+    fn injected_signing_clock_has_deterministic_utc_timestamp_and_signature() {
+        let client = Client::new(
+            "https://s3.amazonaws.com",
+            "bucket",
+            "us-east-1",
+            true,
+            example_credentials(),
+        )
+        .unwrap()
+        .with_signing_clock(|| time::macros::datetime!(2015-08-31 01:59:59 +02:00));
+        let (authorization, headers) = client
+            .sign_request(
+                "GET",
+                "s3.amazonaws.com",
+                "/bucket/key",
+                "",
+                &sha256_hex(b""),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(name, _)| name == "x-amz-date")
+                .unwrap()
+                .1,
+            "20150830T235959Z"
+        );
+        assert_eq!(
+            authorization,
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+             Signature=3ddf05fa0a32eab23c4a59d783436786ccbfd83d7898d1b2880bfdd107022a06"
+        );
+    }
+
+    #[test]
+    fn retries_sign_afresh_with_the_injected_clock() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for method in ["GET", "PUT"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let host = listener.local_addr().unwrap().to_string();
+            let server = std::thread::spawn(move || {
+                let mut requests = Vec::new();
+                for status in ["503 Service Unavailable", "429 Too Many Requests", "200 OK"] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut request = String::new();
+                    loop {
+                        let mut line = String::new();
+                        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        request.push_str(&line);
+                    }
+                    requests.push(request);
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                }
+                requests
+            });
+            let calls = Arc::new(AtomicUsize::new(0));
+            let clock_calls = Arc::clone(&calls);
+            let start = time::macros::datetime!(2015-08-30 23:59:59 UTC);
+            let client = Client::new(
+                &format!("http://{host}"),
+                "bucket",
+                "us-east-1",
+                true,
+                example_credentials(),
+            )
+            .unwrap()
+            .with_signing_clock(move || {
+                start + time::Duration::seconds(clock_calls.fetch_add(1, Ordering::SeqCst) as i64)
+            });
+            let headers = if method == "PUT" {
+                vec![("if-none-match".to_string(), "*".to_string())]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                client
+                    .send(method, "key", "", "", headers.clone(), &[])
+                    .unwrap()
+                    .status,
+                200
+            );
+            let requests = server.join().unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            for (attempt, request) in requests.iter().enumerate() {
+                let now = start + time::Duration::seconds(attempt as i64);
+                let amz_date = format_amz_date(&now).unwrap();
+                let date = format_amz_day(&now).unwrap();
+                let payload_hash = sha256_hex(b"");
+                let mut expected_headers = headers.clone();
+                expected_headers.extend([
+                    ("host".to_string(), host.clone()),
+                    ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+                    ("x-amz-date".to_string(), amz_date.clone()),
+                ]);
+                let (expected_authorization, _) = sign(SigningInput {
+                    credentials: &example_credentials(),
+                    region: "us-east-1",
+                    service: "s3",
+                    amz_date: &amz_date,
+                    date: &date,
+                    method,
+                    canonical_uri: "/bucket/key",
+                    canonical_query: "",
+                    headers: &expected_headers,
+                    payload_hash: &payload_hash,
+                });
+                let wire_headers: Vec<_> = request
+                    .lines()
+                    .skip(1)
+                    .map(|line| line.split_once(": ").unwrap())
+                    .collect();
+                for (name, expected) in [
+                    ("x-amz-date", amz_date),
+                    ("authorization", expected_authorization),
+                ] {
+                    let values: Vec<_> = wire_headers
+                        .iter()
+                        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                        .map(|(_, value)| *value)
+                        .collect();
+                    assert_eq!(values, vec![expected.as_str()]);
+                }
+            }
         }
     }
 

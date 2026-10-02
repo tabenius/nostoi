@@ -556,8 +556,8 @@ pub fn canonicalize(chain: &Path, verified: &nostoi_core::attestation::Document)
 
 /// Sign bytes with `ssh-keygen -Y sign`.
 fn sign_bytes(program: &Path, key: &Path, namespace: &str, document: &[u8]) -> Result<Vec<u8>> {
-    // ssh-keygen signs a file and writes `<file>.sig`, so the bytes go to a
-    // private temporary directory that is removed afterwards.
+    // ssh-keygen signs a file and writes `<file>.sig` beside it, so the bytes go
+    // to a private temporary directory that removes itself.
     let dir = temp_dir("nostoi-attest")?;
     let path = dir.join("attestation.json");
     std::fs::write(&path, document).map_err(crate::error::io(&path))?;

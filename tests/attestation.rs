@@ -71,6 +71,22 @@ fn signer(key: &Path) -> Signer {
     signer
 }
 
+/// The committed fixture key's fingerprint, as a literal.
+///
+/// A known-answer test. Every other test derives the fingerprint at runtime,
+/// which means a parser that returned the wrong token would be wrong on both
+/// sides and the suite would still be green. This one cannot be.
+const FIXTURE_FINGERPRINT: &str = "SHA256:WUWp9u0c5YvfhNzCTTKwA5Am4wOtbQF4/owhgXOeukk";
+
+/// The committed trust anchor, as a deployment provisions it.
+fn fixture_allowed_signers() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/allowed_signers")
+}
+
+fn fixture_key() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/id_ed25519")
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     chain: PathBuf,
@@ -142,6 +158,108 @@ macro_rules! fixture {
             }
         }
     };
+}
+
+#[test]
+fn the_committed_fixture_key_has_the_fingerprint_this_suite_expects() {
+    let Some(program) = ssh_keygen() else { return };
+    // If the fixture key is ever regenerated, this fails and the constant above
+    // has to move with it. That is the point: it makes the fingerprint a known
+    // answer rather than something derived from the same code under test.
+    assert_eq!(
+        attest::fingerprint(&program, &fixture_key()).unwrap(),
+        FIXTURE_FINGERPRINT,
+        "tests/fixtures/id_ed25519 was replaced; update FIXTURE_FINGERPRINT"
+    );
+    // And the public key is read from the .pub sidecar, not by decrypting.
+    let sidecar = fixture_key().with_file_name("id_ed25519.pub");
+    let public = std::fs::read_to_string(sidecar).unwrap();
+    assert_eq!(
+        attest::allowed_signers_line(&program, &fixture_key(), "alice@laptop").unwrap(),
+        format!("alice@laptop {}", public.trim()),
+        "the line keeps the key's own comment, which is what ssh-keygen writes"
+    );
+}
+
+/// A private key copy that ssh-keygen will accept.
+///
+/// It refuses a key file other users can read, which is a deliberate safety
+/// property and also the reason a committed fixture cannot be signed with
+/// directly: git checks out a fresh clone as 0644. Copying and tightening is
+/// what an operator does too.
+fn usable_key(dir: &Path) -> PathBuf {
+    let key = dir.join("id_ed25519");
+    std::fs::copy(fixture_key(), &key).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    key
+}
+
+#[test]
+fn a_world_readable_private_key_is_refused_with_an_explanation() {
+    let Some(program) = ssh_keygen() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain(dir.path(), 1);
+    let key = usable_key(dir.path());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let mut signer = Signer::new(&key, "alice@laptop");
+    signer.program = program;
+
+    let error = attest::sign(&chain, "production/kernel", None, &signer, None).unwrap_err();
+    let said = error.to_string();
+    assert!(
+        said.contains("PRIVATE KEY") || said.contains("UNPROTECTED"),
+        "ssh-keygen's refusal should survive into the message: {said}"
+    );
+}
+
+#[test]
+fn a_signature_by_a_committed_fixture_key_verifies_against_the_committed_anchor() {
+    let Some(program) = ssh_keygen() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain(dir.path(), 2);
+    let mut signer = Signer::new(usable_key(dir.path()), "alice@laptop");
+    signer.program = program.clone();
+
+    let signed = attest::sign(&chain, "production/kernel", None, &signer, None).unwrap();
+    attest::write(&chain, &signed).unwrap();
+    assert_eq!(signed.attestation.fingerprint, FIXTURE_FINGERPRINT);
+
+    // The first principal in a comma-separated entry verifies, and so does the
+    // second: real allowed_signers files list several names per key.
+    for principal in ["alice@laptop", "alice@workstation"] {
+        let mut verifier = Verifier::new(fixture_allowed_signers(), principal);
+        verifier.program = program.clone();
+        verifier.fingerprint = Some(FIXTURE_FINGERPRINT.to_string());
+        let checked = attest::verify(&chain, &verifier)
+            .unwrap_or_else(|error| panic!("{principal} should verify: {error}"));
+        assert!(checked.covers_head());
+    }
+
+    // Options in the file do not narrow an entry for a plain public key. The same
+    // key blob listed under a second principal verifies for that principal too,
+    // with `cert-authority`, `principals=` and an expiry all present. Those
+    // options constrain *certificates*; they are not an access control on a raw
+    // key. Worth knowing before anyone assumes otherwise, and another reason the
+    // fingerprint pin is the thing that has to be right.
+    let mut verifier = Verifier::new(fixture_allowed_signers(), "contractor@laptop");
+    verifier.program = program;
+    let checked = attest::verify(&chain, &verifier)
+        .unwrap_or_else(|error| panic!("the same key is trusted for both: {error}"));
+    assert_eq!(checked.attestation.fingerprint, FIXTURE_FINGERPRINT);
+
+    // A principal the file does not mention at all is still refused.
+    let mut verifier = Verifier::new(fixture_allowed_signers(), "stranger@elsewhere");
+    verifier.program = ssh_keygen().unwrap();
+    let error = attest::verify(&chain, &verifier).unwrap_err();
+    assert!(error.to_string().contains("does not verify"), "{error}");
 }
 
 #[test]

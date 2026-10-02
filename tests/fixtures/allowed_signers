@@ -1,0 +1,4 @@
+# A trust anchor as a deployment provisions it: several principals in one file.
+# One entry carries options, so the parser is not only ever tested on a bare line.
+alice@laptop,alice@workstation ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKXeEd2NovCBIWcayuLQk8T0rzr9LcWI9zN8AqPaRJMc
+contractor@laptop ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKXeEd2NovCBIWcayuLQk8T0rzr9LcWI9zN8AqPaRJMc cert-authority,principals="contractor@laptop" expiry-time="20380101000000"

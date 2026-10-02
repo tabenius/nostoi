@@ -661,16 +661,23 @@ fn parse_fingerprint(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The first line of a tool's output that says something.
+///
+/// ssh-keygen frames some refusals in a box of `@` characters, and the banner is
+/// the first line while the actual complaint is four lines down. Reporting the
+/// banner would be reporting nothing.
 fn first_line(text: &str) -> String {
+    const NOISE: &[char] = &['@', '!', '-', '=', '#', '*', ' '];
     let line = text
         .lines()
-        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.chars().all(|c| NOISE.contains(&c)))
         .unwrap_or("");
-    let trimmed = line.trim();
-    if trimmed.len() > 200 {
-        format!("{}…", &trimmed[..200])
+    let trimmed: String = line.chars().take(200).collect();
+    if line.chars().count() > 200 {
+        format!("{trimmed}…")
     } else {
-        trimmed.to_string()
+        trimmed
     }
 }
 

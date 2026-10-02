@@ -46,13 +46,41 @@ identical and mismatched 412 anchor reconciliation, absent retention, wrong mode
 short retention, and successful verified retention. The all-feature suite now
 passes 41 unit tests, 10 integration tests and one doctest; strict Clippy passes.
 
-1. Expand HTTP tests to cover ambiguous uploads (connection loss after commit).
-2. Add injected read failures to exercise EPIPE/EINVAL and the buffer ceiling;
-   regular-file fixtures are not a full char-device simulation.
+Recovery follow-up (`codex/ingest-recovery`) verifies a PUT whose response is
+lost after the mock stores it: retry uses the same payload and conditional key,
+receives 412, then GET reconciles the existing anchor. A 403 is not retried.
+Kernel fault-injection tests exercise EPIPE followed by EAGAIN then a record,
+EINTR retry, EINVAL buffer growth, and the 1 MiB allocation ceiling. No exact
+loss count is reported until a subsequent sequence number makes it knowable.
+
+### Updated benchmark — 2026-10-02
+
+Command: `cargo run --release --example scale -- /home/xyzzy/.cache`.
+Parent filesystem: ext4 (`findmnt -T`), not tmpfs. SQLite remains WAL with
+`synchronous=FULL`; one commit per append. The benchmark now creates an isolated
+temporary directory rather than deleting fixed filenames.
+
+| Chain size at end of measured window | SQLite re-verify every append | Verified long-lived writer |
+| --- | ---: | ---: |
+| 500 | 1.5925 ms/append | 0.7094 ms/append |
+| 1,000 | 3.1440 ms/append | 0.4447 ms/append |
+| 2,000 | 5.5308 ms/append | 0.4439 ms/append |
+| 4,000 | 10.5152 ms/append | 0.4380 ms/append |
+| 10,000 | not measured | 0.6604 ms/append |
+| 20,000 | not measured | 0.4447 ms/append |
+
+These are window averages, not cumulative averages or latency percentiles.
+Full streaming startup verification took 13.927 ms for 4,000 records and
+75.127 ms for 20,000. This single local run supports removing the per-append
+linear scan; it does not establish production throughput or peak memory.
+
+Remaining queue:
+
+1. Extend ambiguous-upload coverage to locked objects and exhausted retries.
+2. Validate kernel-device behavior on additional distro/kernel configurations.
 3. Add clock-skew diagnostics. Do not fabricate a
    skew offset; synchronize the host clock instead.
-4. Benchmark startup peak memory and append latency at larger chain sizes. The
-   earlier timings predate these edits and have not been remeasured.
+4. Measure startup peak memory and append latency percentiles at larger sizes.
 5. Test against a real Object-Lock-enabled S3 bucket and an R2 locked prefix
    when deployment credentials are available. R2 bucket locking is configured
    out of band and cannot be verified through GetObjectRetention.

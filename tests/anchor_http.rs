@@ -94,6 +94,12 @@ where
             };
             let request = read_request(&mut stream);
             let (status, body) = respond(index, &request);
+            // An empty status deliberately drops the connection after reading
+            // the upload, simulating storage succeeding but its receipt being lost.
+            if status.is_empty() {
+                requests.push(request);
+                continue;
+            }
             write!(
                 stream,
                 "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -198,6 +204,47 @@ fn conditional_412_reconciles_identical_head_and_returns_existing_anchor() {
     assert_eq!(anchor.digest, uploaded.digest);
     assert_eq!(anchor.seq, uploaded.seq);
     assert_eq!(anchor.anchored_at, "2026-01-02T00:00:00Z");
+}
+
+#[test]
+fn committed_upload_with_lost_receipt_is_reconciled_without_overwrite() {
+    let mut existing = String::new();
+    let (client, server) = server(3, move |index, request| match index {
+        0 => {
+            assert_put(request, false);
+            existing = String::from_utf8(request.body.clone()).unwrap();
+            ("", String::new())
+        }
+        1 => {
+            assert_put(request, false);
+            assert_eq!(request.body, existing.as_bytes());
+            ("412 Precondition Failed", String::new())
+        }
+        _ => {
+            assert_eq!(request.line, format!("GET {OBJECT} HTTP/1.1"));
+            ("200 OK", existing.clone())
+        }
+    });
+    let result = call_anchor(&client, None);
+    let requests = server.join().unwrap();
+    let anchor = result.unwrap();
+    let uploaded: Anchor = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(anchor.digest, uploaded.digest);
+    assert_eq!(anchor.anchored_at, uploaded.anchored_at);
+}
+
+#[test]
+fn permission_denied_upload_is_not_retried() {
+    let (client, server) = server(1, |_, request| {
+        assert_put(request, false);
+        (
+            "403 Forbidden",
+            "<Error><Code>AccessDenied</Code></Error>".into(),
+        )
+    });
+    let result = call_anchor(&client, None);
+    server.join().unwrap();
+    assert!(matches!(result, Err(Error::S3(message)) if message.contains("403")));
 }
 
 #[test]

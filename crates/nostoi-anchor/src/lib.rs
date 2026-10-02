@@ -13,11 +13,15 @@
 //! - [`verify_checkpoint`] compares a local chain against a trusted remote
 //!   checkpoint and names the first sequence that no longer fits.
 //!
+//! [`fanout`] publishes one checkpoint to several independent destinations and
+//! requires them to agree before trusting any of them.
+//!
 //! See [`anchor`] for provider differences (AWS S3 Object Lock and Cloudflare R2
 //! bucket locks) and [`outbox`] for the recovery contract.
 
 pub mod anchor;
 mod error;
+pub mod fanout;
 #[cfg(feature = "sqlite")]
 pub mod outbox;
 pub mod s3;

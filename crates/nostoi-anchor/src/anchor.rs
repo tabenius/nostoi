@@ -33,6 +33,11 @@ use crate::s3::{Client, LockMode as S3LockMode, ObjectLock, Provider, PutOptions
 
 pub const PREPARED_ANCHOR_V1: &str = "nostoi-prepared-anchor-v1";
 
+/// Object Lock mode.
+///
+/// The serde names are the ones already persisted inside durable outbox
+/// intents, so they must not be renamed; the lowercase spellings accepted in
+/// configuration are handled by the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LockMode {
     Governance,

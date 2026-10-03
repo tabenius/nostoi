@@ -75,6 +75,11 @@ pub struct Signed {
     pub allowed_signers_line: String,
     /// What the previous attestation covered, when one was replaced.
     pub replaced: Option<Attestation>,
+    /// Kept so `with_description` can re-sign without being handed the key again.
+    key: PathBuf,
+    principal: String,
+    namespace: String,
+    program: PathBuf,
 }
 
 /// How to verify.
@@ -333,6 +338,42 @@ pub fn sign(
         signature,
         allowed_signers_line,
         replaced,
+        key: signer.key.clone(),
+        principal: signer.principal.clone(),
+        namespace: signer.namespace.clone(),
+        program: signer.program.clone(),
+    })
+}
+
+/// Add the optional human-facing fields and re-sign.
+///
+/// The fields live inside the signed bytes, so adding them afterwards would break
+/// the signature. Re-signing is the honest way to do it, and the timestamp moves
+/// with it — correctly, because this is a new attestation made now rather than a
+/// relabelling of an old one.
+///
+/// Named for the re-sign rather than the fields: [`describe`] already means "one
+/// line about an attestation".
+pub fn with_description(
+    signed: Signed,
+    described: nostoi_core::attestation::Described,
+) -> Result<Signed> {
+    let attestation = signed
+        .attestation
+        .describe(described)
+        .map_err(Error::from)?;
+    let document = attestation.canonical_bytes()?;
+    let signature = sign_bytes(&signed.program, &signed.key, &signed.namespace, &document)?;
+    Ok(Signed {
+        attestation,
+        document,
+        signature,
+        allowed_signers_line: signed.allowed_signers_line,
+        replaced: signed.replaced,
+        key: signed.key,
+        principal: signed.principal,
+        namespace: signed.namespace,
+        program: signed.program,
     })
 }
 
@@ -596,6 +637,21 @@ pub struct CheckedBundle {
     pub canonical_bytes: Vec<u8>,
 }
 
+/// Serialize a bundle to the exact bytes to publish.
+pub fn to_json(bundle: &Bundle) -> Result<String> {
+    nostoi_core::bundle::to_json(bundle).map_err(Error::from)
+}
+
+/// Read a bundle from disk.
+pub fn read_bundle(path: &Path) -> Result<Bundle> {
+    nostoi_core::bundle::read_bundle(path).map_err(Error::from)
+}
+
+/// Write a bundle, refusing to write through a symlink.
+pub fn write_bundle(path: &Path, bundle: &Bundle) -> Result<()> {
+    nostoi_core::bundle::write_bundle(path, bundle).map_err(Error::from)
+}
+
 /// Rewrite the document in canonical form, if it is not already.
 ///
 /// Takes the document that was verified rather than reading its own, which does
@@ -676,6 +732,46 @@ fn verify_bytes(
 /// The signature goes to a private temporary file because `ssh-keygen -Y verify`
 /// takes a path rather than reading standard input for the signature itself.
 #[allow(clippy::too_many_arguments)]
+/// Refuse a principal the trust anchor does not mention.
+///
+/// An `allowed_signers` entry is `principal[,principal…] <key> [options]`, and a
+/// principal is only usable if one of its lines lists it. Checking here gives a
+/// specific answer instead of ssh-keygen's single generic refusal, which is the
+/// difference between "your file does not mention this identity" and "this
+/// document was altered".
+fn require_known_principal(allowed_signers: &Path, principal: &str) -> Result<()> {
+    let text = std::fs::read_to_string(allowed_signers).map_err(|error| {
+        Error::Invalid(format!(
+            "cannot read {}: {error}",
+            allowed_signers.display()
+        ))
+    })?;
+    let known = text.lines().any(|line| {
+        let line = line.split('#').next().unwrap_or("").trim();
+        line.split_whitespace()
+            .next()
+            .is_some_and(|names| names.split(',').any(|name| name == principal))
+    });
+    if known {
+        return Ok(());
+    }
+    let listed: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    Err(Error::Invalid(format!(
+        "{} has no entry for {principal:?}{}",
+        allowed_signers.display(),
+        if listed.is_empty() {
+            ", and lists no principals at all".to_string()
+        } else {
+            format!("; it lists {}", listed.join(", "))
+        }
+    )))
+}
+
 fn verify_bundle_signature(
     program: &Path,
     allowed_signers: &Path,
@@ -684,6 +780,10 @@ fn verify_bundle_signature(
     signature: &[u8],
     document: &[u8],
 ) -> Result<String> {
+    // ssh-keygen answers "Could not verify signature." for a bad signature *and*
+    // for a principal it has never heard of, so the two are told apart here rather
+    // than both being reported as a failed signature.
+    require_known_principal(allowed_signers, principal)?;
     let dir = temp_dir("nostoi-attest")?;
     let path = dir.join("attestation.sig");
     std::fs::write(&path, signature).map_err(crate::error::io(&path))?;

@@ -125,10 +125,14 @@ pub fn read_bundle(path: &Path) -> Result<Bundle> {
 
 /// Read a bundle from text, tolerating formatting.
 pub fn parse(text: &str) -> Result<Bundle> {
-    // A byte-order mark is not JSON, and serde's complaint about it does not say so.
-    let text = text
-        .strip_prefix('\u{feff}')
-        .ok_or_else(|| Error::Invalid("a bundle must not start with a byte-order mark".into()))?;
+    // A byte-order mark is not JSON, and serde's complaint about it does not say
+    // so. Refused rather than stripped, as everywhere else: a file that needs
+    // fixing before it can be read is worth telling someone about.
+    if text.starts_with('\u{feff}') {
+        return Err(Error::Invalid(
+            "a bundle must not start with a byte-order mark; remove it".into(),
+        ));
+    }
     let bundle: Bundle = serde_json::from_str(text)
         .map_err(|error| Error::Invalid(format!("invalid bundle: {error}")))?;
     bundle.validate()?;

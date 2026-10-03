@@ -975,6 +975,67 @@ fn a_bundle_with_no_signature_or_a_bom_is_refused() {
 }
 
 #[test]
+fn a_revoked_key_is_refused_even_when_it_is_the_pinned_one() {
+    let fixture = fixture!();
+    fixture.sign();
+    let fingerprint = attest::fingerprint(&ssh_keygen().unwrap(), &fixture.key).unwrap();
+
+    // Pinning the key normally makes it trusted, and that must not survive a
+    // revocation: the point of a separate channel is that un-revoking is not a
+    // matter of editing the trust anchor.
+    assert!(
+        attest::verify(&fixture.chain, &fixture.pinned()).is_ok(),
+        "the pinned key should work before it is revoked"
+    );
+
+    let list = fixture._dir.path().join("revoked.txt");
+    std::fs::write(&list, format!("# burned keys\n\n{fingerprint}\n")).unwrap();
+    let revoked = attest::Revocations::read(&list).unwrap();
+    assert_eq!(revoked.len(), 1);
+    assert!(revoked.is_revoked(&fingerprint));
+
+    let mut verifier = fixture.pinned().revoking(revoked);
+    verifier.fingerprint = Some(fingerprint.clone());
+    let error = attest::verify(&fixture.chain, &verifier).unwrap_err();
+    assert!(error.to_string().contains("revoked"), "{error}");
+
+    // The same key revokes a bundle too, before any signature work.
+    let signed = fixture.sign();
+    let bundle = attest::bundle(&signed, "nostoi-attestation", None).unwrap();
+    let revoked = attest::Revocations::read(&list).unwrap();
+    let mut verifier = fixture.verifier().revoking(revoked);
+    verifier.fingerprint = Some(fingerprint);
+    let error = attest::verify_bundle(&bundle, &verifier).unwrap_err();
+    assert!(error.to_string().contains("revoked"), "{error}");
+}
+
+#[test]
+fn a_mistyped_revocation_line_is_reported_rather_than_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let list = dir.path().join("revoked.txt");
+
+    // A typo in a revocation list is a key that stays trusted, so it is an error
+    // rather than a skipped line.
+    std::fs::write(&list, "SHA256:abc\n").unwrap();
+    assert!(
+        attest::Revocations::read(&list).is_ok(),
+        "one entry is fine"
+    );
+
+    std::fs::write(&list, "# comment\n\nSHA256:abc\nnot-a-fingerprint\n").unwrap();
+    let error = attest::Revocations::read(&list).unwrap_err();
+    let said = error.to_string();
+    assert!(said.contains("revoked.txt:4"), "{said}");
+    assert!(said.contains("SHA256:"), "{said}");
+
+    std::fs::write(&list, "").unwrap();
+    assert!(attest::Revocations::read(&list).unwrap().is_empty());
+
+    let missing = attest::Revocations::read(&dir.path().join("absent")).unwrap_err();
+    assert!(missing.to_string().contains("cannot read"), "{missing}");
+}
+
+#[test]
 fn a_missing_program_is_reported_clearly() {
     let fixture = fixture!();
     let mut signer = signer(&fixture.key);

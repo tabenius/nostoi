@@ -82,6 +82,67 @@ pub struct Signed {
     program: PathBuf,
 }
 
+/// Key fingerprints that must not be trusted, however they are presented.
+///
+/// Why this is a separate list rather than "edit your `allowed_signers` file":
+/// editing that file is exactly the substitution the fingerprint pin defends
+/// against. If revoking a key meant editing the file, then a compromised
+/// operator could quietly un-revoke it, and a verifier reading only the file
+/// would see nothing wrong. Revocation therefore travels on its own channel and
+/// is checked *before* the pin, so a burned key fails even when it is pinned.
+#[derive(Clone, Debug, Default)]
+pub struct Revocations {
+    fingerprints: Vec<String>,
+}
+
+impl Revocations {
+    /// Read a revocation list: one `SHA256:…` fingerprint per line, `#` comments
+    /// and blank lines ignored.
+    ///
+    /// Anything else on a line is a mistake worth reporting rather than skipping,
+    /// because a typo in a revocation list is a key that stays trusted.
+    pub fn read(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| Error::Invalid(format!("cannot read {}: {error}", path.display())))?;
+        let mut fingerprints = Vec::new();
+        for (number, line) in text.lines().enumerate() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            if !line.starts_with("SHA256:") {
+                return Err(Error::Invalid(format!(
+                    "{}:{}: expected a SHA256:… fingerprint, got {line:?}",
+                    path.display(),
+                    number + 1
+                )));
+            }
+            fingerprints.push(line.to_string());
+        }
+        Ok(Self { fingerprints })
+    }
+
+    /// Revoke these fingerprints in memory.
+    pub fn from_fingerprints(fingerprints: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            fingerprints: fingerprints.into_iter().collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fingerprints.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.fingerprints.len()
+    }
+
+    /// Whether this key is on the list.
+    pub fn is_revoked(&self, fingerprint: &str) -> bool {
+        self.fingerprints.iter().any(|entry| entry == fingerprint)
+    }
+}
+
 /// How to verify.
 #[derive(Clone, Debug)]
 pub struct Verifier {
@@ -96,6 +157,8 @@ pub struct Verifier {
     /// in the document, so neither the allowed-signers file nor the document can
     /// introduce a key the operator did not pin.
     pub fingerprint: Option<String>,
+    /// Keys refused outright, checked before the pin.
+    pub revoked: Option<Revocations>,
 }
 
 impl Verifier {
@@ -106,7 +169,14 @@ impl Verifier {
             namespace: DEFAULT_NAMESPACE.to_string(),
             program: PathBuf::from(DEFAULT_PROGRAM),
             fingerprint: None,
+            revoked: None,
         }
+    }
+
+    /// Refuse these revoked keys, whatever else says otherwise.
+    pub fn revoking(mut self, revoked: Revocations) -> Self {
+        self.revoked = Some(revoked);
+        self
     }
 
     /// Pin the expected key fingerprint.
@@ -542,14 +612,16 @@ pub fn verify(chain: &Path, verifier: &Verifier) -> Result<Attested> {
         )));
     }
 
-    let reported = verify_bytes(
-        &verifier.program,
-        &verifier.allowed_signers,
-        &verifier.principal,
-        &verifier.namespace,
-        &signature,
-        canonical.as_bytes(),
-    )?;
+    let reported = verify_signature(&SignatureCheck {
+        program: &verifier.program,
+        allowed_signers: &verifier.allowed_signers,
+        principal: &verifier.principal,
+        namespace: &verifier.namespace,
+        signature: &signature,
+        document: canonical.as_bytes(),
+        fingerprint: Some(&attestation.fingerprint),
+        revoked: verifier.revoked.as_ref(),
+    })?;
 
     if reported != attestation.fingerprint {
         return Err(Error::Invalid(format!(
@@ -599,14 +671,16 @@ pub fn bundle(signed: &Signed, namespace: &str, note: Option<String>) -> Result<
 /// bundle whose document was edited fails here rather than at some later point.
 pub fn verify_bundle(bundle: &Bundle, verifier: &Verifier) -> Result<CheckedBundle> {
     bundle.validate()?;
-    let reported = verify_bundle_signature(
-        &verifier.program,
-        &verifier.allowed_signers,
-        &verifier.principal,
-        &bundle.namespace,
-        bundle.signature.as_bytes(),
-        &bundle.signed_bytes()?,
-    )?;
+    let reported = verify_signature(&SignatureCheck {
+        program: &verifier.program,
+        allowed_signers: &verifier.allowed_signers,
+        principal: &verifier.principal,
+        namespace: &bundle.namespace,
+        signature: bundle.signature.as_bytes(),
+        document: &bundle.signed_bytes()?,
+        fingerprint: Some(&bundle.fingerprint),
+        revoked: verifier.revoked.as_ref(),
+    })?;
     if reported != bundle.fingerprint {
         return Err(Error::Invalid(format!(
             "the bundle pins {} but the signature is from {reported}",
@@ -709,24 +783,6 @@ fn sign_bytes(program: &Path, key: &Path, namespace: &str, document: &[u8]) -> R
 }
 
 /// Verify bytes with `ssh-keygen -Y verify`, returning the key it trusted.
-fn verify_bytes(
-    program: &Path,
-    allowed_signers: &Path,
-    principal: &str,
-    namespace: &str,
-    signature: &[u8],
-    document: &[u8],
-) -> Result<String> {
-    verify_bundle_signature(
-        program,
-        allowed_signers,
-        principal,
-        namespace,
-        signature,
-        document,
-    )
-}
-
 /// Verify a signature over `document`, returning the fingerprint it trusted.
 ///
 /// The signature goes to a private temporary file because `ssh-keygen -Y verify`
@@ -772,15 +828,49 @@ fn require_known_principal(allowed_signers: &Path, principal: &str) -> Result<()
     )))
 }
 
-fn verify_bundle_signature(
-    program: &Path,
-    allowed_signers: &Path,
-    principal: &str,
-    namespace: &str,
-    signature: &[u8],
-    document: &[u8],
-) -> Result<String> {
-    // ssh-keygen answers "Could not verify signature." for a bad signature *and*
+/// Everything needed to ask `ssh-keygen` about one signature.
+///
+/// A struct rather than eight positional arguments, because the two trust-policy
+/// fields have to travel with the invocation: revocation is checked before the
+/// signature runs, which means the expected fingerprint has to arrive alongside
+/// the list it is checked against.
+struct SignatureCheck<'a> {
+    program: &'a Path,
+    allowed_signers: &'a Path,
+    principal: &'a str,
+    namespace: &'a str,
+    signature: &'a [u8],
+    document: &'a [u8],
+    fingerprint: Option<&'a str>,
+    revoked: Option<&'a Revocations>,
+}
+
+/// Check one signature, returning the fingerprint `ssh-keygen` trusted.
+///
+/// The signature goes to a private temporary file because `ssh-keygen -Y verify`
+/// takes a path rather than reading standard input for the signature itself.
+fn verify_signature(check: &SignatureCheck<'_>) -> Result<String> {
+    let SignatureCheck {
+        program,
+        allowed_signers,
+        principal,
+        namespace,
+        signature,
+        document,
+        fingerprint,
+        revoked,
+    } = *check;
+    // Before anything else: a revoked key is refused even when it is the pinned
+    // one, because un-revoking it must not be a matter of editing a file.
+    if let (Some(revoked), Some(fingerprint)) = (revoked, fingerprint) {
+        if revoked.is_revoked(fingerprint) {
+            return Err(Error::Invalid(format!(
+                "{fingerprint} is revoked; a revoked key is refused even when it is \
+                 the pinned one"
+            )));
+        }
+    }
+    // ssh-keygen answers "Could not verify signature." for a bad signature *and"
     // for a principal it has never heard of, so the two are told apart here rather
     // than both being reported as a failed signature.
     require_known_principal(allowed_signers, principal)?;

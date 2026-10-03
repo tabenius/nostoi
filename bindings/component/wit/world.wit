@@ -17,6 +17,19 @@ interface chains {
     append-jsonl: func(jsonl: string, entry: draft) -> result<string, string>;
 }
 
+/// The portable half of an attestation: what was signed, and whether it is still
+/// true of a chain. No signature checking and no `ssh-keygen` — a signature needs
+/// a key, and this interface deliberately has nowhere to put one.
+interface attestations {
+    /// The exact bytes a document's signature covers, in ASCII.
+    canonical-bytes: func(document: string) -> result<string, string>;
+    /// Check a document against a chain the host supplies as JSONL text.
+    /// Returns a JSON report; "stale" is a finding, not an error.
+    verify-document: func(jsonl: string, document: string, format: option<string>)
+        -> result<string, string>;
+}
+
 world audit {
     export chains;
+    export attestations;
 }

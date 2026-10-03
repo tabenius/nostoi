@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use nostoi_core::attestation::{self, Attestation, Attested, Sidecars, DEFAULT_NAMESPACE};
+use nostoi_core::bundle::{Bundle, BUNDLE_V1};
 
 pub use nostoi_core::attestation::{Canonicality, ReadDocument};
 use nostoi_core::time::now as now_rfc3339;
@@ -74,6 +75,72 @@ pub struct Signed {
     pub allowed_signers_line: String,
     /// What the previous attestation covered, when one was replaced.
     pub replaced: Option<Attestation>,
+    /// Kept so `with_description` can re-sign without being handed the key again.
+    key: PathBuf,
+    principal: String,
+    namespace: String,
+    program: PathBuf,
+}
+
+/// Key fingerprints that must not be trusted, however they are presented.
+///
+/// Why this is a separate list rather than "edit your `allowed_signers` file":
+/// editing that file is exactly the substitution the fingerprint pin defends
+/// against. If revoking a key meant editing the file, then a compromised
+/// operator could quietly un-revoke it, and a verifier reading only the file
+/// would see nothing wrong. Revocation therefore travels on its own channel and
+/// is checked *before* the pin, so a burned key fails even when it is pinned.
+#[derive(Clone, Debug, Default)]
+pub struct Revocations {
+    fingerprints: Vec<String>,
+}
+
+impl Revocations {
+    /// Read a revocation list: one `SHA256:…` fingerprint per line, `#` comments
+    /// and blank lines ignored.
+    ///
+    /// Anything else on a line is a mistake worth reporting rather than skipping,
+    /// because a typo in a revocation list is a key that stays trusted.
+    pub fn read(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| Error::Invalid(format!("cannot read {}: {error}", path.display())))?;
+        let mut fingerprints = Vec::new();
+        for (number, line) in text.lines().enumerate() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            if !line.starts_with("SHA256:") {
+                return Err(Error::Invalid(format!(
+                    "{}:{}: expected a SHA256:… fingerprint, got {line:?}",
+                    path.display(),
+                    number + 1
+                )));
+            }
+            fingerprints.push(line.to_string());
+        }
+        Ok(Self { fingerprints })
+    }
+
+    /// Revoke these fingerprints in memory.
+    pub fn from_fingerprints(fingerprints: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            fingerprints: fingerprints.into_iter().collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fingerprints.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.fingerprints.len()
+    }
+
+    /// Whether this key is on the list.
+    pub fn is_revoked(&self, fingerprint: &str) -> bool {
+        self.fingerprints.iter().any(|entry| entry == fingerprint)
+    }
 }
 
 /// How to verify.
@@ -90,6 +157,8 @@ pub struct Verifier {
     /// in the document, so neither the allowed-signers file nor the document can
     /// introduce a key the operator did not pin.
     pub fingerprint: Option<String>,
+    /// Keys refused outright, checked before the pin.
+    pub revoked: Option<Revocations>,
 }
 
 impl Verifier {
@@ -100,7 +169,14 @@ impl Verifier {
             namespace: DEFAULT_NAMESPACE.to_string(),
             program: PathBuf::from(DEFAULT_PROGRAM),
             fingerprint: None,
+            revoked: None,
         }
+    }
+
+    /// Refuse these revoked keys, whatever else says otherwise.
+    pub fn revoking(mut self, revoked: Revocations) -> Self {
+        self.revoked = Some(revoked);
+        self
     }
 
     /// Pin the expected key fingerprint.
@@ -332,6 +408,42 @@ pub fn sign(
         signature,
         allowed_signers_line,
         replaced,
+        key: signer.key.clone(),
+        principal: signer.principal.clone(),
+        namespace: signer.namespace.clone(),
+        program: signer.program.clone(),
+    })
+}
+
+/// Add the optional human-facing fields and re-sign.
+///
+/// The fields live inside the signed bytes, so adding them afterwards would break
+/// the signature. Re-signing is the honest way to do it, and the timestamp moves
+/// with it — correctly, because this is a new attestation made now rather than a
+/// relabelling of an old one.
+///
+/// Named for the re-sign rather than the fields: [`describe`] already means "one
+/// line about an attestation".
+pub fn with_description(
+    signed: Signed,
+    described: nostoi_core::attestation::Described,
+) -> Result<Signed> {
+    let attestation = signed
+        .attestation
+        .describe(described)
+        .map_err(Error::from)?;
+    let document = attestation.canonical_bytes()?;
+    let signature = sign_bytes(&signed.program, &signed.key, &signed.namespace, &document)?;
+    Ok(Signed {
+        attestation,
+        document,
+        signature,
+        allowed_signers_line: signed.allowed_signers_line,
+        replaced: signed.replaced,
+        key: signed.key,
+        principal: signed.principal,
+        namespace: signed.namespace,
+        program: signed.program,
     })
 }
 
@@ -500,14 +612,16 @@ pub fn verify(chain: &Path, verifier: &Verifier) -> Result<Attested> {
         )));
     }
 
-    let reported = verify_bytes(
-        &verifier.program,
-        &verifier.allowed_signers,
-        &verifier.principal,
-        &verifier.namespace,
-        &signature,
-        canonical.as_bytes(),
-    )?;
+    let reported = verify_signature(&SignatureCheck {
+        program: &verifier.program,
+        allowed_signers: &verifier.allowed_signers,
+        principal: &verifier.principal,
+        namespace: &verifier.namespace,
+        signature: &signature,
+        document: canonical.as_bytes(),
+        fingerprint: Some(&attestation.fingerprint),
+        revoked: verifier.revoked.as_ref(),
+    })?;
 
     if reported != attestation.fingerprint {
         return Err(Error::Invalid(format!(
@@ -525,6 +639,91 @@ pub fn verify(chain: &Path, verifier: &Verifier) -> Result<Attested> {
     let mut checked = attestation::check(chain, &attestation, None).map_err(Error::from)?;
     checked.document = read.document;
     Ok(checked)
+}
+
+/// Wrap a signature into a publishable bundle.
+///
+/// The fingerprint is repeated outside the document so a receiver can compare it
+/// against what it already trusts before doing anything else, and the public key
+/// is deliberately *not* included: `ssh-keygen` embeds it in the signature, so a
+/// bundle cannot be used to smuggle in a different one.
+pub fn bundle(signed: &Signed, namespace: &str, note: Option<String>) -> Result<Bundle> {
+    let bundle = Bundle {
+        v: BUNDLE_V1.to_string(),
+        namespace: namespace.to_string(),
+        fingerprint: signed.attestation.fingerprint.clone(),
+        document: signed.attestation.clone(),
+        signature: String::from_utf8(signed.signature.clone()).map_err(|_| {
+            Error::Invalid("the signature is not UTF-8, so it cannot be bundled".into())
+        })?,
+        note,
+    };
+    bundle.validate()?;
+    Ok(bundle)
+}
+
+/// Check a bundle's signature, its pin and its namespace, with no chain.
+///
+/// This is what a receiver does when a bundle arrives: there is no local chain to
+/// compare against yet, so it answers "is this a genuine attestation by the key I
+/// already trust, and what does it claim" rather than "does it match these
+/// records". The document is validated and its canonical bytes recomputed, so a
+/// bundle whose document was edited fails here rather than at some later point.
+pub fn verify_bundle(bundle: &Bundle, verifier: &Verifier) -> Result<CheckedBundle> {
+    bundle.validate()?;
+    let reported = verify_signature(&SignatureCheck {
+        program: &verifier.program,
+        allowed_signers: &verifier.allowed_signers,
+        principal: &verifier.principal,
+        namespace: &bundle.namespace,
+        signature: bundle.signature.as_bytes(),
+        document: &bundle.signed_bytes()?,
+        fingerprint: Some(&bundle.fingerprint),
+        revoked: verifier.revoked.as_ref(),
+    })?;
+    if reported != bundle.fingerprint {
+        return Err(Error::Invalid(format!(
+            "the bundle pins {} but the signature is from {reported}",
+            bundle.fingerprint
+        )));
+    }
+    if let Some(pinned) = &verifier.fingerprint {
+        if &reported != pinned {
+            return Err(Error::Invalid(format!(
+                "signed by {reported}, which is not the pinned key {pinned}"
+            )));
+        }
+    }
+    Ok(CheckedBundle {
+        bundle: bundle.clone(),
+        fingerprint: reported,
+        canonical_bytes: bundle.signed_bytes()?,
+    })
+}
+
+/// A bundle whose signature and pin have been checked.
+#[derive(Clone, Debug)]
+pub struct CheckedBundle {
+    pub bundle: Bundle,
+    /// The fingerprint `ssh-keygen` reported, equal to the bundle's own.
+    pub fingerprint: String,
+    /// The bytes the signature covers, for storage and display.
+    pub canonical_bytes: Vec<u8>,
+}
+
+/// Serialize a bundle to the exact bytes to publish.
+pub fn to_json(bundle: &Bundle) -> Result<String> {
+    nostoi_core::bundle::to_json(bundle).map_err(Error::from)
+}
+
+/// Read a bundle from disk.
+pub fn read_bundle(path: &Path) -> Result<Bundle> {
+    nostoi_core::bundle::read_bundle(path).map_err(Error::from)
+}
+
+/// Write a bundle, refusing to write through a symlink.
+pub fn write_bundle(path: &Path, bundle: &Bundle) -> Result<()> {
+    nostoi_core::bundle::write_bundle(path, bundle).map_err(Error::from)
 }
 
 /// Rewrite the document in canonical form, if it is not already.
@@ -584,14 +783,97 @@ fn sign_bytes(program: &Path, key: &Path, namespace: &str, document: &[u8]) -> R
 }
 
 /// Verify bytes with `ssh-keygen -Y verify`, returning the key it trusted.
-fn verify_bytes(
-    program: &Path,
-    allowed_signers: &Path,
-    principal: &str,
-    namespace: &str,
-    signature: &[u8],
-    document: &[u8],
-) -> Result<String> {
+/// Verify a signature over `document`, returning the fingerprint it trusted.
+///
+/// The signature goes to a private temporary file because `ssh-keygen -Y verify`
+/// takes a path rather than reading standard input for the signature itself.
+#[allow(clippy::too_many_arguments)]
+/// Refuse a principal the trust anchor does not mention.
+///
+/// An `allowed_signers` entry is `principal[,principal…] <key> [options]`, and a
+/// principal is only usable if one of its lines lists it. Checking here gives a
+/// specific answer instead of ssh-keygen's single generic refusal, which is the
+/// difference between "your file does not mention this identity" and "this
+/// document was altered".
+fn require_known_principal(allowed_signers: &Path, principal: &str) -> Result<()> {
+    let text = std::fs::read_to_string(allowed_signers).map_err(|error| {
+        Error::Invalid(format!(
+            "cannot read {}: {error}",
+            allowed_signers.display()
+        ))
+    })?;
+    let known = text.lines().any(|line| {
+        let line = line.split('#').next().unwrap_or("").trim();
+        line.split_whitespace()
+            .next()
+            .is_some_and(|names| names.split(',').any(|name| name == principal))
+    });
+    if known {
+        return Ok(());
+    }
+    let listed: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    Err(Error::Invalid(format!(
+        "{} has no entry for {principal:?}{}",
+        allowed_signers.display(),
+        if listed.is_empty() {
+            ", and lists no principals at all".to_string()
+        } else {
+            format!("; it lists {}", listed.join(", "))
+        }
+    )))
+}
+
+/// Everything needed to ask `ssh-keygen` about one signature.
+///
+/// A struct rather than eight positional arguments, because the two trust-policy
+/// fields have to travel with the invocation: revocation is checked before the
+/// signature runs, which means the expected fingerprint has to arrive alongside
+/// the list it is checked against.
+struct SignatureCheck<'a> {
+    program: &'a Path,
+    allowed_signers: &'a Path,
+    principal: &'a str,
+    namespace: &'a str,
+    signature: &'a [u8],
+    document: &'a [u8],
+    fingerprint: Option<&'a str>,
+    revoked: Option<&'a Revocations>,
+}
+
+/// Check one signature, returning the fingerprint `ssh-keygen` trusted.
+///
+/// The signature goes to a private temporary file because `ssh-keygen -Y verify`
+/// takes a path rather than reading standard input for the signature itself.
+fn verify_signature(check: &SignatureCheck<'_>) -> Result<String> {
+    let SignatureCheck {
+        program,
+        allowed_signers,
+        principal,
+        namespace,
+        signature,
+        document,
+        fingerprint,
+        revoked,
+    } = *check;
+    // Before anything else: a revoked key is refused even when it is the pinned
+    // one, because un-revoking it must not be a matter of editing a file.
+    if let (Some(revoked), Some(fingerprint)) = (revoked, fingerprint) {
+        if revoked.is_revoked(fingerprint) {
+            return Err(Error::Invalid(format!(
+                "{fingerprint} is revoked; a revoked key is refused even when it is \
+                 the pinned one"
+            )));
+        }
+    }
+    // ssh-keygen answers "Could not verify signature." for a bad signature *and"
+    // for a principal it has never heard of, so the two are told apart here rather
+    // than both being reported as a failed signature.
+    require_known_principal(allowed_signers, principal)?;
     let dir = temp_dir("nostoi-attest")?;
     let path = dir.join("attestation.sig");
     std::fs::write(&path, signature).map_err(crate::error::io(&path))?;
@@ -837,12 +1119,18 @@ const ATTEMPTS: usize = 8;
 /// umask, and it succeeds on a directory that is already there. The second is
 /// the dangerous one, because the name is derived from the pid and a clock.
 fn create_private(dir: &Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
+    // Set the mode by hand rather than trusting the umask, which is the only way
+    // to be sure nothing else on the box can read a signature or a private key
+    // we just staged.
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
-    }
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     builder.create(dir)
 }
 

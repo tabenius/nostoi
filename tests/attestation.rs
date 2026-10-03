@@ -272,7 +272,7 @@ fn a_signature_by_a_committed_fixture_key_verifies_against_the_committed_anchor(
     let mut verifier = Verifier::new(fixture_allowed_signers(), "stranger@elsewhere");
     verifier.program = ssh_keygen().unwrap();
     let error = attest::verify(&chain, &verifier).unwrap_err();
-    assert!(error.to_string().contains("does not verify"), "{error}");
+    assert!(error.to_string().contains("no entry for"), "{error}");
 }
 
 #[test]
@@ -538,7 +538,9 @@ fn a_principal_with_no_allowed_signers_entry_is_refused() {
     let mut verifier = fixture.pinned();
     verifier.principal = "someone@else".into();
     let error = attest::verify(&fixture.chain, &verifier).unwrap_err();
-    assert!(error.to_string().contains("does not verify"), "{error}");
+    let said = error.to_string();
+    assert!(said.contains("no entry for"), "{said}");
+    assert!(!said.contains("does not verify"), "{said}");
 }
 
 #[test]
@@ -867,6 +869,170 @@ fn a_tilde_path_is_expanded_and_other_accounts_are_not() {
     let error = attest::expand_home(Path::new("~root/.ssh/id_ed25519")).unwrap_err();
     assert!(error.to_string().contains("only ~/"), "{error}");
     assert!(attest::expand_home(Path::new("~")).is_err());
+}
+
+#[test]
+fn a_bundle_round_trips_and_can_be_checked_without_a_chain() {
+    let fixture = fixture!();
+    let signed = fixture.sign();
+    // The descriptive fields are inside the signed bytes, so setting them means
+    // signing again, and the timestamp moves with it.
+    let with_title = attest::with_description(
+        signed,
+        nostoi::attestation::Described {
+            title: Some("March evidence freeze".into()),
+            manifest: Some("sha256:review-notes-v3".into()),
+            author: Some("Alice L".into()),
+        },
+    )
+    .unwrap();
+    let bundle = attest::bundle(
+        &with_title,
+        "nostoi-attestation",
+        Some("published to the ops repo".into()),
+    )
+    .unwrap();
+    let path = fixture._dir.path().join("bundle.json");
+    attest::write_bundle(&path, &bundle).unwrap();
+
+    // The fingerprint is stated twice, and a receiver can compare the outer one
+    // against its own trust before doing anything else.
+    assert_eq!(bundle.fingerprint, with_title.attestation.fingerprint);
+    assert_eq!(bundle.v, "nostoi-attestation-bundle-v1");
+    assert_eq!(
+        bundle.signature,
+        String::from_utf8(with_title.signature.clone()).unwrap()
+    );
+    // No public key in the bundle: ssh-keygen already embeds it in the signature.
+    assert!(!attest::to_json(&bundle).unwrap().contains("ssh-ed25519"));
+
+    let reread = attest::read_bundle(&path).unwrap();
+    assert_eq!(reread, bundle);
+    let mut verifier = fixture.verifier();
+    verifier.fingerprint = Some(bundle.fingerprint.clone());
+    let checked = attest::verify_bundle(&reread, &verifier).unwrap();
+    assert_eq!(checked.fingerprint, bundle.fingerprint);
+    assert_eq!(
+        checked.canonical_bytes,
+        with_title.attestation.canonical_bytes().unwrap()
+    );
+    assert_eq!(
+        checked.bundle.document.title.as_deref(),
+        Some("March evidence freeze")
+    );
+}
+
+#[test]
+fn an_edited_bundle_fails_and_an_unknown_principal_is_named() {
+    let fixture = fixture!();
+    let signed = fixture.sign();
+    let bundle = attest::bundle(&signed, "nostoi-attestation", None).unwrap();
+    let path = fixture._dir.path().join("bundle.json");
+    attest::write_bundle(&path, &bundle).unwrap();
+
+    let mut verifier = fixture.verifier();
+    verifier.fingerprint = Some(bundle.fingerprint.clone());
+    assert!(attest::verify_bundle(&bundle, &verifier).is_ok());
+
+    // Changing a descriptive field changes the signed bytes, so it fails even
+    // though the field is only a label.
+    let mut edited = bundle.clone();
+    edited.document.title = Some("April freeze".into());
+    let error = attest::verify_bundle(&edited, &verifier).unwrap_err();
+    assert!(error.to_string().contains("does not verify"), "{error}");
+
+    // A bundle whose fingerprint disagrees with its document is refused before
+    // any signature work.
+    let mut mismatched = bundle.clone();
+    mismatched.fingerprint = format!("SHA256:{}", "A".repeat(43));
+    let error = attest::verify_bundle(&mismatched, &verifier).unwrap_err();
+    assert!(error.to_string().contains("pins"), "{error}");
+
+    // A principal the trust anchor never mentions is named, rather than being
+    // reported as a bad signature.
+    let mut unknown = fixture.verifier();
+    unknown.principal = "stranger@elsewhere".into();
+    let error = attest::verify_bundle(&bundle, &unknown).unwrap_err();
+    let said = error.to_string();
+    assert!(said.contains("no entry for"), "{said}");
+    assert!(said.contains("stranger@elsewhere"), "{said}");
+    assert!(!said.contains("does not verify"), "{said}");
+}
+
+#[test]
+fn a_bundle_with_no_signature_or_a_bom_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("b.json");
+    let text = r#"{"v":"nostoi-attestation-bundle-v1","namespace":"n","fingerprint":"SHA256:x","document":{"v":"nostoi-attestation-v1","chain":"c","format":"nostoi-v1","seq":1,"digest":"0000000000000000000000000000000000000000000000000000000000000000","anchored_at":"2026-01-01T00:00:00Z","principal":"p","fingerprint":"SHA256:x"},"signature":""}"#;
+    std::fs::write(&path, text).unwrap();
+    let error = attest::read_bundle(&path).unwrap_err();
+    assert!(error.to_string().contains("no signature"), "{error}");
+
+    // A byte-order mark is not JSON; serde's complaint does not say so.
+    std::fs::write(&path, format!("\u{feff}{text}")).unwrap();
+    let error = attest::read_bundle(&path).unwrap_err();
+    assert!(error.to_string().contains("byte-order mark"), "{error}");
+}
+
+#[test]
+fn a_revoked_key_is_refused_even_when_it_is_the_pinned_one() {
+    let fixture = fixture!();
+    fixture.sign();
+    let fingerprint = attest::fingerprint(&ssh_keygen().unwrap(), &fixture.key).unwrap();
+
+    // Pinning the key normally makes it trusted, and that must not survive a
+    // revocation: the point of a separate channel is that un-revoking is not a
+    // matter of editing the trust anchor.
+    assert!(
+        attest::verify(&fixture.chain, &fixture.pinned()).is_ok(),
+        "the pinned key should work before it is revoked"
+    );
+
+    let list = fixture._dir.path().join("revoked.txt");
+    std::fs::write(&list, format!("# burned keys\n\n{fingerprint}\n")).unwrap();
+    let revoked = attest::Revocations::read(&list).unwrap();
+    assert_eq!(revoked.len(), 1);
+    assert!(revoked.is_revoked(&fingerprint));
+
+    let mut verifier = fixture.pinned().revoking(revoked);
+    verifier.fingerprint = Some(fingerprint.clone());
+    let error = attest::verify(&fixture.chain, &verifier).unwrap_err();
+    assert!(error.to_string().contains("revoked"), "{error}");
+
+    // The same key revokes a bundle too, before any signature work.
+    let signed = fixture.sign();
+    let bundle = attest::bundle(&signed, "nostoi-attestation", None).unwrap();
+    let revoked = attest::Revocations::read(&list).unwrap();
+    let mut verifier = fixture.verifier().revoking(revoked);
+    verifier.fingerprint = Some(fingerprint);
+    let error = attest::verify_bundle(&bundle, &verifier).unwrap_err();
+    assert!(error.to_string().contains("revoked"), "{error}");
+}
+
+#[test]
+fn a_mistyped_revocation_line_is_reported_rather_than_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let list = dir.path().join("revoked.txt");
+
+    // A typo in a revocation list is a key that stays trusted, so it is an error
+    // rather than a skipped line.
+    std::fs::write(&list, "SHA256:abc\n").unwrap();
+    assert!(
+        attest::Revocations::read(&list).is_ok(),
+        "one entry is fine"
+    );
+
+    std::fs::write(&list, "# comment\n\nSHA256:abc\nnot-a-fingerprint\n").unwrap();
+    let error = attest::Revocations::read(&list).unwrap_err();
+    let said = error.to_string();
+    assert!(said.contains("revoked.txt:4"), "{said}");
+    assert!(said.contains("SHA256:"), "{said}");
+
+    std::fs::write(&list, "").unwrap();
+    assert!(attest::Revocations::read(&list).unwrap().is_empty());
+
+    let missing = attest::Revocations::read(&dir.path().join("absent")).unwrap_err();
+    assert!(missing.to_string().contains("cannot read"), "{missing}");
 }
 
 #[test]

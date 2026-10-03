@@ -39,6 +39,7 @@
 //! journeys home: records that should have survived and did not.
 
 pub mod attestation;
+pub mod bundle;
 pub mod canonical;
 pub mod chain;
 mod error;
@@ -51,7 +52,7 @@ pub mod schema;
 pub mod sqlite;
 pub mod time;
 
-pub use attestation::{Attestation, Attested, Coverage, Sidecars, ATTESTATION_V1};
+pub use attestation::{Attestation, Attested, Coverage, Described, Sidecars, ATTESTATION_V1};
 pub use chain::{Entry, Head, Problem, Report, StreamingVerification, GENESIS};
 pub use error::{Error, Result};
 pub use format::Format;

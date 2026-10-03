@@ -134,9 +134,55 @@ enum Command {
         /// ssh-keygen to use
         #[arg(long, default_value = nostoi::attest::DEFAULT_PROGRAM)]
         program: PathBuf,
+        /// Human label for what is being attested; signed into the document
+        #[arg(long)]
+        title: Option<String>,
+        /// What is being attested beyond the position: a digest or a short
+        /// description; signed into the document
+        #[arg(long)]
+        manifest: Option<String>,
+        /// Who is attesting, in their own words. Signing this publishes it
+        /// permanently, so leave it out unless linking the name is the point.
+        #[arg(long)]
+        author: Option<String>,
+        /// Write a portable bundle here as well: document, signature and the
+        /// fingerprint to pin, in one file to publish or hand over
+        #[arg(long)]
+        bundle: Option<PathBuf>,
+        /// A note to put in the bundle for whoever reads it
+        #[arg(long)]
+        note: Option<String>,
         /// Sign and report, but do not write the sidecars
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check a bundle's signature and its pinned key, with no chain
+    ///
+    /// What a receiver does when a bundle arrives. Does not answer whether the
+    /// document matches a local chain; use verify-attestation for that.
+    VerifyBundle {
+        path: PathBuf,
+        /// An allowed_signers file naming --principal
+        #[arg(long)]
+        allowed_signers: PathBuf,
+        /// The signing identity to verify
+        #[arg(long)]
+        principal: String,
+        /// The key fingerprint to pin, SHA256:...
+        #[arg(long)]
+        fingerprint: Option<String>,
+        /// The signing namespace the signature must have been made in
+        #[arg(long, default_value = nostoi::attestation::DEFAULT_NAMESPACE)]
+        namespace: String,
+        /// ssh-keygen to use
+        #[arg(long, default_value = nostoi::attest::DEFAULT_PROGRAM)]
+        program: PathBuf,
+        /// A file of revoked SHA256 fingerprints, one per line. A revoked key is
+        /// refused even when it is the pinned one.
+        #[arg(long)]
+        revoked: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -161,6 +207,10 @@ enum Command {
         /// ssh-keygen to use
         #[arg(long, default_value = nostoi::attest::DEFAULT_PROGRAM)]
         program: PathBuf,
+        /// A file of revoked SHA256 fingerprints, one per line. A revoked key is
+        /// refused even when it is the pinned one.
+        #[arg(long)]
+        revoked: Option<PathBuf>,
         /// Rewrite the document in canonical form, once the signature has been
         /// checked against it. Only ever touches formatting.
         #[arg(long)]
@@ -379,6 +429,11 @@ fn run(command: Command) -> Result<ExitCode, String> {
             format,
             namespace,
             anchor_key,
+            title,
+            manifest,
+            author,
+            bundle,
+            note,
             program,
             dry_run,
             json,
@@ -391,8 +446,35 @@ fn run(command: Command) -> Result<ExitCode, String> {
                 format,
                 namespace: &namespace,
                 anchor_key,
+                title,
+                manifest,
+                author,
+                bundle,
+                note,
                 program: &program,
                 dry_run,
+                json,
+            },
+        ),
+        Command::VerifyBundle {
+            path,
+            allowed_signers,
+            principal,
+            fingerprint,
+            namespace,
+            program,
+            revoked,
+            json,
+        } => verify_bundle(
+            &path,
+            VerifyOptions {
+                allowed_signers: &allowed_signers,
+                principal: &principal,
+                fingerprint: fingerprint.as_deref(),
+                namespace: &namespace,
+                program: &program,
+                revoked: revoked.as_deref(),
+                canonicalize: false,
                 json,
             },
         ),
@@ -403,6 +485,7 @@ fn run(command: Command) -> Result<ExitCode, String> {
             fingerprint,
             namespace,
             program,
+            revoked,
             canonicalize,
             json,
         } => verify_attestation(
@@ -413,6 +496,7 @@ fn run(command: Command) -> Result<ExitCode, String> {
                 fingerprint: fingerprint.as_deref(),
                 namespace: &namespace,
                 program: &program,
+                revoked: revoked.as_deref(),
                 canonicalize,
                 json,
             },
@@ -562,6 +646,11 @@ struct AttestOptions<'a> {
     format: Option<Format>,
     namespace: &'a str,
     anchor_key: Option<String>,
+    title: Option<String>,
+    manifest: Option<String>,
+    author: Option<String>,
+    bundle: Option<PathBuf>,
+    note: Option<String>,
     program: &'a Path,
     dry_run: bool,
     json: bool,
@@ -576,6 +665,11 @@ fn attest(path: &Path, options: AttestOptions<'_>) -> Result<ExitCode, String> {
         format,
         namespace,
         anchor_key,
+        title,
+        manifest,
+        author,
+        bundle,
+        note,
         program,
         dry_run,
         json,
@@ -588,6 +682,25 @@ fn attest(path: &Path, options: AttestOptions<'_>) -> Result<ExitCode, String> {
     signer.program = program.to_path_buf();
     let signed = nostoi::attest::sign(path, chain_id, format, &signer, anchor_key)
         .map_err(|e| e.to_string())?;
+    let signed = if title.is_some() || manifest.is_some() || author.is_some() {
+        let described = nostoi::attestation::Described {
+            title,
+            manifest,
+            author,
+        };
+        nostoi::attest::with_description(signed, described).map_err(|e| e.to_string())?
+    } else {
+        signed
+    };
+    let bundle_path = match &bundle {
+        Some(bundle_path) => {
+            let bundle =
+                nostoi::attest::bundle(&signed, namespace, note).map_err(|e| e.to_string())?;
+            nostoi::attest::write_bundle(bundle_path, &bundle).map_err(|e| e.to_string())?;
+            Some(bundle_path.clone())
+        }
+        None => None,
+    };
 
     let sidecars = if dry_run {
         None
@@ -613,6 +726,10 @@ fn attest(path: &Path, options: AttestOptions<'_>) -> Result<ExitCode, String> {
                 "signature": sidecars.as_ref().map(|s| s.signature.display().to_string()),
                 "replaced_seq": signed.replaced.as_ref().map(|old| old.seq),
                 "allowed_signers_line": signed.allowed_signers_line,
+                "title": signed.attestation.title,
+                "manifest": signed.attestation.manifest,
+                "author": signed.attestation.author,
+                "bundle": bundle_path.as_ref().map(|p| p.display().to_string()),
                 "dry_run": dry_run,
             })
         );
@@ -628,6 +745,23 @@ fn attest(path: &Path, options: AttestOptions<'_>) -> Result<ExitCode, String> {
                 println!("  signature  {}", paths.signature.display());
             }
             None => println!("  dry run: nothing written"),
+        }
+        for (label, value) in [
+            ("title", &signed.attestation.title),
+            ("manifest", &signed.attestation.manifest),
+            ("author", &signed.attestation.author),
+        ] {
+            if let Some(value) = value {
+                println!("  {label:<10} {value}");
+            }
+        }
+        if let Some(bundle_path) = &bundle_path {
+            println!(
+                "\nbundle {} carries the document, the signature and the fingerprint to pin.\n\
+                 Publish it where it cannot be retracted: a signature proves authorship, \
+                 not when.",
+                bundle_path.display()
+            );
         }
         if let Some(replaced) = &signed.replaced {
             println!(
@@ -654,6 +788,99 @@ fn attest(path: &Path, options: AttestOptions<'_>) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `nostoi verify-bundle`: check a bundle's signature and pinned key.
+///
+/// No chain is involved, so this answers "is this a genuine attestation by a key I
+/// trust, and what does it claim" — which is the question a receiver has when a
+/// bundle arrives. The document is printed so it can be read without opening the
+/// file, and its digest so it can be cited.
+fn verify_bundle(path: &Path, options: VerifyOptions<'_>) -> Result<ExitCode, String> {
+    let (fingerprint, json) = (options.fingerprint, options.json);
+    let bundle = nostoi::attest::read_bundle(path).map_err(|e| e.to_string())?;
+    let verifier = options.verifier()?;
+
+    match nostoi::attest::verify_bundle(&bundle, &verifier) {
+        Ok(checked) => {
+            let document = &checked.bundle.document;
+            if json {
+                println!(
+                    "{}",
+                    json!({
+                        "path": path,
+                        "ok": true,
+                        "signature": "verified",
+                        "bundle": checked.bundle.v,
+                        "namespace": checked.bundle.namespace,
+                        "principal": document.principal,
+                        "fingerprint": checked.fingerprint,
+                        "anchored_at": document.anchored_at,
+                        "chain": document.chain,
+                        "format": document.format,
+                        "seq": document.seq,
+                        "digest": document.digest,
+                        "anchor_key": document.anchor_key,
+                        "title": document.title,
+                        "manifest": document.manifest,
+                        "author": document.author,
+                        "note": checked.bundle.note,
+                        "document_digest": document.digest,
+                        "signed_bytes": String::from_utf8_lossy(&checked.canonical_bytes),
+                    })
+                );
+            } else {
+                println!(
+                    "✓ {}: bundle verified, signed by {} with key {}",
+                    path.display(),
+                    document.principal,
+                    checked.fingerprint
+                );
+                println!("  attested {} at {}", document.chain, document.anchored_at);
+                println!(
+                    "  position seq={} digest={}",
+                    document.seq,
+                    &document.digest[..document.digest.len().min(16)]
+                );
+                for (label, value) in [
+                    ("title", &document.title),
+                    ("manifest", &document.manifest),
+                    ("author", &document.author),
+                    ("anchor", &document.anchor_key),
+                ] {
+                    if let Some(value) = value {
+                        println!("  {label:<9} {value}");
+                    }
+                }
+                if let Some(note) = &checked.bundle.note {
+                    println!("  note      {note}");
+                }
+                println!(
+                    "\n  this bundle says nothing about a local chain; run \
+                     verify-attestation once you have one"
+                );
+            }
+            if fingerprint.is_none() {
+                eprintln!(
+                    "  note: no --fingerprint was pinned, so the allowed_signers file is the \
+                     only trust anchor"
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    json!({"path": path, "ok": false, "signature": "refused",
+                           "error": error.to_string()})
+                );
+            } else {
+                eprintln!("✗ {}: {error}", path.display());
+            }
+            Ok(ExitCode::from(1))
+        }
+    }
+}
+
 /// The options `verify-attestation` takes, gathered for the same reason.
 struct VerifyOptions<'a> {
     allowed_signers: &'a Path,
@@ -661,25 +888,32 @@ struct VerifyOptions<'a> {
     fingerprint: Option<&'a str>,
     namespace: &'a str,
     program: &'a Path,
+    revoked: Option<&'a Path>,
     canonicalize: bool,
     json: bool,
 }
 
+impl VerifyOptions<'_> {
+    /// The verifier, with revocations applied.
+    fn verifier(&self) -> Result<nostoi::attest::Verifier, String> {
+        let mut verifier = nostoi::attest::Verifier::new(self.allowed_signers, self.principal);
+        verifier.namespace = self.namespace.to_string();
+        verifier.program = self.program.to_path_buf();
+        verifier.fingerprint = self.fingerprint.map(str::to_string);
+        if let Some(path) = self.revoked {
+            let revoked = nostoi::attest::Revocations::read(path).map_err(|e| e.to_string())?;
+            verifier = verifier.revoking(revoked);
+        }
+        Ok(verifier)
+    }
+}
+
 /// `nostoi verify-attestation`: signature, pinned key and chain, failing closed.
-fn verify_attestation(path: &Path, options: VerifyOptions) -> Result<ExitCode, String> {
-    let VerifyOptions {
-        allowed_signers,
-        principal,
-        fingerprint,
-        namespace,
-        program,
-        canonicalize,
-        json,
-    } = options;
-    let mut verifier = nostoi::attest::Verifier::new(allowed_signers, principal);
-    verifier.namespace = namespace.to_string();
-    verifier.program = program.to_path_buf();
-    verifier.fingerprint = fingerprint.map(str::to_string);
+fn verify_attestation(path: &Path, options: VerifyOptions<'_>) -> Result<ExitCode, String> {
+    let canonicalize = options.canonicalize;
+    let json = options.json;
+    let fingerprint = options.fingerprint;
+    let verifier = options.verifier()?;
 
     match nostoi::attest::verify(path, &verifier) {
         Ok(checked) => {

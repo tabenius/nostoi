@@ -36,7 +36,8 @@ use std::path::Path;
 use crate::attestation::{
     read_capped, write_guarded, Attestation, Canonicality, Document, ReadDocument,
 };
-use crate::{Error, Result};
+use crate::revocation::Revocations;
+use crate::{sshsig, Error, Result};
 
 /// The only bundle version this code produces or accepts.
 pub const BUNDLE_V1: &str = "nostoi-attestation-bundle-v1";
@@ -107,6 +108,105 @@ impl Bundle {
     pub fn signed_bytes(&self) -> Result<Vec<u8>> {
         self.document.canonical_bytes()
     }
+}
+
+/// What a caller expects of a bundle beyond "the signature is good".
+///
+/// The defaults are the strict ones, and that is deliberate: a caller that has
+/// thought about trust can relax them, and a caller that has not gets a refusal
+/// rather than a shrug.
+#[derive(Clone, Debug, Default)]
+pub struct Expectations {
+    /// The key that must have signed, `SHA256:…`.
+    ///
+    /// `None` means the caller has no pin. That is allowed and it is not a
+    /// recommendation: the bundle's own fingerprint then names a key nobody has
+    /// vouched for, and the honest description of the result is "signed by
+    /// someone unknown".
+    pub fingerprint: Option<String>,
+    /// The namespace the signature must have been made in.
+    ///
+    /// `None` accepts the namespace the signature says it used, which is the one
+    /// place a bundle gets to speak for itself. Set it when you know.
+    pub namespace: Option<String>,
+    /// Keys that must be refused whatever else is true.
+    pub revoked: Option<Revocations>,
+}
+
+/// A bundle whose signature, pin and revocation standing have been checked.
+///
+/// `how` says how the signature was checked, because a reader deciding whether to
+/// trust this should know whether a program or the built-in verifier did it.
+#[derive(Clone, Debug)]
+pub struct CheckedBundle {
+    pub bundle: Bundle,
+    /// The key that signed, equal to the bundle's own pin.
+    pub fingerprint: String,
+    /// The public key the signature carried, `ssh-ed25519 <base64>`.
+    pub public_key: String,
+    /// The namespace the signature was made in.
+    pub namespace: String,
+    /// The bytes the signature covers, for storage and display.
+    pub canonical_bytes: Vec<u8>,
+    /// `built-in` or `ssh-keygen`.
+    pub how: &'static str,
+    /// Whether the signing key is revoked. Always false here: a revoked key is
+    /// refused rather than reported, so that no caller can mistake a bundle it
+    /// stored for one it accepted.
+    pub revoked: bool,
+}
+
+/// Check a bundle without `ssh-keygen`.
+///
+/// The portable half of `nostoi verify-bundle`: shape, signature, the pin it
+/// carries, the pin the caller expects, and the revocation list. Everything
+/// needed is in the bundle and the arguments, so this works in a WebAssembly
+/// component, a browser, or anywhere else without a subprocess.
+///
+/// A caller that has both should use both. `ssh-keygen` is the reference
+/// implementation and this is a reading of a document that describes itself
+/// wrongly in two places; a disagreement between them is worth more than either
+/// answer, and the CLI treats it as a failure.
+pub fn verify_bundle(bundle: &Bundle, expected: &Expectations) -> Result<CheckedBundle> {
+    bundle.validate()?;
+    if let Some(namespace) = &expected.namespace {
+        if &bundle.namespace != namespace {
+            return Err(Error::Invalid(format!(
+                "the bundle signs namespace {:?}, not {namespace:?}",
+                bundle.namespace
+            )));
+        }
+    }
+    if let Some(revoked) = &expected.revoked {
+        // Before the signature, and before the pin: a burned key is not going to
+        // become unburned by being verified.
+        revoked.refuse(&bundle.fingerprint)?;
+    }
+    let canonical_bytes = bundle.signed_bytes()?;
+    let verified = sshsig::verify(&bundle.signature, &canonical_bytes, &bundle.namespace)?;
+    if verified.fingerprint != bundle.fingerprint {
+        return Err(Error::Invalid(format!(
+            "the bundle pins {} but the signature is from {}",
+            bundle.fingerprint, verified.fingerprint
+        )));
+    }
+    if let Some(pinned) = &expected.fingerprint {
+        if &verified.fingerprint != pinned {
+            return Err(Error::Invalid(format!(
+                "signed by {}, which is not the pinned key {pinned}",
+                verified.fingerprint
+            )));
+        }
+    }
+    Ok(CheckedBundle {
+        bundle: bundle.clone(),
+        fingerprint: verified.fingerprint,
+        public_key: sshsig::public_key_line(&verified.public_key)?,
+        namespace: verified.namespace,
+        canonical_bytes,
+        how: "built-in",
+        revoked: false,
+    })
 }
 
 /// Serialize a bundle to the exact bytes to publish.

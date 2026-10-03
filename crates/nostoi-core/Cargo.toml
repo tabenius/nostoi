@@ -17,6 +17,11 @@ serde_json = { version = "1", features = ["arbitrary_precision"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 hex = "0.4"
+# Signature verification, so a bundle can be checked without `ssh-keygen`: a
+# WebAssembly component has no subprocesses and a browser has no filesystem.
+# Pure Rust, so it compiles for every target this crate does.
+ed25519-dalek = "2"
+base64 = "0.22"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 # Only for attestations: to check that a string is NFC. Record canonicalization

@@ -1,0 +1,20 @@
+{
+  "v": "nostoi-attestation-bundle-v1",
+  "namespace": "nostoi-attestation",
+  "fingerprint": "SHA256:TXqo/u13biOBWNJi/NM+MweBh6qhWr2Ur/pEdnNUG44",
+  "document": {
+    "v": "nostoi-attestation-v1",
+    "chain": "audit",
+    "format": "nostoi-v1",
+    "seq": 3,
+    "digest": "14c40ec9a9fe55b184e078a3e4c3e8dd7c9a23bd0a681aaa4ee9765049bdb709",
+    "anchored_at": "2026-10-03T00:55:41.572Z",
+    "principal": "alice@laptop",
+    "fingerprint": "SHA256:TXqo/u13biOBWNJi/NM+MweBh6qhWr2Ur/pEdnNUG44",
+    "title": "March evidence freeze",
+    "manifest": "2601bb262d9bd511f78628fce3bd9c0b7767662ec7dcb0a65a679977a6b59df6",
+    "author": "Alice Example"
+  },
+  "signature": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgPpS+nzzBl6h2drm/RJIWNN7yud\n3n+LZDwxTjoieLXaUAAAASbm9zdG9pLWF0dGVzdGF0aW9uAAAAAAAAAAZzaGE1MTIAAABT\nAAAAC3NzaC1lZDI1NTE5AAAAQL8gjajStBDMtW7J4DQnaNVjNq55ZGAtCOo2z4S3asfZhc\npqtuK0wxyQ+bqDptqc29CvqsXcE+oLTEhz5uufLg0=\n-----END SSH SIGNATURE-----\n",
+  "note": "kept as the March freeze"
+}

@@ -46,10 +46,12 @@ mod error;
 pub mod format;
 pub mod jsonl;
 pub mod portable;
+pub mod revocation;
 #[cfg(feature = "sqlite")]
 pub mod schema;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+pub mod sshsig;
 pub mod time;
 
 pub use attestation::{Attestation, Attested, Coverage, Described, Sidecars, ATTESTATION_V1};
@@ -57,6 +59,7 @@ pub use chain::{Entry, Head, Problem, Report, StreamingVerification, GENESIS};
 pub use error::{Error, Result};
 pub use format::Format;
 pub use jsonl::{Draft, Loaded};
+pub use revocation::Revocations;
 
 use std::path::Path;
 

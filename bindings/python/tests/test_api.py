@@ -37,3 +37,79 @@ class Api(unittest.TestCase):
             Path(directory, "python.jsonl").write_text(text)
 
 if __name__ == "__main__": unittest.main()
+
+class AttestationTests(unittest.TestCase):
+    """The portable half of an attestation, from Python."""
+
+    def chain(self, dir_, records=3):
+        path = os.path.join(dir_, "audit.jsonl")
+        for index in range(records):
+            nostoi.append(path, kind="attest", body={"index": index})
+        return path
+
+    def document(self, path, **overrides):
+        head = nostoi.verify(path)
+        document = {
+            "v": "nostoi-attestation-v1",
+            "chain": "test",
+            "format": "nostoi-v1",
+            "seq": head["head"]["seq"],
+            "digest": head["head"]["digest"],
+            "anchored_at": "2026-02-01T12:00:00Z",
+            "principal": "alice@laptop",
+            "fingerprint": "SHA256:" + "A" * 43,
+            **overrides,
+        }
+        return document
+
+    def test_canonical_bytes_are_reproducible_and_ascii(self):
+        with tempfile.TemporaryDirectory() as dir_:
+            path = self.chain(dir_)
+            document = self.document(path, title="caf\u00e9 freeze")
+            first = nostoi.attestation_canonical_bytes(document)
+            self.assertEqual(first, nostoi.attestation_canonical_bytes(document))
+            self.assertTrue(first.isascii())
+            # Key order in the caller's dict must not change what was signed.
+            reordered = dict(reversed(list(document.items())))
+            self.assertEqual(nostoi.attestation_canonical_bytes(reordered), first)
+            self.assertIn(r"\u00e9", first)
+
+    def test_verifying_against_a_chain(self):
+        with tempfile.TemporaryDirectory() as dir_:
+            path = self.chain(dir_)
+            report = nostoi.verify_attestation(path, self.document(path))
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["coverage"], "current")
+            self.assertTrue(report["covers_head"])
+            self.assertEqual(report["principal"], "alice@laptop")
+            # It has no allowed-signers file, so it must not claim otherwise.
+            self.assertEqual(report["signature"], "unchecked")
+
+    def test_a_stale_attestation_is_reported_not_raised(self):
+        with tempfile.TemporaryDirectory() as dir_:
+            path = self.chain(dir_, records=2)
+            old = self.document(path)
+            nostoi.append(path, kind="attest", body={"index": 99})
+            report = nostoi.verify_attestation(path, old)
+            self.assertTrue(report["ok"])
+            self.assertFalse(report["covers_head"])
+            self.assertEqual(report["coverage"], {"stale": True, "ahead_by": 1})
+
+    def test_a_rewritten_or_truncated_chain_is_refused(self):
+        with tempfile.TemporaryDirectory() as dir_:
+            path = self.chain(dir_, records=4)
+            document = self.document(path)
+            text = open(path).read().splitlines()
+            open(path, "w").write("\n".join(text[:2]) + "\n")
+            with self.assertRaises(ValueError):
+                nostoi.verify_attestation(path, document)
+
+    def test_a_malformed_document_is_refused(self):
+        with tempfile.TemporaryDirectory() as dir_:
+            path = self.chain(dir_)
+            document = self.document(path)
+            document["seq"] = 0
+            with self.assertRaises(ValueError):
+                nostoi.attestation_canonical_bytes(document)
+            with self.assertRaises(ValueError):
+                nostoi.verify_attestation(path, document)

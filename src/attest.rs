@@ -1119,12 +1119,18 @@ const ATTEMPTS: usize = 8;
 /// umask, and it succeeds on a directory that is already there. The second is
 /// the dangerous one, because the name is derived from the pid and a clock.
 fn create_private(dir: &Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
+    // Set the mode by hand rather than trusting the umask, which is the only way
+    // to be sure nothing else on the box can read a signature or a private key
+    // we just staged.
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
-    }
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     builder.create(dir)
 }
 

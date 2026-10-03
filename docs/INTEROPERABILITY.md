@@ -5,7 +5,8 @@ see [audit-first operations](AUDIT-FIRST.md).
 
 All bindings call the same Rust verifier. The WIT contract is
 [`bindings/component/wit/world.wit`](../bindings/component/wit/world.wit).
-The component exports canonical-json, verify-jsonl and append-jsonl. JSON text
+The component exports canonical-json, verify-jsonl and append-jsonl from
+`chains`, and canonical-bytes and verify-document from `attestations`. JSON text
 crosses the boundary so unsigned 64-bit integers are never rounded by JavaScript.
 Results contain JSON reports; a broken chain is `ok: false`, while API errors
 (invalid format, rejected append, malformed draft) are errors/exceptions.
@@ -36,6 +37,28 @@ an extension. The native package uses a CPython stable ABI with Python 3.11 as
 its floor. Linux x86-64 was tested locally; other platforms need wheel builds
 and platform verification before being advertised as release targets.
 
+### Attestations from Python
+
+The portable half of an attestation — what was signed, and whether it is still
+true of a chain — needs no `ssh-keygen`, so a binding can do it:
+
+```python
+import nostoi
+document = {'v': 'nostoi-attestation-v1', 'chain': 'events', 'format': 'nostoi-v1',
+            'seq': 2, 'digest': '…', 'anchored_at': '2026-09-27T13:00:00Z',
+            'principal': 'alice@laptop', 'fingerprint': 'SHA256:…'}
+# The exact bytes a signature covers, so a receiver can reproduce what was signed.
+signed = nostoi.attestation_canonical_bytes(document)
+report = nostoi.verify_attestation('events.jsonl', document)
+assert report['ok'] and report['coverage'] == 'current'
+```
+
+`verify_attestation` reports `signature: 'unchecked'` and always will: these
+functions have no allowed-signers file, so they cannot have verified a
+signature and must not imply that they did. A stale attestation is reported
+(`coverage: {'stale': True, 'ahead_by': n}`) rather than raised, because
+"this is out of date" is an answer; use the `nostoi` CLI to check a signature.
+
 ## WIT component and JavaScript
 
 ```sh
@@ -56,12 +79,25 @@ const text = chains.appendJsonl('', {
 console.log(JSON.parse(chains.verifyJsonl(text, undefined)).ok);
 ```
 
+```js
+import { attestations } from './dist/nostoi.js';
+// Reports are JSON text with snake_case keys, as `verifyJsonl` reports are.
+const report = JSON.parse(attestations.verifyDocument(text, document, undefined));
+console.log(report.coverage, report.signature); // current unchecked
+```
+
 Do not pass large integers through JavaScript Number or JSON.parse/stringify
 before verification. Preserve original JSON text, or encode decimal business
 values as strings. The generated TypeScript declarations describe the WIT ABI.
 Jco supplies JavaScript bindings and WASI shims for Node and browser bundlers;
 bare browser imports need a bundler/import map for preview2-shim. Node execution
 is tested; browser bundler integration is not a separately shipped application.
+
+`attestations` checks a document against a chain the host holds as text. It
+verifies no signature and holds no keys: a signature needs a private key, and
+this interface deliberately has nowhere to put one. A component that must
+verify signatures needs `ssh-keygen` on the host side, or a native SSHSIG
+implementation on top of WebCrypto.
 
 The component has no filesystem API. Its host supplies complete JSONL and an
 explicit RFC 3339 timestamp and owns storage, locks and atomic writes. It does

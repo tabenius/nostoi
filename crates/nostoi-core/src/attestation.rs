@@ -665,8 +665,22 @@ pub fn check(
     attestation: &Attestation,
     format: Option<crate::Format>,
 ) -> Result<Attested> {
-    attestation.validate()?;
     let verification = crate::verify_streaming(chain, format, Some(attestation.seq))?;
+    check_verification(attestation, verification)
+}
+
+/// The same check, for a chain already in memory.
+///
+/// Takes the verification rather than a path so a caller that does not have a
+/// filesystem — a WebAssembly host, or anything holding the records as text —
+/// can reach the same conclusion. The verification must have been computed with
+/// `checkpoint_seq` set to the attested sequence, because that is what makes an
+/// attestation over an intact prefix distinguishable from a rewrite.
+pub fn check_verification(
+    attestation: &Attestation,
+    verification: StreamingVerification,
+) -> Result<Attested> {
+    attestation.validate()?;
     // The format is part of the claim, not decoration: the same digest under a
     // different format is not the same record.
     if verification.report.format != attestation.format {

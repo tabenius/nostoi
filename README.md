@@ -87,8 +87,13 @@ and bindings use only that. Existing `nostoi::` paths keep working; see
 
 Signed attestations (`nostoi_core::attestation`) live in the core: the document
 format, its canonical bytes and its binding to a chain head are portable and need
-no SSH tooling, so any language can verify one. The `ssh-keygen -Y sign`
-driver is in the facade, and only that part shells out.
+no SSH tooling. The `ssh-keygen -Y sign` driver is in the facade, and only that
+part shells out.
+
+The bindings do not expose attestation verification yet, so "portable" currently
+means the format is reproducible outside Rust rather than that a verifier is
+shipped for you: a Python or JavaScript caller would recompute the canonical bytes
+and invoke `ssh-keygen` itself.
 
 ## Python and WebAssembly
 

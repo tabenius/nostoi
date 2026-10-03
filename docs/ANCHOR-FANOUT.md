@@ -223,6 +223,13 @@ Single-destination variables (`ENDPOINT`, `BUCKET`, `REGION`, `LOCK`,
 half-migrated unit fails loudly instead of quietly publishing to one place.
 Per-destination retention belongs in the target file.
 
+The refusal is doubled, because either layer alone had a gap. The runner refuses
+those variables, and so does the binary: `--endpoint` and `--bucket` are optional
+in the parser — a target file replaces them — and are then checked per mode, so a
+single destination names what it is missing and a fan-out refuses them outright.
+Before that, every fan-out invocation died on argument parsing because both flags
+were unconditionally required.
+
 In this mode the runner exports no AWS variables at all: credentials come only
 from the files systemd copied into the service's private credential directory.
 The runner passes that directory's path through, and `nostoi-anchor` reads each

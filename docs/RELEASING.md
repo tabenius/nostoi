@@ -10,19 +10,32 @@ Run from a clean checkout with Rust, Python, maturin, Node and wasm-tools:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --locked
-cargo test --no-default-features --lib --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+sh -n contrib/systemd/nostoi-anchor-runner
+python3 contrib/systemd/test_anchor_runner.py
+cargo test --locked -p nostoi --test attestation -- --nocapture   # signs for real
+cargo test --no-default-features --features sqlite --example large_chain --locked
+cargo build --no-default-features --lib --locked
 cargo build --no-default-features --lib --target wasm32-unknown-unknown
 cargo build -p nostoi-component --target wasm32-wasip2 --release
 wasm-tools validate target/wasm32-wasip2/release/nostoi_component.wasm
-cargo publish --dry-run
+cargo publish --dry-run --locked -p nostoi-core
 ```
+
+`ssh-keygen` has to be on `PATH` for the attestation suite. It signs with a
+throwaway key generated per run, so the suite skips when the tool is absent —
+which is right on a laptop and wrong in CI, hence the explicit invocation.
 
 Build/install the Python wheel, run bindings/python/tests, build the JavaScript
 package and run its tests as described in INTEROPERABILITY.md. CI repeats the
 cross-language equality check. Inspect `cargo package --list`: each crate should
 enter crates.io with only its own source, tests, licenses, README and logo.
+
+The root package includes `/tests/*.rs` rather than `/tests/**`, which keeps the
+attestation suite's committed test key out of the published artifact. Cargo
+ignores `exclude` when `include` is present, so the narrowing has to be in
+`include`, and CI checks all four crates' package lists for it.
 
 Before publishing: review the diff and CI, confirm crates.io ownership, check
 license files, choose a tag matching Cargo.toml, and record the tested toolchain.

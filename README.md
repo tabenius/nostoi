@@ -178,9 +178,10 @@ checkpoint key.
 Full-chain and remote-checkpoint verification now stream records rather than
 retaining the entire history. See [streaming verification](docs/STREAMING-VERIFICATION.md),
 [bounded S3 diagnostics](docs/S3-DIAGNOSTICS.md), and
-[large-chain measurements](docs/LARGE-CHAIN-BENCHMARKS.md). A proposed next-step
-[compartment architecture](docs/COMPARTMENT-ARCHITECTURE.md) describes process
-privileges and a staged crate split while preserving the current API.
+[large-chain measurements](docs/LARGE-CHAIN-BENCHMARKS.md). The
+[compartment architecture](docs/COMPARTMENT-ARCHITECTURE.md) has since been
+implemented: the workspace is split per compartment and the facade preserves the
+existing API.
 
 Owned databases now declare independent schema revisions and component identities;
 prepared requests and kernel payloads also carry explicit format tags. Use

@@ -78,6 +78,26 @@ pub struct Attestation {
     /// Optional, and omitted rather than null when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_key: Option<String>,
+    /// A human label for what was attested, e.g. "March evidence freeze".
+    ///
+    /// Inside the document rather than beside it, so it is covered by the
+    /// signature. A label in a sidecar file would be editable by anyone, and a
+    /// display page showing an unsigned claim is worse than showing nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// What was attested beyond the position: a digest, or a short description of
+    /// the artifact. Free text, because the shape belongs to whatever is being
+    /// attested and the chain digest already pins the position exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+    /// Who is attesting, in their own words.
+    ///
+    /// **This is a public, permanent commitment once signed.** The document is
+    /// meant to be published somewhere it cannot be retracted, so a real name here
+    /// cannot be unlinked later. Use `principal` for a key identity and leave this
+    /// empty unless linking the two is the point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
 }
 
 /// The sidecar paths for a chain.
@@ -173,9 +193,26 @@ impl Attestation {
             principal: principal.to_string(),
             fingerprint: fingerprint.to_string(),
             anchor_key,
+            title: None,
+            manifest: None,
+            author: None,
         };
         attestation.validate()?;
         Ok(attestation)
+    }
+
+    /// Add the optional human-facing fields and re-validate.
+    ///
+    /// A builder step rather than another constructor, because a second
+    /// constructor taking eight arguments is worse than one that takes seven and a
+    /// struct. The document is validated again because these fields are inside the
+    /// signed bytes.
+    pub fn describe(mut self, described: Described) -> Result<Self> {
+        self.title = described.title;
+        self.manifest = described.manifest;
+        self.author = described.author;
+        self.validate()?;
+        Ok(self)
     }
 
     /// Build an attestation for `head` at a given instant.
@@ -289,11 +326,25 @@ impl Attestation {
                 )));
             }
         }
-        if let Some(key) = &self.anchor_key {
-            if !is_nfc(key) {
-                return Err(Error::Invalid(
-                    "anchor_key is not in Unicode NFC form".into(),
-                ));
+        // anchor_key is checked with the rest below rather than twice.
+        for (field, value) in [
+            ("anchor_key", &self.anchor_key),
+            ("title", &self.title),
+            ("manifest", &self.manifest),
+            ("author", &self.author),
+        ] {
+            if let Some(value) = value {
+                if value.chars().count() > MAX_FIELD_CHARS {
+                    return Err(Error::Invalid(format!(
+                        "{field} is longer than {MAX_FIELD_CHARS} characters: an attestation \
+                         describes a position, it is not a place to put a document"
+                    )));
+                }
+                if !is_nfc(value) {
+                    return Err(Error::Invalid(format!(
+                        "{field} is not in Unicode NFC form"
+                    )));
+                }
             }
         }
         Ok(())
@@ -345,6 +396,23 @@ impl Attestation {
     pub fn matches_chain(&self, chain: &str) -> bool {
         self.chain == chain
     }
+}
+
+/// The most characters any one optional field may carry.
+///
+/// Generous for a title or a description, and small enough that an attestation
+/// cannot be turned into bulk storage. The document size limit is the hard bound.
+pub const MAX_FIELD_CHARS: usize = 4096;
+
+/// The optional human-facing fields of an attestation.
+///
+/// Grouped so they travel together: they are all "what this is", none of them
+/// affects whether a chain matches, and all of them are inside the signed bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Described {
+    pub title: Option<String>,
+    pub manifest: Option<String>,
+    pub author: Option<String>,
 }
 
 /// The one definition of the bytes a signature covers.
@@ -469,11 +537,42 @@ impl ReadDocument {
 /// an error rather than an out-of-memory kill.
 pub const MAX_DOCUMENT_BYTES: u64 = 64 * 1024;
 
+/// Read a file, refusing one larger than `limit`, for callers with their own cap.
+pub fn read_capped(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    read_bounded(path, limit)
+}
+
+/// Write a file, refusing to write through a symlink.
+///
+/// `fs::write` follows symlinks, so a planted path turns a create into an
+/// overwrite of something else. These files sit next to audit chains and get
+/// published, which is where something might try to redirect a write.
+///
+/// Best effort, and worth saying so: a symlink created between the check and the
+/// write still wins, and protecting the directory components as well would need
+/// `openat` with `O_NOFOLLOW` on each one. This catches the planted-in-advance
+/// case and the accidental one.
+pub fn write_guarded(path: &Path, bytes: &[u8]) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(Error::Invalid(format!(
+                "{} is a symlink, so it was not written; move it aside if that is intended, \
+                 and check what it points at",
+                path.display()
+            )))
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(crate::error::io(path)(error)),
+    }
+    std::fs::write(path, bytes).map_err(crate::error::io(path))
+}
+
 /// Read a file, refusing one larger than `limit`.
 ///
 /// The size is checked before reading and the read itself is capped, so a file
 /// that grows between the two is still refused rather than followed.
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     use std::io::Read as _;
     let file = std::fs::File::open(path).map_err(crate::error::io(path))?;
     let size = file.metadata().map_err(crate::error::io(path))?.len();

@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use nostoi_core::attestation::{self, Attestation, Attested, Sidecars, DEFAULT_NAMESPACE};
+use nostoi_core::bundle::{Bundle, BUNDLE_V1};
 
 pub use nostoi_core::attestation::{Canonicality, ReadDocument};
 use nostoi_core::time::now as now_rfc3339;
@@ -527,6 +528,74 @@ pub fn verify(chain: &Path, verifier: &Verifier) -> Result<Attested> {
     Ok(checked)
 }
 
+/// Wrap a signature into a publishable bundle.
+///
+/// The fingerprint is repeated outside the document so a receiver can compare it
+/// against what it already trusts before doing anything else, and the public key
+/// is deliberately *not* included: `ssh-keygen` embeds it in the signature, so a
+/// bundle cannot be used to smuggle in a different one.
+pub fn bundle(signed: &Signed, namespace: &str, note: Option<String>) -> Result<Bundle> {
+    let bundle = Bundle {
+        v: BUNDLE_V1.to_string(),
+        namespace: namespace.to_string(),
+        fingerprint: signed.attestation.fingerprint.clone(),
+        document: signed.attestation.clone(),
+        signature: String::from_utf8(signed.signature.clone()).map_err(|_| {
+            Error::Invalid("the signature is not UTF-8, so it cannot be bundled".into())
+        })?,
+        note,
+    };
+    bundle.validate()?;
+    Ok(bundle)
+}
+
+/// Check a bundle's signature, its pin and its namespace, with no chain.
+///
+/// This is what a receiver does when a bundle arrives: there is no local chain to
+/// compare against yet, so it answers "is this a genuine attestation by the key I
+/// already trust, and what does it claim" rather than "does it match these
+/// records". The document is validated and its canonical bytes recomputed, so a
+/// bundle whose document was edited fails here rather than at some later point.
+pub fn verify_bundle(bundle: &Bundle, verifier: &Verifier) -> Result<CheckedBundle> {
+    bundle.validate()?;
+    let reported = verify_bundle_signature(
+        &verifier.program,
+        &verifier.allowed_signers,
+        &verifier.principal,
+        &bundle.namespace,
+        bundle.signature.as_bytes(),
+        &bundle.signed_bytes()?,
+    )?;
+    if reported != bundle.fingerprint {
+        return Err(Error::Invalid(format!(
+            "the bundle pins {} but the signature is from {reported}",
+            bundle.fingerprint
+        )));
+    }
+    if let Some(pinned) = &verifier.fingerprint {
+        if &reported != pinned {
+            return Err(Error::Invalid(format!(
+                "signed by {reported}, which is not the pinned key {pinned}"
+            )));
+        }
+    }
+    Ok(CheckedBundle {
+        bundle: bundle.clone(),
+        fingerprint: reported,
+        canonical_bytes: bundle.signed_bytes()?,
+    })
+}
+
+/// A bundle whose signature and pin have been checked.
+#[derive(Clone, Debug)]
+pub struct CheckedBundle {
+    pub bundle: Bundle,
+    /// The fingerprint `ssh-keygen` reported, equal to the bundle's own.
+    pub fingerprint: String,
+    /// The bytes the signature covers, for storage and display.
+    pub canonical_bytes: Vec<u8>,
+}
+
 /// Rewrite the document in canonical form, if it is not already.
 ///
 /// Takes the document that was verified rather than reading its own, which does
@@ -585,6 +654,29 @@ fn sign_bytes(program: &Path, key: &Path, namespace: &str, document: &[u8]) -> R
 
 /// Verify bytes with `ssh-keygen -Y verify`, returning the key it trusted.
 fn verify_bytes(
+    program: &Path,
+    allowed_signers: &Path,
+    principal: &str,
+    namespace: &str,
+    signature: &[u8],
+    document: &[u8],
+) -> Result<String> {
+    verify_bundle_signature(
+        program,
+        allowed_signers,
+        principal,
+        namespace,
+        signature,
+        document,
+    )
+}
+
+/// Verify a signature over `document`, returning the fingerprint it trusted.
+///
+/// The signature goes to a private temporary file because `ssh-keygen -Y verify`
+/// takes a path rather than reading standard input for the signature itself.
+#[allow(clippy::too_many_arguments)]
+fn verify_bundle_signature(
     program: &Path,
     allowed_signers: &Path,
     principal: &str,

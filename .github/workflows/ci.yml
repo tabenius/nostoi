@@ -78,14 +78,17 @@ jobs:
         env:
           NOSTOI_INTEROP_DIR: /tmp/nostoi-interop
       - run: cargo build --no-default-features --lib --target wasm32-unknown-unknown --locked
+      - run: npm ci && npm audit && npm run build
+        working-directory: bindings/javascript
       - uses: taiki-e/install-action@wasm-tools
       - name: The component binary is a valid component
         # The checklist in docs/RELEASING.md asks for this by hand, which means
-        # it was only ever run when someone remembered. `npm run build` above
-        # already produced the artifact via jco, so this validates the binary
-        # that actually ships rather than a separately built one.
+        # it only ran when someone remembered. `npm run build` immediately above
+        # produced this exact artifact -- `nostoi-component` for wasm32-wasip2,
+        # then jco -- so this validates the binary that actually ships rather
+        # than a separately built one. It has to come after that build.
         run: wasm-tools validate target/wasm32-wasip2/release/nostoi_component.wasm
-      - run: npm ci && npm audit && npm run build && npm test
+      - run: npm test
         working-directory: bindings/javascript
         env:
           NOSTOI_INTEROP_DIR: /tmp/nostoi-interop

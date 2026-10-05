@@ -64,9 +64,12 @@ jobs:
       - name: Python for the wheel and the interop checks
         run: |
           python3 -m venv "$RUNNER_TEMP/interop"
-          echo "PYTHON=$RUNNER_TEMP/interop/bin/python" >> "$GITHUB_ENV"
-          "$PYTHON" -m pip install --quiet --upgrade pip
-          "$PYTHON" --version
+          # `$GITHUB_ENV` only reaches *later* steps, so use a local variable in
+          # this one and publish it for the rest of the job.
+          PY="$RUNNER_TEMP/interop/bin/python"
+          echo "PYTHON=$PY" >> "$GITHUB_ENV"
+          "$PY" -m pip install --quiet --upgrade pip
+          "$PY" --version
       - run: $PYTHON -m pip install maturin
       - run: $PYTHON -m maturin build --locked --manifest-path bindings/python/Cargo.toml --out dist
       - run: $PYTHON -m pip install dist/*.whl

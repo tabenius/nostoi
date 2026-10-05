@@ -1061,7 +1061,16 @@ mod tests {
     fn the_selection_is_two_signals_not_one() {
         let dir = tempfile::tempdir().unwrap();
         chain(dir.path());
-        let mut selected = App::new(&chain_path(dir.path()), None);
+        // Ask for colour explicitly rather than taking `App::new`'s answer from
+        // the environment: on a runner with no terminal, detection settles on
+        // `ColorMode::None`, the palette has no colours, and the assertion
+        // below would panic instead of testing anything. That is the whole
+        // reason `with_look` exists.
+        let mut selected = App::with_look(
+            &chain_path(dir.path()),
+            None,
+            look("ragbaz", ColorMode::Ansi256, Set::Ascii),
+        );
         let colour = buffer(&mut selected);
         // Signal one: a marker glyph in the one-cell gutter column the table
         // reserves for it, immediately inside the block's border.

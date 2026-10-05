@@ -10,7 +10,11 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # This repository's own runner, `tabenius-nostoi`, registered on the
+    # ci-runner account on the development host. The labels are the ones a
+    # runner reports by default; `nostoi` is registered too, as a readable
+    # marker in the runner list.
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -22,6 +26,12 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Test (with the Python conformance checks)
         run: cargo test --workspace --all-features --locked
+      - name: The Python reference and the crate write the same bytes
+        # `tests/cli.rs` checks interoperability from the Rust side and skips
+        # when python3 is absent. This is the mirror: it pins a known-answer
+        # digest, checks rejection and tamper parity at the 64-bit boundaries,
+        # and its escaping cases run even with no Rust toolchain present.
+        run: python3 contrib/python/test_conformance.py
       - name: Scheduling helper syntax and credential separation
         run: sh -n contrib/systemd/nostoi-anchor-runner && python3 contrib/systemd/test_anchor_runner.py
       - name: Attestations need ssh-keygen
@@ -36,7 +46,7 @@ jobs:
       - name: The verifier alone builds (no default features)
         run: cargo build --no-default-features --lib --locked
   interoperability:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -56,6 +66,13 @@ jobs:
         env:
           NOSTOI_INTEROP_DIR: /tmp/nostoi-interop
       - run: cargo build --no-default-features --lib --target wasm32-unknown-unknown --locked
+      - uses: taiki-e/install-action@wasm-tools
+      - name: The component binary is a valid component
+        # The checklist in docs/RELEASING.md asks for this by hand, which means
+        # it was only ever run when someone remembered. `npm run build` above
+        # already produced the artifact via jco, so this validates the binary
+        # that actually ships rather than a separately built one.
+        run: wasm-tools validate target/wasm32-wasip2/release/nostoi_component.wasm
       - run: npm ci && npm audit && npm run build && npm test
         working-directory: bindings/javascript
         env:
@@ -82,9 +99,22 @@ jobs:
           # The attestation suite commits a throwaway key so its fingerprint can
           # be a known answer. Cargo ignores `exclude` when `include` is set, so
           # this is the check that the narrowing in Cargo.toml keeps holding.
+          #
+          # It has to fail *closed*. `cargo package --list` writes nothing to
+          # stdout and exits non-zero when packaging cannot even be attempted --
+          # a dirty tree, a lockfile out of date, a missing file -- and piping
+          # that straight into `grep -q` makes the guard conclude "no key" and
+          # pass. So an empty listing is treated as the error it is.
           for crate in nostoi nostoi-core nostoi-anchor nostoi-kmsg; do
-            if cargo package --list --locked -p "$crate" | grep -q 'id_ed25519'; then
+            listing="$(cargo package --list --locked -p "$crate")"
+            if [ -z "${listing//[[:space:]]/}" ]; then
+              echo "::error::$crate produced no file list, so this check cannot conclude anything"
+              exit 1
+            fi
+            count="$(printf '%s\n' "$listing" | grep -c .)"
+            if printf '%s\n' "$listing" | grep -q 'id_ed25519'; then
               echo "::error::$crate would publish the test private key"
               exit 1
             fi
+            echo "$crate: $count files packaged, no test private key"
           done

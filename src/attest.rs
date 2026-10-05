@@ -29,9 +29,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use nostoi_core::attestation::{self, Attestation, Attested, Sidecars, DEFAULT_NAMESPACE};
-use nostoi_core::bundle::{Bundle, BUNDLE_V1};
+use nostoi_core::bundle::{Bundle, Expectations, BUNDLE_V1};
 
 pub use nostoi_core::attestation::{Canonicality, ReadDocument};
+pub use nostoi_core::bundle::CheckedBundle;
 use nostoi_core::time::now as now_rfc3339;
 use nostoi_core::Format;
 
@@ -84,64 +85,11 @@ pub struct Signed {
 
 /// Key fingerprints that must not be trusted, however they are presented.
 ///
-/// Why this is a separate list rather than "edit your `allowed_signers` file":
-/// editing that file is exactly the substitution the fingerprint pin defends
-/// against. If revoking a key meant editing the file, then a compromised
-/// operator could quietly un-revoke it, and a verifier reading only the file
-/// would see nothing wrong. Revocation therefore travels on its own channel and
-/// is checked *before* the pin, so a burned key fails even when it is pinned.
-#[derive(Clone, Debug, Default)]
-pub struct Revocations {
-    fingerprints: Vec<String>,
-}
-
-impl Revocations {
-    /// Read a revocation list: one `SHA256:…` fingerprint per line, `#` comments
-    /// and blank lines ignored.
-    ///
-    /// Anything else on a line is a mistake worth reporting rather than skipping,
-    /// because a typo in a revocation list is a key that stays trusted.
-    pub fn read(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|error| Error::Invalid(format!("cannot read {}: {error}", path.display())))?;
-        let mut fingerprints = Vec::new();
-        for (number, line) in text.lines().enumerate() {
-            let line = line.split('#').next().unwrap_or("").trim();
-            if line.is_empty() {
-                continue;
-            }
-            if !line.starts_with("SHA256:") {
-                return Err(Error::Invalid(format!(
-                    "{}:{}: expected a SHA256:… fingerprint, got {line:?}",
-                    path.display(),
-                    number + 1
-                )));
-            }
-            fingerprints.push(line.to_string());
-        }
-        Ok(Self { fingerprints })
-    }
-
-    /// Revoke these fingerprints in memory.
-    pub fn from_fingerprints(fingerprints: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            fingerprints: fingerprints.into_iter().collect(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.fingerprints.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.fingerprints.len()
-    }
-
-    /// Whether this key is on the list.
-    pub fn is_revoked(&self, fingerprint: &str) -> bool {
-        self.fingerprints.iter().any(|entry| entry == fingerprint)
-    }
-}
+/// Re-exported from the core crate, where it lives so that Python and
+/// WebAssembly callers can honour a revocation list as well. See
+/// [`nostoi_core::revocation`] for why it is a separate list rather than a
+/// shorter allow list.
+pub use nostoi_core::revocation::Revocations;
 
 /// How to verify.
 #[derive(Clone, Debug)]
@@ -159,6 +107,14 @@ pub struct Verifier {
     pub fingerprint: Option<String>,
     /// Keys refused outright, checked before the pin.
     pub revoked: Option<Revocations>,
+    /// Check the signature with the built-in verifier instead of the program.
+    ///
+    /// Off by default, because `ssh-keygen -Y verify` is the reference
+    /// implementation and this crate's own reading of a document that describes
+    /// itself wrongly in two places is not. Turn it on where there is no
+    /// subprocess to run: a WebAssembly host, a container without ssh tooling, a
+    /// service checking bundles it was handed.
+    pub portable: bool,
 }
 
 impl Verifier {
@@ -170,6 +126,7 @@ impl Verifier {
             program: PathBuf::from(DEFAULT_PROGRAM),
             fingerprint: None,
             revoked: None,
+            portable: false,
         }
     }
 
@@ -182,6 +139,12 @@ impl Verifier {
     /// Pin the expected key fingerprint.
     pub fn pin(mut self, fingerprint: impl Into<String>) -> Self {
         self.fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    /// Check with the built-in verifier, without running a program.
+    pub fn portable(mut self) -> Self {
+        self.portable = true;
         self
     }
 }
@@ -667,48 +630,47 @@ pub fn bundle(signed: &Signed, namespace: &str, note: Option<String>) -> Result<
 /// This is what a receiver does when a bundle arrives: there is no local chain to
 /// compare against yet, so it answers "is this a genuine attestation by the key I
 /// already trust, and what does it claim" rather than "does it match these
-/// records". The document is validated and its canonical bytes recomputed, so a
-/// bundle whose document was edited fails here rather than at some later point.
+/// records".
+///
+/// Checked twice by default, and the two must agree: once with the built-in
+/// verifier and once with `ssh-keygen -Y verify`. They are independent readings
+/// of the same bytes — one from the reference implementation, one from this
+/// crate's reading of a specification that describes the format wrongly in two
+/// places — and a bundle they disagree about is a bug in one of them, which is
+/// worth surfacing rather than picking a winner. [`Verifier::portable`] checks
+/// with the built-in verifier alone, for a host that has no program to run.
 pub fn verify_bundle(bundle: &Bundle, verifier: &Verifier) -> Result<CheckedBundle> {
-    bundle.validate()?;
+    let expected = Expectations {
+        fingerprint: verifier.fingerprint.clone(),
+        // The namespace a bundle signs is stated by the bundle, so it is not
+        // pinned here; `verify-attestation` has a document and a caller who
+        // asked for a namespace, and this does not.
+        namespace: None,
+        revoked: verifier.revoked.clone(),
+    };
+    let mut checked = nostoi_core::bundle::verify_bundle(bundle, &expected).map_err(Error::from)?;
+    if verifier.portable {
+        return Ok(checked);
+    }
     let reported = verify_signature(&SignatureCheck {
         program: &verifier.program,
         allowed_signers: &verifier.allowed_signers,
         principal: &verifier.principal,
         namespace: &bundle.namespace,
         signature: bundle.signature.as_bytes(),
-        document: &bundle.signed_bytes()?,
+        document: &checked.canonical_bytes,
         fingerprint: Some(&bundle.fingerprint),
         revoked: verifier.revoked.as_ref(),
     })?;
-    if reported != bundle.fingerprint {
+    if reported != checked.fingerprint {
         return Err(Error::Invalid(format!(
-            "the bundle pins {} but the signature is from {reported}",
-            bundle.fingerprint
+            "ssh-keygen trusts {} but the built-in verifier read {} from the same signature: \
+             one of them is wrong, and this bundle is not being accepted on either answer",
+            reported, checked.fingerprint
         )));
     }
-    if let Some(pinned) = &verifier.fingerprint {
-        if &reported != pinned {
-            return Err(Error::Invalid(format!(
-                "signed by {reported}, which is not the pinned key {pinned}"
-            )));
-        }
-    }
-    Ok(CheckedBundle {
-        bundle: bundle.clone(),
-        fingerprint: reported,
-        canonical_bytes: bundle.signed_bytes()?,
-    })
-}
-
-/// A bundle whose signature and pin have been checked.
-#[derive(Clone, Debug)]
-pub struct CheckedBundle {
-    pub bundle: Bundle,
-    /// The fingerprint `ssh-keygen` reported, equal to the bundle's own.
-    pub fingerprint: String,
-    /// The bytes the signature covers, for storage and display.
-    pub canonical_bytes: Vec<u8>,
+    checked.how = "ssh-keygen and built-in";
+    Ok(checked)
 }
 
 /// Serialize a bundle to the exact bytes to publish.

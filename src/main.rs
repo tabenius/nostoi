@@ -183,6 +183,9 @@ enum Command {
         /// refused even when it is the pinned one.
         #[arg(long)]
         revoked: Option<PathBuf>,
+        /// Check with the built-in verifier only, without running ssh-keygen
+        #[arg(long)]
+        portable: bool,
         #[arg(long)]
         json: bool,
     },
@@ -464,6 +467,7 @@ fn run(command: Command) -> Result<ExitCode, String> {
             namespace,
             program,
             revoked,
+            portable,
             json,
         } => verify_bundle(
             &path,
@@ -476,6 +480,7 @@ fn run(command: Command) -> Result<ExitCode, String> {
                 revoked: revoked.as_deref(),
                 canonicalize: false,
                 json,
+                portable,
             },
         ),
         Command::VerifyAttestation {
@@ -499,6 +504,7 @@ fn run(command: Command) -> Result<ExitCode, String> {
                 revoked: revoked.as_deref(),
                 canonicalize,
                 json,
+                portable: false,
             },
         ),
         Command::Formats => {
@@ -809,6 +815,8 @@ fn verify_bundle(path: &Path, options: VerifyOptions<'_>) -> Result<ExitCode, St
                         "path": path,
                         "ok": true,
                         "signature": "verified",
+                        "verified_by": checked.how,
+                        "public_key": checked.public_key,
                         "bundle": checked.bundle.v,
                         "namespace": checked.bundle.namespace,
                         "principal": document.principal,
@@ -834,6 +842,12 @@ fn verify_bundle(path: &Path, options: VerifyOptions<'_>) -> Result<ExitCode, St
                     document.principal,
                     checked.fingerprint
                 );
+                if checked.how != "built-in" {
+                    println!(
+                        "  checked   both {} and the built-in verifier agreed",
+                        checked.how
+                    );
+                }
                 println!("  attested {} at {}", document.chain, document.anchored_at);
                 println!(
                     "  position seq={} digest={}",
@@ -891,6 +905,8 @@ struct VerifyOptions<'a> {
     revoked: Option<&'a Path>,
     canonicalize: bool,
     json: bool,
+    /// Check with the built-in verifier alone, without running a program.
+    portable: bool,
 }
 
 impl VerifyOptions<'_> {
@@ -903,6 +919,9 @@ impl VerifyOptions<'_> {
         if let Some(path) = self.revoked {
             let revoked = nostoi::attest::Revocations::read(path).map_err(|e| e.to_string())?;
             verifier = verifier.revoking(revoked);
+        }
+        if self.portable {
+            verifier = verifier.portable();
         }
         Ok(verifier)
     }

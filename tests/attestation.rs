@@ -1016,15 +1016,22 @@ fn a_mistyped_revocation_line_is_reported_rather_than_skipped() {
 
     // A typo in a revocation list is a key that stays trusted, so it is an error
     // rather than a skipped line.
-    std::fs::write(&list, "SHA256:abc\n").unwrap();
-    assert!(
-        attest::Revocations::read(&list).is_ok(),
+    let real =
+        attest::fingerprint(&ssh_keygen().unwrap(), &generate_key(dir.path(), "x@y")).unwrap();
+    std::fs::write(&list, format!("{real}\n")).unwrap();
+    assert_eq!(
+        attest::Revocations::read(&list).unwrap().len(),
+        1,
         "one entry is fine"
     );
 
-    std::fs::write(&list, "# comment\n\nSHA256:abc\nnot-a-fingerprint\n").unwrap();
-    let error = attest::Revocations::read(&list).unwrap_err();
-    let said = error.to_string();
+    // The right prefix and the wrong length: the near miss worth catching.
+    std::fs::write(&list, "SHA256:abc\n").unwrap();
+    let said = attest::Revocations::read(&list).unwrap_err().to_string();
+    assert!(said.contains("revoked.txt:1"), "{said}");
+
+    std::fs::write(&list, format!("# comment\n\n{real}\nnot-a-fingerprint\n")).unwrap();
+    let said = attest::Revocations::read(&list).unwrap_err().to_string();
     assert!(said.contains("revoked.txt:4"), "{said}");
     assert!(said.contains("SHA256:"), "{said}");
 
@@ -1042,4 +1049,54 @@ fn a_missing_program_is_reported_clearly() {
     signer.program = PathBuf::from("/nonexistent/ssh-keygen");
     let error = attest::sign(&fixture.chain, "production/kernel", None, &signer, None).unwrap_err();
     assert!(error.to_string().contains("cannot run"), "{error}");
+}
+
+#[test]
+fn the_built_in_verifier_and_ssh_keygen_agree_about_a_bundle() {
+    let fixture = fixture!();
+    let signed = fixture.sign();
+    let bundle = attest::bundle(
+        &signed,
+        "nostoi-attestation",
+        Some("portable cross-check".to_string()),
+    )
+    .unwrap();
+    let fingerprint = attest::fingerprint(&ssh_keygen().unwrap(), &fixture.key).unwrap();
+
+    // Checked both ways by default, and the two must agree: one reading is the
+    // reference implementation, the other is this crate's reading of a document
+    // that describes the format wrongly in two places.
+    let both = attest::verify_bundle(&bundle, &fixture.pinned()).unwrap();
+    assert_eq!(both.fingerprint, fingerprint);
+    assert_eq!(both.how, "ssh-keygen and built-in");
+    assert!(both
+        .public_key
+        .contains(public_key(&fixture.key).split(' ').nth(1).unwrap()));
+
+    // The built-in verifier alone, for a host with no subprocess to run.
+    let mut portable = fixture.pinned().portable();
+    portable.allowed_signers = std::path::PathBuf::from("/nonexistent/allowed_signers");
+    let built_in = attest::verify_bundle(&bundle, &portable).unwrap();
+    assert_eq!(built_in.fingerprint, both.fingerprint);
+    assert_eq!(built_in.canonical_bytes, both.canonical_bytes);
+    assert_eq!(built_in.how, "built-in");
+
+    // And they refuse the same things: an edited document, a namespace that is
+    // not the one signed, and a key that is revoked whatever else says otherwise.
+    let mut edited = bundle.clone();
+    edited.document.seq += 1;
+    assert!(attest::verify_bundle(&edited, &fixture.pinned()).is_err());
+    assert!(attest::verify_bundle(&edited, &portable).is_err());
+
+    let other_namespace = attest::bundle(&signed, "some-other-use", None).unwrap();
+    assert!(attest::verify_bundle(&other_namespace, &fixture.pinned()).is_err());
+    assert!(attest::verify_bundle(&other_namespace, &portable).is_err());
+
+    let list = fixture._dir.path().join("revoked.txt");
+    std::fs::write(&list, format!("{fingerprint}\n")).unwrap();
+    let revoked = attest::Revocations::read(&list).unwrap();
+    let mut pinned_revoked = fixture.pinned().revoking(revoked.clone());
+    pinned_revoked.portable = true;
+    let error = attest::verify_bundle(&bundle, &pinned_revoked).unwrap_err();
+    assert!(error.to_string().contains("revoked"), "{error}");
 }

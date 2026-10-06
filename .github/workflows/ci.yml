@@ -5,11 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   test:
+    timeout-minutes: 20
     # This repository's own runner, `tabenius-nostoi`, registered on the
     # ci-runner account on the development host. The labels are the ones a
     # runner reports by default; `nostoi` is registered too, as a readable
@@ -46,6 +51,7 @@ jobs:
       - name: The verifier alone builds (no default features)
         run: cargo build --no-default-features --lib --locked
   interoperability:
+    timeout-minutes: 20
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4

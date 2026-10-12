@@ -48,6 +48,13 @@ then appends `key.erased`. Prior record bytes/digests do not change. No key byte
 are printed or recorded. The receipt claims **active-key-store-only**, not proof
 of physical erasure or proof that nobody previously decrypted the value.
 
+Failures before atomic replacement roll back the pending in-memory mutation.
+If replacement succeeds but directory sync fails, durability is uncertain: the
+store does not restore an erased key or discard a newly written key in memory.
+That store handle refuses further key lookup/mutation until closed and reloaded;
+the caller receives an error, not a successful erasure receipt. Inspect/retry the
+chain's outstanding erasure request after reloading the actual active store.
+
 The store and chain are separate durable resources, not one transaction. A crash
 can leave a request without a completion receipt; retry forgetting to record the
 current absence. A failed final append reports that the key was removed but the
@@ -64,6 +71,9 @@ Human/JSON `show` and the TUI project sealed bodies as `[sealed]`; a known local
 erasure tombstone makes them `[erased]`. Missing/unreadable store metadata means
 unknown availability, not proof of erasure. The TUI remains redacted on a store
 read error. It reads atomic tombstone snapshots without holding a writer lock.
+Display validates the store using the same rules as mutation, including rejecting
+a tombstone whose key material is still present. Contradictory/corrupt metadata
+must never be presented as evidence of erasure.
 `show --json` labels the result `display_projection`: its substituted body is
 not a raw digest-verifiable record. Use `show --raw --json` or the original chain
 for ciphertext export/verification. Live `log` remains a raw ciphertext stream.

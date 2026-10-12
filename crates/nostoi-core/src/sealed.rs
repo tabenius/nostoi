@@ -209,22 +209,7 @@ pub fn display_record(record: &Value, path: &Path) -> Result<Value, Error> {
             let text = Zeroizing::new(text);
             let value: Value =
                 serde_json::from_str(&text).map_err(|_| invalid("malformed key store"))?;
-            if value.get("v").and_then(Value::as_u64) != Some(1) {
-                return Err(invalid("unsupported key-store version"));
-            }
-            match value.get("erased") {
-                None => BTreeSet::new(),
-                Some(items) => items
-                    .as_array()
-                    .ok_or_else(|| invalid("invalid erasure tombstones"))?
-                    .iter()
-                    .map(|kid| {
-                        kid.as_str()
-                            .map(String::from)
-                            .ok_or_else(|| invalid("invalid erased key ID"))
-                    })
-                    .collect::<Result<BTreeSet<_>, _>>()?,
-            }
+            parse_store(&value)?.1
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
         Err(e) => return Err(crate::error::io(path)(e)),
@@ -242,8 +227,18 @@ pub struct KeyStore {
     path: PathBuf,
     keys: BTreeMap<String, Key>,
     erased: BTreeSet<String>,
+    write_uncertain: bool,
     _lock: File,
 }
+
+impl Drop for KeyStore {
+    fn drop(&mut self) {
+        // Release explicitly: an inherited descriptor must not prolong a
+        // cooperating writer's lock beyond this owner's lifetime.
+        let _ = self._lock.unlock();
+    }
+}
+
 impl KeyStore {
     pub fn default_path(chain: &Path) -> PathBuf {
         let mut name = chain.as_os_str().to_owned();
@@ -294,6 +289,7 @@ impl KeyStore {
             path: path.to_owned(),
             keys: BTreeMap::new(),
             erased: BTreeSet::new(),
+            write_uncertain: false,
             _lock: lock,
         };
         let text = match std::fs::read_to_string(path) {
@@ -303,48 +299,25 @@ impl KeyStore {
         };
         let value: Value =
             serde_json::from_str(&text).map_err(|_| invalid("malformed key store"))?;
-        if value.get("v").and_then(Value::as_u64) != Some(1) {
-            return Err(invalid("unsupported key-store version"));
-        }
-        let keys = value
-            .get("keys")
-            .and_then(Value::as_object)
-            .ok_or_else(|| invalid("key store lacks keys object"))?;
-        for (kid, encoded) in keys {
-            kid_valid(kid)?;
-            let bytes = STANDARD
-                .decode(
-                    encoded
-                        .as_str()
-                        .ok_or_else(|| invalid("invalid encoded key"))?,
-                )
-                .map_err(|_| invalid("invalid encoded key"))?;
-            let bytes: [u8; KEY_LEN] = bytes
-                .try_into()
-                .map_err(|_| invalid("key must be 32 bytes"))?;
-            store.keys.insert(kid.clone(), Key::from_bytes(bytes));
-        }
-        if let Some(erased) = value.get("erased") {
-            for kid in erased
-                .as_array()
-                .ok_or_else(|| invalid("invalid erasure tombstones"))?
-            {
-                let kid = kid
-                    .as_str()
-                    .ok_or_else(|| invalid("invalid erased key ID"))?;
-                kid_valid(kid)?;
-                if store.keys.contains_key(kid) {
-                    return Err(invalid("erased key still present in store"));
-                }
-                store.erased.insert(kid.into());
-            }
-        }
+        (store.keys, store.erased) = parse_store(&value)?;
         Ok(store)
     }
     pub fn key(&self, kid: &str) -> Option<&Key> {
-        self.keys.get(kid)
+        if self.write_uncertain {
+            None
+        } else {
+            self.keys.get(kid)
+        }
     }
     pub fn generate(&mut self, kid: &str) -> Result<String, Error> {
+        self.generate_with_sync(kid, sync_parent)
+    }
+    fn generate_with_sync(
+        &mut self,
+        kid: &str,
+        sync: impl FnOnce(&Path) -> Result<(), Error>,
+    ) -> Result<String, Error> {
+        self.ensure_usable()?;
         kid_valid(kid)?;
         if self.keys.contains_key(kid) || self.erased.contains(kid) {
             return Err(invalid("key ID already exists or was erased; use a new ID"));
@@ -352,30 +325,52 @@ impl KeyStore {
         let key = Key::generate()?;
         let fingerprint = key.fingerprint();
         self.keys.insert(kid.into(), key);
-        if let Err(e) = self.save() {
-            self.keys.remove(kid);
+        if let Err(e) = self.save_with_sync(sync) {
+            if !self.write_uncertain {
+                self.keys.remove(kid);
+            }
             return Err(e);
         }
         Ok(fingerprint)
     }
     /// Removes active key material; returns only its public fingerprint.
     pub fn forget(&mut self, kid: &str) -> Result<Option<String>, Error> {
+        self.forget_with_sync(kid, sync_parent)
+    }
+    fn forget_with_sync(
+        &mut self,
+        kid: &str,
+        sync: impl FnOnce(&Path) -> Result<(), Error>,
+    ) -> Result<Option<String>, Error> {
+        self.ensure_usable()?;
         kid_valid(kid)?;
         let removed = self.keys.remove(kid);
         let existed = self.erased.contains(kid);
         self.erased.insert(kid.into());
-        if let Err(e) = self.save() {
-            if let Some(key) = removed {
-                self.keys.insert(kid.into(), key);
-            }
-            if !existed {
-                self.erased.remove(kid);
+        if let Err(e) = self.save_with_sync(sync) {
+            if !self.write_uncertain {
+                if let Some(key) = removed {
+                    self.keys.insert(kid.into(), key);
+                }
+                if !existed {
+                    self.erased.remove(kid);
+                }
             }
             return Err(e);
         }
         Ok(removed.map(|key| key.fingerprint()))
     }
-    fn save(&self) -> Result<(), Error> {
+    fn ensure_usable(&self) -> Result<(), Error> {
+        if self.write_uncertain {
+            Err(invalid("key-store replacement occurred but durability is uncertain; close and reload the store before retrying"))
+        } else {
+            Ok(())
+        }
+    }
+    fn save_with_sync(
+        &mut self,
+        sync: impl FnOnce(&Path) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         let parent = self.path.parent().expect("validated parent");
         let keys: BTreeMap<_, _> = self
             .keys
@@ -391,14 +386,69 @@ impl KeyStore {
         tmp.as_file().sync_all().map_err(crate::error::io(parent))?;
         tmp.persist(&self.path)
             .map_err(|e| crate::error::io(&self.path)(e.error))?;
-        #[cfg(unix)]
-        {
-            File::open(parent)
-                .and_then(|file| file.sync_all())
-                .map_err(crate::error::io(parent))?;
+        if let Err(error) = sync(parent) {
+            // Rename already committed the replacement. Rolling memory back
+            // here could resurrect an erased key in a later save.
+            self.write_uncertain = true;
+            return Err(Error::Invalid(format!("{error}; key-store replacement occurred but durability is uncertain; close and reload the store before retrying")));
         }
         Ok(())
     }
+}
+
+fn sync_parent(parent: &Path) -> Result<(), Error> {
+    #[cfg(unix)]
+    File::open(parent)
+        .and_then(|file| file.sync_all())
+        .map_err(crate::error::io(parent))?;
+    #[cfg(not(unix))]
+    let _ = parent;
+    Ok(())
+}
+
+fn parse_store(value: &Value) -> Result<(BTreeMap<String, Key>, BTreeSet<String>), Error> {
+    if value.get("v").and_then(Value::as_u64) != Some(1) {
+        return Err(invalid("unsupported key-store version"));
+    }
+    let encoded_keys = value
+        .get("keys")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("key store lacks keys object"))?;
+    let mut keys = BTreeMap::new();
+    for (kid, encoded) in encoded_keys {
+        kid_valid(kid)?;
+        let bytes = Zeroizing::new(
+            STANDARD
+                .decode(
+                    encoded
+                        .as_str()
+                        .ok_or_else(|| invalid("invalid encoded key"))?,
+                )
+                .map_err(|_| invalid("invalid encoded key"))?,
+        );
+        let bytes: [u8; KEY_LEN] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid("key must be 32 bytes"))?;
+        keys.insert(kid.clone(), Key::from_bytes(bytes));
+    }
+    let mut erased = BTreeSet::new();
+    if let Some(items) = value.get("erased") {
+        for kid in items
+            .as_array()
+            .ok_or_else(|| invalid("invalid erasure tombstones"))?
+        {
+            let kid = kid
+                .as_str()
+                .ok_or_else(|| invalid("invalid erased key ID"))?;
+            kid_valid(kid)?;
+            if keys.contains_key(kid) {
+                return Err(invalid("erased key still present in store"));
+            }
+            erased.insert(kid.into());
+        }
+    }
+    Ok((keys, erased))
 }
 
 fn check_private_file(path: &Path) -> Result<(), Error> {
@@ -422,5 +472,62 @@ fn check_private_file(path: &Path) -> Result<(), Error> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(crate::error::io(path)(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn erasure_does_not_restore_key_after_replacement_sync_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private/store.json");
+        let mut store = KeyStore::load(&path).unwrap();
+        store.generate("subject").unwrap();
+        assert!(store
+            .forget_with_sync("subject", |_| Err(invalid(
+                "injected directory sync failure"
+            )))
+            .is_err());
+        assert!(!store.keys.contains_key("subject"));
+        assert!(store.erased.contains("subject"));
+        assert!(store.generate("other").is_err());
+        drop(store);
+        let mut reloaded = KeyStore::load(&path).unwrap();
+        assert!(reloaded.key("subject").is_none());
+        assert!(reloaded.generate("subject").is_err());
+    }
+
+    #[test]
+    fn generated_key_is_not_rolled_back_after_replacement_sync_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private/store.json");
+        let mut store = KeyStore::load(&path).unwrap();
+        assert!(store
+            .generate_with_sync("subject", |_| Err(invalid(
+                "injected directory sync failure"
+            )))
+            .is_err());
+        assert!(store.keys.contains_key("subject"));
+        assert!(store.key("subject").is_none());
+        assert!(store.forget("subject").is_err());
+        drop(store);
+        let reloaded = KeyStore::load(&path).unwrap();
+        assert!(reloaded.key("subject").is_some());
+    }
+
+    #[test]
+    fn failure_before_replacement_restores_original_memory_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private/store.json");
+        let mut store = KeyStore::load(&path).unwrap();
+        store.generate("subject").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        store.path = path.parent().unwrap().to_owned(); // persist cannot replace a directory
+        assert!(store.forget("subject").is_err());
+        assert!(store.key("subject").is_some());
+        assert!(!store.erased.contains("subject"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }

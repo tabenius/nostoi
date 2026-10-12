@@ -130,6 +130,21 @@ fn selection_is_atomic_and_missing_fields_or_keys_fail_closed() {
 }
 
 #[test]
+fn display_refuses_contradictory_erasure_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("private/store.json");
+    let mut store = KeyStore::load(&path).unwrap();
+    store.generate("subject").unwrap();
+    let value = sealed::seal(&json!("private"), "subject", store.key("subject").unwrap()).unwrap();
+    drop(store);
+    let mut metadata: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    metadata["erased"] = json!(["subject"]);
+    fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    assert!(KeyStore::load(&path).is_err());
+    assert!(sealed::display_record(&json!({"body":{"personal":value}}), &path).is_err());
+}
+
+#[test]
 fn cooperating_writers_are_locked_and_display_does_not_wait_for_writer() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("private/store.json");

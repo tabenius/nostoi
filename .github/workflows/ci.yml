@@ -30,7 +30,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Test (with the Python conformance checks)
-        run: cargo test --workspace --all-features --locked
+        # Use a venv rather than modifying the distro-managed Python.
+        # The optional encryption helpers require libsodium via PyNaCl.
+        run: |
+          python3 -m venv "$RUNNER_TEMP/crypto-python"
+          "$RUNNER_TEMP/crypto-python/bin/python" -m pip install 'PyNaCl==1.6.0'
+          PATH="$RUNNER_TEMP/crypto-python/bin:$PATH" cargo test --workspace --all-features --locked
       - name: The Python reference and the crate write the same bytes
         # `tests/cli.rs` checks interoperability from the Rust side and skips
         # when python3 is absent. This is the mirror: it pins a known-answer

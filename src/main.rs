@@ -28,6 +28,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create a subject key in a private store (prints its fingerprint, never key bytes)
+    Keygen {
+        subject: String,
+        #[arg(long)]
+        chain: PathBuf,
+        #[arg(long)]
+        key_store: Option<PathBuf>,
+    },
+    /// Remove a subject key and append an erasure receipt; backups are not erased
+    Forget {
+        subject: String,
+        #[arg(long)]
+        chain: PathBuf,
+        #[arg(long)]
+        key_store: Option<PathBuf>,
+    },
     /// Inspect audit/outbox database schema metadata without migrating it
     #[cfg(feature = "sqlite")]
     Schema {
@@ -61,6 +77,11 @@ enum Command {
         /// The record body: a JSON object, @FILE, or - for stdin
         #[arg(long, default_value = "{}")]
         body: String,
+        /// Top-level field=key-id to encrypt; repeatable, missing fields fail
+        #[arg(long)]
+        seal: Vec<String>,
+        #[arg(long)]
+        key_store: Option<PathBuf>,
         /// Timestamp (RFC 3339; default now)
         #[arg(long)]
         at: Option<String>,
@@ -84,6 +105,11 @@ enum Command {
         format: Option<Format>,
         #[arg(long)]
         json: bool,
+        /// Return stored ciphertext records instead of a display projection
+        #[arg(long)]
+        raw: bool,
+        #[arg(long)]
+        key_store: Option<PathBuf>,
     },
     /// Stream verified records as JSON lines; --follow waits for new ones
     Log {
@@ -236,7 +262,57 @@ fn main() -> ExitCode {
 }
 
 fn run(command: Command) -> Result<ExitCode, String> {
+    use nostoi::sealed::{seal_fields, KeyStore};
     match command {
+        Command::Keygen {
+            subject,
+            chain,
+            key_store,
+        } => {
+            let path = key_store.unwrap_or_else(|| KeyStore::default_path(&chain));
+            let fingerprint = KeyStore::load(&path)
+                .and_then(|mut store| store.generate(&subject))
+                .map_err(|e| e.to_string())?;
+            println!(
+                "{}",
+                json!({"key_id": subject, "key_fingerprint": fingerprint})
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Forget {
+            subject,
+            chain,
+            key_store,
+        } => {
+            let report = nostoi::verify(&chain, None).map_err(|e| e.to_string())?;
+            if !report.ok || report.format != Format::Nostoi.name() {
+                return Err(
+                    "erasure requires an intact nostoi-v1 chain; no key was changed".into(),
+                );
+            }
+            let path = key_store.unwrap_or_else(|| KeyStore::default_path(&chain));
+            let mut store = KeyStore::load(&path).map_err(|e| e.to_string())?;
+            let fingerprint = store.key(&subject).map(|key| key.fingerprint());
+            nostoi::append(
+                &chain,
+                Draft {
+                    actor: None,
+                    kind: "key.erasure.requested",
+                    subject: Some(&subject),
+                    body: json!({"kid":subject,"key_fingerprint":fingerprint}),
+                    at: None,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            let removed = store.forget(&subject).map_err(|e| e.to_string())?;
+            let entry = nostoi::append(&chain, Draft { actor: None, kind: "key.erased", subject: Some(&subject), body: json!({"kid":subject,"key_fingerprint":removed,"active_store_key_present":false,"scope":"active-key-store-only"}), at: None })
+                .map_err(|e| format!("key removed but erasure receipt could not be appended: {e}; inspect key.erasure.requested and retry"))?;
+            println!(
+                "{}",
+                json!({"seq":entry.seq,"digest":entry.digest,"active_store_key_present":false})
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         #[cfg(feature = "sqlite")]
         Command::Schema { path, json } => {
             let info = nostoi::schema::inspect(&path).map_err(|e| e.to_string())?;
@@ -301,10 +377,29 @@ fn run(command: Command) -> Result<ExitCode, String> {
             actor,
             subject,
             body,
+            seal,
+            key_store,
             at,
             json,
         } => {
-            let body = read_body(&body)?;
+            let mut body = read_body(&body)?;
+            let key_path = key_store.unwrap_or_else(|| KeyStore::default_path(&path));
+            let _store = if seal.is_empty() {
+                None
+            } else {
+                let selections = seal
+                    .iter()
+                    .map(|selection| {
+                        selection
+                            .split_once('=')
+                            .map(|(field, kid)| (field.to_owned(), kid.to_owned()))
+                            .ok_or_else(|| "--seal requires field=key-id".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let store = KeyStore::load(&key_path).map_err(|e| e.to_string())?;
+                seal_fields(&mut body, &selections, &store).map_err(|e| e.to_string())?;
+                Some(store)
+            };
             let draft = Draft {
                 actor: actor.as_deref(),
                 kind: &kind,
@@ -364,10 +459,13 @@ fn run(command: Command) -> Result<ExitCode, String> {
             seq,
             format,
             json,
+            raw,
+            key_store,
         } => {
             let loaded = nostoi::open(&path, format).map_err(|e| e.to_string())?;
             let report = loaded.verify();
             let trusted = report.verified;
+            let key_path = key_store.unwrap_or_else(|| KeyStore::default_path(&path));
             match seq {
                 Some(seq) => {
                     let entry = loaded
@@ -380,23 +478,37 @@ fn run(command: Command) -> Result<ExitCode, String> {
                     } else {
                         "NOT verified"
                     };
+                    let record = if raw {
+                        entry.record.clone()
+                    } else {
+                        nostoi::sealed::display_record(&entry.record, &key_path)
+                            .map_err(|e| e.to_string())?
+                    };
                     if json {
                         println!(
                             "{}",
-                            json!({"seq": seq, "verified": seq <= trusted, "record": entry.record})
+                            json!({"seq": seq, "verified": seq <= trusted, "display_projection": !raw, "record": record})
                         );
                     } else {
                         println!("record {seq} ({verdict})");
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&entry.record).unwrap_or_default()
+                            serde_json::to_string_pretty(&record).unwrap_or_default()
                         );
                     }
                 }
                 None => {
                     for entry in &loaded.entries {
                         if json {
-                            println!("{}", entry_json(entry, entry.seq <= trusted));
+                            let mut projected = entry.clone();
+                            if !raw {
+                                projected.record =
+                                    nostoi::sealed::display_record(&entry.record, &key_path)
+                                        .map_err(|e| e.to_string())?;
+                            }
+                            let mut record = entry_json(&projected, entry.seq <= trusted);
+                            record["display_projection"] = json!(!raw);
+                            println!("{record}");
                         } else {
                             println!("{}", entry_line(entry, entry.seq <= trusted));
                         }

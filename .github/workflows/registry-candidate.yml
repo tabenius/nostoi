@@ -1,0 +1,39 @@
+name: Nostoi release candidate
+on:
+  pull_request:
+    paths: ['release-registry.json', '.github/workflows/registry-candidate.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build CLI/TUI release binary
+        run: |
+          cargo build --release --locked
+          target/release/nostoi --help > /tmp/nostoi-help
+          test -s /tmp/nostoi-help
+          mkdir -p dist
+          cp target/release/nostoi dist/nostoi-linux-amd64
+          chmod 755 dist/nostoi-linux-amd64
+          cd dist
+          sha256sum nostoi-linux-amd64 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Validate registry contract
+        run: |
+          python3 - <<'PY'
+          import json
+          data=json.load(open('release-registry.json'))
+          assert data['product']=='nostoi'
+          assert data['promotion']['automaticStable'] is False
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nostoi-candidate-cli-tui-linux-amd64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

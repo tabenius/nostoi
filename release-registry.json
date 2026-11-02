@@ -1,0 +1,25 @@
+{
+  "schema": "ragbaz.release-package/1",
+  "product": "nostoi",
+  "repository": "tabenius/nostoi",
+  "channel": "candidate",
+  "distribution": "https://ragbaz.cc/downloads/",
+  "formats": [
+    "cli",
+    "tui",
+    "rust-crate",
+    "python-bindings",
+    "wasm-component"
+  ],
+  "description": "Tamper-evident audit verifier CLI/TUI and multi-language bindings",
+  "promotion": {
+    "requiresTag": true,
+    "requiresGreenCI": true,
+    "requiresSHA256": true,
+    "requiresAttestation": true,
+    "requiresSigning": true,
+    "requiresInstalledSmoke": true,
+    "automaticStable": false
+  },
+  "releaseEligible": false
+}

@@ -690,7 +690,20 @@ impl App {
                 };
                 (
                     format!(" record {}{sep}{verdict} ", entry.seq),
-                    serde_json::to_string_pretty(&entry.record).unwrap_or_default(),
+                    serde_json::to_string_pretty(
+                        &crate::sealed::display_record(
+                            &entry.record,
+                            &crate::sealed::KeyStore::default_path(&self.path),
+                        )
+                        .unwrap_or_else(|_| {
+                            let mut record = entry.record.clone();
+                            if let Some(body) = record.get_mut("body") {
+                                *body = crate::sealed::render_body(body, None);
+                            }
+                            record
+                        }),
+                    )
+                    .unwrap_or_default(),
                 )
             }
             None => (" record ".into(), String::new()),
@@ -1366,6 +1379,45 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.selected().unwrap().kind, "tool.call");
         assert!(screen(&mut app).contains("records 1/3"));
+    }
+
+    #[test]
+    fn sealed_details_are_redacted_and_erasure_is_visible_without_decryption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = chain_path(dir.path());
+        let store_path = crate::sealed::KeyStore::default_path(&path);
+        let mut store = crate::sealed::KeyStore::load(&store_path).unwrap();
+        store.generate("opaque-subject").unwrap();
+        let sealed = crate::sealed::seal(
+            &json!("private@example.test"),
+            "opaque-subject",
+            store.key("opaque-subject").unwrap(),
+        )
+        .unwrap();
+        append(
+            &path,
+            Draft {
+                actor: None,
+                kind: "event",
+                subject: None,
+                body: json!({"personal": sealed}),
+                at: None,
+            },
+        )
+        .unwrap();
+        let mut app = App::new(&path, None);
+        app.detail = true;
+        let rendered = screen(&mut app);
+        assert!(rendered.contains("[sealed]"), "{rendered}");
+        assert!(!rendered.contains("private@example.test"));
+        assert!(!rendered.contains("xchacha20poly1305"));
+        store.forget("opaque-subject").unwrap();
+        let rendered = screen(&mut app);
+        assert!(rendered.contains("[erased]"), "{rendered}");
+        std::fs::write(&store_path, "malformed store").unwrap();
+        let rendered = screen(&mut app);
+        assert!(rendered.contains("[sealed]"), "{rendered}");
+        assert!(!rendered.contains("private@example.test"));
     }
 
     #[test]

@@ -35,6 +35,68 @@ VERSION = "nostoi-v1"
 GENESIS = "0" * 64
 
 
+def _sealed_kid(kid: str) -> None:
+    if not isinstance(kid, str) or not kid or len(kid.encode()) > 128 or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in kid):
+        raise ValueError("invalid sealed key ID")
+
+
+def seal(value: Any, kid: str, key: bytes, *, nonce: bytes | None = None) -> dict[str, Any]:
+    """Seal a JSON value with optional PyNaCl/libsodium, never hand-rolled crypto.
+
+    A supplied nonce is for interoperability vectors only; never reuse a nonce
+    with a key. Verification and rendering do not require PyNaCl.
+    """
+    import base64
+    from nacl.bindings import crypto_aead_xchacha20poly1305_ietf_encrypt
+
+    _sealed_kid(kid)
+    _check_body(value)
+    nonce = os.urandom(24) if nonce is None else nonce
+    if len(key) != 32 or len(nonce) != 24:
+        raise ValueError("sealed keys need 32 bytes and nonces 24 bytes")
+    aad = f"xchacha20poly1305|{kid}|1".encode()
+    ciphertext = crypto_aead_xchacha20poly1305_ietf_encrypt(canonical(value).encode(), aad, nonce, key)
+    return {"$sealed": {"v": 1, "alg": "xchacha20poly1305", "kid": kid,
+                        "nonce": base64.b64encode(nonce).decode(), "ct": base64.b64encode(ciphertext).decode()}}
+
+
+def open_sealed(value: dict[str, Any], key: bytes) -> Any:
+    """Explicit decryption. Displays never call this function automatically."""
+    import base64
+    from nacl.bindings import crypto_aead_xchacha20poly1305_ietf_decrypt
+
+    if not isinstance(value, dict) or set(value) != {"$sealed"}:
+        raise ValueError("invalid sealed envelope")
+    inner = value["$sealed"]
+    if not isinstance(inner, dict) or set(inner) != {"v", "alg", "kid", "nonce", "ct"} or type(inner["v"]) is not int or inner["v"] != 1 or inner["alg"] != "xchacha20poly1305":
+        raise ValueError("unsupported or malformed sealed envelope")
+    _sealed_kid(inner["kid"])
+    nonce = base64.b64decode(inner["nonce"], validate=True)
+    ciphertext = base64.b64decode(inner["ct"], validate=True)
+    if len(key) != 32 or len(nonce) != 24 or len(ciphertext) < 16:
+        raise ValueError("invalid sealed key, nonce or ciphertext length")
+    plaintext = crypto_aead_xchacha20poly1305_ietf_decrypt(ciphertext, f"xchacha20poly1305|{inner['kid']}|1".encode(), nonce, key)
+    result = json.loads(plaintext)
+    _check_body(result)
+    return result
+
+
+def render_body(value: Any, *, erased_ids=()) -> Any:
+    """Data-only display projection; unknown key availability remains sealed."""
+    erased = set(erased_ids)
+    def visit(item):
+        if isinstance(item, dict):
+            if "$sealed" in item:
+                inner = item["$sealed"]
+                kid = inner.get("kid") if isinstance(inner, dict) else None
+                return "[erased]" if isinstance(kid, str) and kid in erased else "[sealed]"
+            return {k: visit(v) for k, v in item.items()}
+        if isinstance(item, list):
+            return [visit(v) for v in item]
+        return item
+    return visit(value)
+
+
 def canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 

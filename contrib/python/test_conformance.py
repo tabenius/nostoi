@@ -91,7 +91,9 @@ def rust(*args: str) -> subprocess.CompletedProcess:
 
 class ChainCase(unittest.TestCase):
     def setUp(self):
-        self.folder = tempfile.TemporaryDirectory(dir="/tmp/opencode")
+        # Use the runner's temporary directory (including TMPDIR overrides),
+        # not a path owned by a particular development harness.
+        self.folder = tempfile.TemporaryDirectory(prefix="nostoi-conformance-")
         self.addCleanup(self.folder.cleanup)
         self.path = Path(self.folder.name) / "chain.jsonl"
 

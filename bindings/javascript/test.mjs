@@ -13,6 +13,15 @@ assert.equal(JSON.parse(chains.verifyJsonl(altered, undefined)).ok, false);
 assert.throws(() => chains.appendJsonl(altered, draft));
 assert.throws(() => chains.appendJsonl('', {...draft, bodyJson:'{"float":0.1}'}));
 assert.throws(() => chains.verifyJsonl('', 'unknown'));
+for (const prefix of ['', '\n', one, one.trimEnd()]) {
+  const delta = chains.appendDeltaJsonl(prefix, draft);
+  assert.equal(prefix + delta, chains.appendJsonl(prefix, draft));
+  assert.equal(JSON.parse(chains.verifyJsonl(prefix + delta, undefined)).ok, true);
+}
+assert.throws(() => chains.appendDeltaJsonl(altered, draft));
+assert.throws(() => chains.appendDeltaJsonl(two + '{', draft));
+assert.throws(() => chains.appendDeltaJsonl(one, {...draft, bodyJson:'{"float":0.1}'}));
+assert.throws(() => chains.appendDeltaJsonl(one, {...draft, at:'yesterday'}));
 const vector = readFileSync(new URL('../../crates/nostoi-core/tests/vectors/weftmark-ledger.jsonl', import.meta.url), 'utf8');
 assert.equal(JSON.parse(chains.verifyJsonl(vector, undefined)).ok, true);
 // An attestation over the chain as it stood after the second record. The

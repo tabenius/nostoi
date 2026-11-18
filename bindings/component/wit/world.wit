@@ -15,6 +15,11 @@ interface chains {
     verify-jsonl: func(jsonl: string, format: option<string>) -> result<string, string>;
     /// Returns the entire extended chain. Refuses to extend broken chains.
     append-jsonl: func(jsonl: string, entry: draft) -> result<string, string>;
+    /// Verifies the entire history but returns only the bytes to append,
+    /// including a separator if needed. Host must lock or compare-and-swap the
+    /// unchanged history and durably persist before acknowledging success.
+    /// No authentication, HITL approval or encryption is performed here.
+    append-delta-jsonl: func(jsonl: string, entry: draft) -> result<string, string>;
 }
 
 /// The portable half of an attestation: what was signed, and whether it is still

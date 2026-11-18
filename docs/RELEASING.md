@@ -8,6 +8,10 @@ the resulting `nostoi_0.1.0_amd64.deb`. This package contains the CLI/TUI binary
 license files and README only. Shared-library dependencies are derived from
 the ELF binary. OpenSSH is a runtime dependency for SSH attestations.
 
+A separate Linux amd64 Python abi3 wheel is built and tested for Python 3.11+
+in the same workflow. Install that wheel when Python consumers need the native
+bindings; it does not require Rust or maturin on the consuming machine.
+
 The package is installed and exercised in Debian 12, Ubuntu 24.04 and Kali
 rolling containers before publication. CLI, SQLite and tamper-refusal tests
 are software release gates; documentation rendering is not one.

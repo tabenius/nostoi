@@ -25,6 +25,13 @@ jobs:
         run: |
           cargo build --release --locked
           bash scripts/package-deb.sh
+      - name: Build and test installable Python bindings without a local toolchain
+        run: |
+          python3 -m pip install 'maturin>=1.5,<2'
+          python3 -m maturin build --release --locked --manifest-path bindings/python/Cargo.toml --out dist
+          python3 -m pip install dist/*.whl
+          python3 -m unittest discover -s bindings/python/tests -v
+          (cd dist && sha256sum *.whl >> SHA256SUMS && sha256sum --check --strict SHA256SUMS)
       - name: Install and exercise package on Debian, Ubuntu and Kali
         run: |
           set -euo pipefail

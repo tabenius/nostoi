@@ -1,5 +1,24 @@
 # Dependency remediation
 
+## 2026-11-18 release follow-up (0.1.1)
+
+Dependabot reports four open Rustls alerts (9–12) against `Cargo.lock`, all
+with patched floor 0.23.46. A targeted `cargo update -p rustls --precise
+0.23.46` changes only that third-party package; other dependency upgrades are
+not mixed into this release. The six workspace packages are versioned 0.1.1.
+
+The JavaScript tooling audit found GHSA-g3hv-75wg-m249 in transitive minimatch
+through `@bytecodealliance/jco-std`. npm's forced fix would downgrade jco.
+Instead an explicit minimatch 11.0.9 override preserves jco and the existing
+weval security fix. `npm audit --package-lock-only` reports zero vulnerabilities.
+The complete JS/WASM and Python interoperability checks passed with this
+override in hosted CI run 44206996328, before the 0.1.1/Rustls follow-up.
+The follow-up is revalidated by the PR checks; no alert is dismissed and no
+audit gate is suppressed. Default-branch alerts close only after merge/rescan.
+
+The earlier observations below remain historical evidence, not a claim that
+the current vulnerability database was checked on their dates.
+
 Verified on 2026-10-02, based on commit `485f6ec`, on
 `codex/dependency-remediation`. Scope: native Python bindings, JavaScript
 component build tooling, their lockfiles, and interoperability CI.

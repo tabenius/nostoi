@@ -1,10 +1,10 @@
-# Preparing 0.1.0
+# Preparing 0.1.1
 
 ## Lightweight CLI/TUI installation
 
 The tagged candidate workflow builds on GitHub-hosted Ubuntu 22.04; no local
 Rust toolchain, checkout, Pandoc, Node or Python bindings are needed to install
-the resulting `nostoi_0.1.0_amd64.deb`. This package contains the CLI/TUI binary,
+the resulting `nostoi_0.1.1_amd64.deb`. This package contains the CLI/TUI binary,
 license files and README only. Shared-library dependencies are derived from
 the ELF binary. OpenSSH is a runtime dependency for SSH attestations.
 
@@ -17,7 +17,7 @@ rolling containers before publication. CLI, SQLite and tamper-refusal tests
 are software release gates; documentation rendering is not one.
 
 Use the signed release manifest and SHA256SUMS to verify downloads at
-`https://dl.ragbaz.cc/v1/nostoi/v0.1.0/`. This is explicitly a candidate release,
+`https://dl.ragbaz.cc/v1/nostoi/v0.1.1/`. This is explicitly a candidate release,
 not a security audit or a crates.io/PyPI/npm publication.
 
 ### Artifact lifecycle

@@ -1,6 +1,6 @@
 [package]
 name = "nostoi"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.89"
 description = "Tamper-evident audit chains: verify, append, stream and browse them (library, CLI and TUI)"
@@ -49,9 +49,9 @@ kmsg = ["dep:nostoi-kmsg"]
 s3 = ["dep:nostoi-anchor"]
 
 [dependencies]
-nostoi-core = { version = "0.1.0", path = "crates/nostoi-core", default-features = false }
-nostoi-anchor = { version = "0.1.0", path = "crates/nostoi-anchor", default-features = false, optional = true }
-nostoi-kmsg = { version = "0.1.0", path = "crates/nostoi-kmsg", default-features = false, optional = true }
+nostoi-core = { version = "0.1.1", path = "crates/nostoi-core", default-features = false }
+nostoi-anchor = { version = "0.1.1", path = "crates/nostoi-anchor", default-features = false, optional = true }
+nostoi-kmsg = { version = "0.1.1", path = "crates/nostoi-kmsg", default-features = false, optional = true }
 rusqlite = { version = "0.40", features = ["bundled", "functions"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 ratatui = { version = "0.30", optional = true }

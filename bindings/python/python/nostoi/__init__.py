@@ -3,7 +3,7 @@ import json
 import os
 from . import _native
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __all__ = [
     "canonical", "verify", "append", "verify_jsonl", "append_jsonl", "append_delta_jsonl",
     "attestation_canonical_bytes", "verify_attestation",

@@ -1,5 +1,41 @@
 # Preparing 0.1.0
 
+## Lightweight CLI/TUI installation
+
+The tagged candidate workflow builds on GitHub-hosted Ubuntu 22.04; no local
+Rust toolchain, checkout, Pandoc, Node or Python bindings are needed to install
+the resulting `nostoi_0.1.0_amd64.deb`. This package contains the CLI/TUI binary,
+license files and README only. Shared-library dependencies are derived from
+the ELF binary. OpenSSH is a runtime dependency for SSH attestations.
+
+The package is installed and exercised in Debian 12, Ubuntu 24.04 and Kali
+rolling containers before publication. CLI, SQLite and tamper-refusal tests
+are software release gates; documentation rendering is not one.
+
+Use the signed release manifest and SHA256SUMS to verify downloads at
+`https://dl.ragbaz.cc/v1/nostoi/v0.1.0/`. This is explicitly a candidate release,
+not a security audit or a crates.io/PyPI/npm publication.
+
+### Artifact lifecycle
+
+| Activity | Required local files | Temporary files that may be evicted afterwards |
+| --- | --- | --- |
+| Run CLI/TUI | Installed Debian package; its declared OS dependencies | Downloaded `.deb` after installation and hash verification |
+| Develop/debug | Source checkout; Cargo.lock; Rust toolchain; optional binding tools | `target/` after tests; recreate with Cargo or prefer hosted CI |
+| Python binding work | Python binding source plus maturin/Rust for builds, or a compatible installed wheel | Wheel downloads, build products after verification |
+| JS/WASM binding work | WIT/component source, Rust WASM targets and Node/jco | Generated WASM and JS outputs after interop verification |
+| Publish release | GitHub-hosted build, package smoke tests, signed manifest and R2 mirror | Runner build directories after publication |
+| Read docs | README or downloaded docs | No document renderer required to run software |
+
+Before evicting a downloaded artifact, retain its immutable release URL,
+SHA-256, version/platform and purpose. Never treat uncommitted source, audit
+chains, trusted anchors, signatures, keys or unique debug evidence as a cache.
+RAGBAZ component manifests describe cross-project phase dependencies;
+Cargo records the internal `nostoi-core`, optional `nostoi-anchor` and
+`nostoi-kmsg` workspace dependencies. Those are crates in this repository,
+not separate project edges. Packaging is not an SBOM or an artifact garbage
+collector; do not automatically delete other projects' files.
+
 The repository is public at https://github.com/tabenius/nostoi. The Rust crate is
 prepared for crates.io; no registry upload or release tag is performed by this
 change. Python/npm distribution names and publication credentials must be

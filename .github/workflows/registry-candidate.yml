@@ -1,7 +1,7 @@
 name: Nostoi release candidate
 on:
   pull_request:
-    paths: ['release-registry.json', '.github/workflows/registry-candidate.yml']
+    paths: ['release-registry.json', '.github/workflows/registry-candidate.yml', 'scripts/**', 'Cargo.*', 'src/**', 'crates/**', 'bindings/**']
   push:
     tags: ['v*.*.*']
   workflow_dispatch:
@@ -9,22 +9,32 @@ permissions:
   contents: read
 jobs:
   package-smoke:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test software before packaging
+        run: |
+          cargo test --workspace --all-features --locked
+          python3 contrib/python/test_conformance.py
       - name: Build CLI/TUI release binary
         run: |
           cargo build --release --locked
-          target/release/nostoi --help > /tmp/nostoi-help
-          test -s /tmp/nostoi-help
-          mkdir -p dist
-          cp target/release/nostoi dist/nostoi-linux-amd64
-          chmod 755 dist/nostoi-linux-amd64
-          cd dist
-          sha256sum nostoi-linux-amd64 > SHA256SUMS
-          sha256sum --check SHA256SUMS
+          bash scripts/package-deb.sh
+      - name: Install and exercise package on Debian, Ubuntu and Kali
+        run: |
+          set -euo pipefail
+          for image in debian:12-slim ubuntu:24.04 kalilinux/kali-rolling; do
+            docker run --rm -v "$PWD/dist:/packages:ro" -v "$PWD/scripts:/smoke:ro" "$image" bash -ec '
+              apt-get update -qq
+              apt-get install -y --no-install-recommends /packages/nostoi_*.deb
+              bash /smoke/smoke-installed.sh
+            '
+          done
       - name: Validate registry contract
         run: |
           python3 - <<'PY'
@@ -81,3 +91,12 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" --verify-tag --prerelease \
             --title "nostoi $GITHUB_REF_NAME (candidate)" --generate-notes release-assets/*
+
+  mirror-ragbaz-r2:
+    needs: release-candidate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ragbaz-r2.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit

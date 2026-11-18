@@ -5,7 +5,7 @@ see [audit-first operations](AUDIT-FIRST.md).
 
 All bindings call the same Rust verifier. The WIT contract is
 [`bindings/component/wit/world.wit`](../bindings/component/wit/world.wit).
-The component exports canonical-json, verify-jsonl and append-jsonl from
+The component exports canonical-json, verify-jsonl, append-jsonl and append-delta-jsonl from
 `chains`, and canonical-bytes and verify-document from `attestations`. JSON text
 crosses the boundary so unsigned 64-bit integers are never rounded by JavaScript.
 Results contain JSON reports; a broken chain is `ok: false`, while API errors
@@ -32,6 +32,10 @@ assert nostoi.verify_jsonl(text)['ok']
 `append` and `verify` support both JSONL and SQLite, including existing Ephor
 SQLite chains for verification. `append_jsonl` and `verify_jsonl` work in memory.
 Appending a broken chain raises ValueError; file I/O failures raise OSError.
+`append_delta_jsonl` takes the same arguments as `append_jsonl`, verifies the
+entire supplied history, and returns only the new bytes (including a leading
+newline if the existing history needs one). Concatenating history and delta
+produces exactly the same bytes as `append_jsonl`.
 The stdlib reference remains in contrib/python for producers that cannot ship
 an extension. The native package uses a CPython stable ABI with Python 3.11 as
 its floor. Linux x86-64 was tested locally; other platforms need wheel builds
@@ -77,6 +81,12 @@ const text = chains.appendJsonl('', {
   subject: undefined, bodyJson: '{"count":18446744073709551615}'
 });
 console.log(JSON.parse(chains.verifyJsonl(text, undefined)).ok);
+// Return only the new bytes rather than copying the history back to the host.
+const delta = chains.appendDeltaJsonl(text, {
+  at: '2026-09-27T12:01:00Z', actor: 'agent:demo', kind: 'tool.finished',
+  subject: undefined, bodyJson: '{"status":"succeeded"}'
+});
+console.log(JSON.parse(chains.verifyJsonl(text + delta, undefined)).verified); // 2
 ```
 
 ```js
@@ -106,6 +116,31 @@ not expose SQLite. The Rust standard library contributes WASI runtime imports
 wit`. No permission to arbitrary files or network is needed by the chain API.
 A no-default-features Rust library also builds for wasm32-unknown-unknown;
 use the WIT component above for an exported interoperable interface.
+
+### Resource and security boundaries
+
+Portable verification and both append functions retain only the current parsed
+record, rather than a parsed copy of the whole history. The supplied JSONL text
+still occupies memory, and each call still scans the complete history: verification
+is O(history bytes) time and O(largest record) additional parsing memory. The
+delta API avoids a history-sized result and lets a host persist or transmit only
+the new bytes. It is not an incremental trusted-checkpoint verifier or a mesh
+replication protocol. Bound input and record sizes at the host before calling it.
+
+For either append API, hold a lock across reading, verification and durable
+commit, or use a storage compare-and-swap against the exact source revision.
+A delta is valid only for that history; do not apply it to a changed head or
+acknowledge success before durable storage. A receiver must verify its resulting
+chain and compare independently trusted anchors to detect rollback or rewritten
+history. Hash-chain verification is not sender authentication, human approval,
+signature verification or encryption. Restrict plaintext to authorized memory-pool
+members and use authenticated encryption for confidential replication.
+
+Critical actions still follow [audit-first operations](AUDIT-FIRST.md): verify
+authorization and any required human approval, durably record the bounded intent,
+then execute and record the outcome. An API result alone grants no permission
+and proves no persistence. Aya enforcement, encrypted resumable transport,
+background indexing and replication scheduling belong to host integrations.
 
 ## Conformance
 

@@ -7,6 +7,20 @@ use std::io::Cursor;
 struct Component;
 
 impl Guest for Component {
+    fn append_delta_jsonl(jsonl: String, entry: Draft) -> Result<String, String> {
+        let body = serde_json::from_str(&entry.body_json).map_err(|e| e.to_string())?;
+        nostoi::portable::append_delta_jsonl(
+            &jsonl,
+            nostoi::Draft {
+                at: Some(entry.at),
+                actor: entry.actor.as_deref(),
+                kind: &entry.kind,
+                subject: entry.subject.as_deref(),
+                body,
+            },
+        )
+        .map_err(|e| e.to_string())
+    }
     fn canonical_json(json: String) -> Result<String, String> {
         nostoi::portable::canonical_json(&json).map_err(|e| e.to_string())
     }

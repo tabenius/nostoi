@@ -25,6 +25,20 @@ class Api(unittest.TestCase):
             self.assertEqual(before, p.read_bytes())
             with self.assertRaises(OSError): nostoi.verify(Path(d) / "absent")
 
+    def test_append_delta(self):
+        one = nostoi.append_jsonl("", **DRAFT)
+        for prefix in ("", "\n", one, one.rstrip()):
+            delta = nostoi.append_delta_jsonl(prefix, **DRAFT)
+            self.assertEqual(prefix + delta, nostoi.append_jsonl(prefix, **DRAFT))
+            self.assertTrue(nostoi.verify_jsonl(prefix + delta)["ok"])
+        for broken in (one.replace("agent:test", "agent:other", 1), one + "{"):
+            with self.assertRaises(ValueError):
+                nostoi.append_delta_jsonl(broken, **DRAFT)
+        with self.assertRaises(ValueError):
+            nostoi.append_delta_jsonl(one, **dict(DRAFT, body={"x": 0.1}))
+        with self.assertRaises(ValueError):
+            nostoi.append_delta_jsonl(one, **dict(DRAFT, at="yesterday"))
+
     def test_portable_and_precision(self):
         text = nostoi.append_jsonl("", **DRAFT)
         self.assertEqual(nostoi.verify_jsonl(text)["verified"], 1)

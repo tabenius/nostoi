@@ -104,6 +104,30 @@ fn append_jsonl(
     .map_err(error)
 }
 
+#[pyfunction]
+#[pyo3(signature = (jsonl, kind, body_json, at, actor=None, subject=None))]
+fn append_delta_jsonl(
+    jsonl: &str,
+    kind: &str,
+    body_json: &str,
+    at: String,
+    actor: Option<&str>,
+    subject: Option<&str>,
+) -> PyResult<String> {
+    let body = serde_json::from_str(body_json).map_err(error)?;
+    nostoi::portable::append_delta_jsonl(
+        jsonl,
+        nostoi::Draft {
+            kind,
+            body,
+            actor,
+            subject,
+            at: Some(at),
+        },
+    )
+    .map_err(error)
+}
+
 /// The canonical bytes an attestation document's signature covers, and their digest.
 ///
 /// No filesystem and no `ssh-keygen`: this is the portable half, so a Python caller
@@ -178,6 +202,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(canonical_json, m)?)?;
     m.add_function(wrap_pyfunction!(verify_jsonl, m)?)?;
     m.add_function(wrap_pyfunction!(append_jsonl, m)?)?;
+    m.add_function(wrap_pyfunction!(append_delta_jsonl, m)?)?;
     m.add_function(wrap_pyfunction!(verify, m)?)?;
     m.add_function(wrap_pyfunction!(append, m)?)?;
     m.add_function(wrap_pyfunction!(attestation_canonical_bytes, m)?)?;

@@ -3,10 +3,11 @@
   "product": "nostoi",
   "repository": "tabenius/nostoi",
   "channel": "candidate",
-  "distribution": "https://ragbaz.cc/downloads/",
+  "distribution": "https://dl.ragbaz.cc/v1/nostoi/",
   "formats": [
     "cli",
     "tui",
+    "deb",
     "rust-crate",
     "python-bindings",
     "wasm-component"

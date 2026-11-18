@@ -3,9 +3,9 @@ import json
 import os
 from . import _native
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __all__ = [
-    "canonical", "verify", "append", "verify_jsonl", "append_jsonl",
+    "canonical", "verify", "append", "verify_jsonl", "append_jsonl", "append_delta_jsonl",
     "attestation_canonical_bytes", "verify_attestation",
 ]
 
@@ -31,6 +31,10 @@ def verify_jsonl(text, format=None):
 def append_jsonl(text, *, kind, body, at, actor=None, subject=None):
     """Return the extended JSONL. Caller owns persistence and locking."""
     return _native.append_jsonl(text, kind, _json(body), at, actor, subject)
+
+def append_delta_jsonl(text, *, kind, body, at, actor=None, subject=None):
+    """Verify history and return only append bytes. Host owns locking and durability."""
+    return _native.append_delta_jsonl(text, kind, _json(body), at, actor, subject)
 
 
 def attestation_canonical_bytes(document):

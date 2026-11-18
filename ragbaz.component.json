@@ -4,6 +4,7 @@
   "identity": {
     "id": "ragbaz.nostoi",
     "name": "Nostoi",
+    "version": "0.1.1",
     "repository": "tabenius/nostoi",
     "owner": "ragbaz",
     "lifecycle": "beta"

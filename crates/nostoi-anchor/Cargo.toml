@@ -1,6 +1,6 @@
 [package]
 name = "nostoi-anchor"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.89"
 description = "S3-compatible checkpoint publishing, verification and durable recovery"
@@ -19,7 +19,7 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [dependencies]
-nostoi-core = { version = "0.1.0", path = "../nostoi-core", default-features = false }
+nostoi-core = { version = "0.1.1", path = "../nostoi-core", default-features = false }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

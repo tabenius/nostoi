@@ -15,11 +15,8 @@ permissions:
 jobs:
   test:
     timeout-minutes: 20
-    # This repository's own runner, `tabenius-nostoi`, registered on the
-    # ci-runner account on the development host. The labels are the ones a
-    # runner reports by default; `nostoi` is registered too, as a readable
-    # marker in the runner list.
-    runs-on: [self-hosted, linux, x64]
+    # Do not depend on fleet hardware being online for release evidence.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -57,7 +54,7 @@ jobs:
         run: cargo build --no-default-features --lib --locked
   interoperability:
     timeout-minutes: 20
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -66,12 +63,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      # `actions/setup-python` publishes no Kali build, so on this runner it
-      # fails with "The version '3.11' with architecture 'x64' was not found for
-      # Kali 2026.3" -- it has toolchains for Ubuntu, not for this distribution.
-      # The wheel is abi3, so any CPython from 3.11 satisfies it; take the
-      # runner's own in a venv, because a distribution Python is externally
-      # managed and refuses `pip install`.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # The abi3 wheel requires CPython >=3.11, not Ubuntu 22.04's system 3.10.
       - name: Python for the wheel and the interop checks
         run: |
           python3 -m venv "$RUNNER_TEMP/interop"

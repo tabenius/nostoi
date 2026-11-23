@@ -1,0 +1,29 @@
+{
+  "$schema": "https://ragbaz.cc/schemas/ragbaz.component.schema.json",
+  "schemaVersion": "0.2.0",
+  "identity": {
+    "id": "ragbaz.nostoi",
+    "name": "Nostoi",
+    "version": "0.1.1",
+    "repository": "tabenius/nostoi",
+    "owner": "ragbaz",
+    "lifecycle": "beta"
+  },
+  "docs": {
+    "readme": "README.md"
+  },
+  "presentation": {
+    "catalog": {
+      "slug": "nostoi",
+      "name": "Nostoi",
+      "tag": "beta",
+      "tagLabel": "beta",
+      "short": "Tamper-evident audit chains: verify, append, stream and browse them. One format for every chain.",
+      "value": "A chain is a sequence of records where each carries the digest of the record before it and a digest of its own content. Verification names the first inconsistent record. Nostoi is a Rust library, a CLI and a TUI for that, and it already reads the chains the RAGBAZ projects keep — Nostoi's own, WeftMark's ledger and Ephor's audit chain — so the rest of a fleet can share one format. Detecting a removed tail or a wholly recomputed history still requires a head trusted outside the chain, which is what signed anchors are for.",
+      "repo": "nostoi",
+      "links": {
+        "site": "/#p-nostoi"
+      }
+    }
+  }
+}

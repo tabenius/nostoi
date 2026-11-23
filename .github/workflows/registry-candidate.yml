@@ -1,0 +1,109 @@
+name: Nostoi release candidate
+on:
+  pull_request:
+    paths: ['release-registry.json', '.github/workflows/registry-candidate.yml', 'scripts/**', 'Cargo.*', 'src/**', 'crates/**', 'bindings/**']
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package-smoke:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test software before packaging
+        run: |
+          cargo test --workspace --all-features --locked
+          python3 contrib/python/test_conformance.py
+      - name: Build CLI/TUI release binary
+        run: |
+          cargo build --release --locked
+          bash scripts/package-deb.sh
+      - name: Build and test installable Python bindings without a local toolchain
+        run: |
+          python3 -m pip install 'maturin>=1.5,<2'
+          python3 -m maturin build --release --locked --manifest-path bindings/python/Cargo.toml --out dist
+          python3 -m pip install dist/*.whl
+          python3 -m unittest discover -s bindings/python/tests -v
+          (cd dist && sha256sum *.whl >> SHA256SUMS && sha256sum --check --strict SHA256SUMS)
+      - name: Install and exercise package on Debian, Ubuntu and Kali
+        run: |
+          set -euo pipefail
+          for image in debian:12-slim ubuntu:24.04 kalilinux/kali-rolling; do
+            docker run --rm -v "$PWD/dist:/packages:ro" -v "$PWD/scripts:/smoke:ro" "$image" bash -ec '
+              apt-get update -qq
+              apt-get install -y --no-install-recommends /packages/nostoi_*.deb
+              bash /smoke/smoke-installed.sh
+            '
+          done
+      - name: Validate registry contract
+        run: |
+          python3 - <<'PY'
+          import json
+          data=json.load(open('release-registry.json'))
+          assert data['product']=='nostoi'
+          assert data['promotion']['automaticStable'] is False
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nostoi-candidate-cli-tui-linux-amd64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  release-candidate:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: package-smoke
+    runs-on: ubuntu-24.04
+    environment: release-candidate
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: nostoi-candidate-cli-tui-linux-amd64
+          path: release-assets
+      - name: Check semantic version agrees with package definition
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          with open('Cargo.toml','rb') as handle:
+              config=tomllib.load(handle)
+          version=config['package']['version']
+          assert os.environ['GITHUB_REF_NAME']=='v'+version
+          PY
+      - name: Generate source-bound manifest and verify checksums
+        run: |
+          cd release-assets
+          sha256sum --check SHA256SUMS
+          cd ..
+          python scripts/create_registry_release.py nostoi linux-amd64 release-assets
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign with GitHub Actions tag identity
+        run: cosign sign-blob --yes --bundle release-assets/release.sigstore.json release-assets/release.json
+      - name: Publish signed candidate artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --prerelease \
+            --title "nostoi $GITHUB_REF_NAME (candidate)" --generate-notes release-assets/*
+
+  mirror-ragbaz-r2:
+    needs: release-candidate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ragbaz-r2.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit

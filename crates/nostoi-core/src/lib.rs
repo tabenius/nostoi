@@ -49,6 +49,8 @@ pub mod portable;
 pub mod revocation;
 #[cfg(feature = "sqlite")]
 pub mod schema;
+#[cfg(feature = "sealed")]
+pub mod sealed;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod sshsig;

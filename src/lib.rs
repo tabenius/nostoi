@@ -56,6 +56,10 @@ pub mod outbox {
 pub mod portable {
     pub use nostoi_core::portable::*;
 }
+#[cfg(feature = "sealed")]
+pub mod sealed {
+    pub use nostoi_core::sealed::*;
+}
 #[cfg(feature = "s3")]
 pub mod s3 {
     pub use nostoi_anchor::s3::*;

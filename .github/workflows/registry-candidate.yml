@@ -19,6 +19,7 @@ jobs:
           python-version: '3.12'
       - name: Test software before packaging
         run: |
+          python3 -m pip install 'PyNaCl==1.6.0'
           cargo test --workspace --all-features --locked
           python3 contrib/python/test_conformance.py
       - name: Build CLI/TUI release binary
